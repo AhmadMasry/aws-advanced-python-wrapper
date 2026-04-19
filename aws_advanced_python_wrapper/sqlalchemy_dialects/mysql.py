@@ -37,3 +37,12 @@ class AwsWrapperMySQLConnectorDialect(MySQLDialect_mysqlconnector):
     def import_dbapi(cls):
         import aws_advanced_python_wrapper.mysql_connector as dbapi
         return dbapi
+
+    def create_connect_args(self, url):
+        # See aws_advanced_python_wrapper/sqlalchemy_dialects/pg.py for the
+        # `wrapper_plugins` → `plugins` translation rationale.
+        args, kwargs = super().create_connect_args(url)
+        wrapper_plugins = kwargs.pop("wrapper_plugins", None)
+        if wrapper_plugins is not None:
+            kwargs["plugins"] = wrapper_plugins
+        return args, kwargs
