@@ -32,6 +32,8 @@ aws_wrapper_postgresql_async = "aws_advanced_python_wrapper.sqlalchemy_dialects.
 "aws_wrapper_postgresql.psycopg_async" = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg_async:AwsWrapperPGPsycopgAsyncDialect"
 aws_wrapper_mysql = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
 "aws_wrapper_mysql.mysqlconnector" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
+aws_wrapper_mysql_async = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async:AwsWrapperMySQLAiomysqlAsyncDialect"
+"aws_wrapper_mysql.aiomysql_async" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async:AwsWrapperMySQLAiomysqlAsyncDialect"
 
 [tool.poetry]
 include = ["CONTRIBUTING.md"]
@@ -60,6 +62,7 @@ psycopg-binary = "^3.3.3"
 mysql-connector-python = "^9.6.0"
 django = "^5.2.13"
 django-stubs = "^5.2.9"
+aiomysql = ">=0.2"
 
 [tool.poetry.group.test.dependencies]
 boto3 = "^1.42.91"
