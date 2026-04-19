@@ -14,7 +14,7 @@
 
 from typing import Optional
 
-from .pep249 import Error
+from .pep249 import Error, InterfaceError, NotSupportedError, OperationalError
 
 
 class AwsWrapperError(Error):
@@ -30,15 +30,15 @@ class AwsWrapperError(Error):
             self.driver_error = original_error
 
 
-class UnsupportedOperationError(AwsWrapperError):
+class UnsupportedOperationError(AwsWrapperError, NotSupportedError):
     __module__ = "aws_advanced_python_wrapper"
 
 
-class QueryTimeoutError(AwsWrapperError):
+class QueryTimeoutError(AwsWrapperError, OperationalError):
     __module__ = "aws_advanced_python_wrapper"
 
 
-class FailoverError(Error):
+class FailoverError(OperationalError):
     __module__ = "aws_advanced_python_wrapper"
 
 
@@ -54,9 +54,9 @@ class FailoverSuccessError(FailoverError):
     __module__ = "aws_advanced_python_wrapper"
 
 
-class ReadWriteSplittingError(AwsWrapperError):
+class ReadWriteSplittingError(AwsWrapperError, InterfaceError):
     __module__ = "aws_advanced_python_wrapper"
 
 
-class AwsConnectError(AwsWrapperError):
+class AwsConnectError(AwsWrapperError, OperationalError):
     __module__ = "aws_advanced_python_wrapper"
