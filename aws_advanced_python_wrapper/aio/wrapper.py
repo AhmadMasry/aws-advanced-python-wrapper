@@ -12,62 +12,290 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""``AsyncAwsWrapperConnection`` -- async facade over the plugin pipeline.
+"""``AsyncAwsWrapperConnection`` + ``AsyncAwsWrapperCursor``.
 
-Parallel to sync :class:`AwsWrapperConnection`. Per SP-0 decision D2, this
-class uses an explicit ``Async`` prefix matching psycopg's ``AsyncConnection``
-convention.
-
-This is an SP-0 stub: class header + method signatures only. Real async
-connection behavior lands in SP-2 alongside the psycopg driver dialect.
+Async counterparts of :class:`AwsWrapperConnection` and :class:`AwsWrapperCursor`.
+Every DB operation routes through ``AsyncPluginManager`` so plugins
+(failover, EFM, R/W splitting -- delivered in later sub-projects) can
+intercept it.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Type, Union
+from typing import (TYPE_CHECKING, Any, Callable, List, Optional, Sequence,
+                    Type, Union)
+
+from aws_advanced_python_wrapper.aio.plugin_manager import AsyncPluginManager
+from aws_advanced_python_wrapper.aio.plugin_service import \
+    AsyncPluginServiceImpl
+from aws_advanced_python_wrapper.errors import AwsWrapperError
+from aws_advanced_python_wrapper.hostinfo import HostInfo
+from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.messages import Messages
+from aws_advanced_python_wrapper.utils.properties import (Properties,
+                                                          PropertiesUtils)
+
+if TYPE_CHECKING:
+    from aws_advanced_python_wrapper.aio.driver_dialect.base import \
+        AsyncDriverDialect
+    from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 
 
-class AsyncAwsWrapperConnection:
-    """Async counterpart of :class:`AwsWrapperConnection`.
+class AsyncAwsWrapperCursor:
+    """Async counterpart of :class:`AwsWrapperCursor`.
 
-    In SP-2, this will own an ``AsyncPluginService`` + ``AsyncPluginManager``
-    and delegate every DBAPI-async method through the plugin pipeline. For
-    SP-0 the signatures are declared and every method raises
-    ``NotImplementedError`` so the shape is locked and downstream sub-projects
-    can type-check against it.
+    Wraps a driver-async cursor; every query/fetch routes through the plugin
+    pipeline via :class:`AsyncPluginManager`.
     """
 
-    __module__ = "aws_advanced_python_wrapper.aio"
+    def __init__(
+            self,
+            conn: AsyncAwsWrapperConnection,
+            target_cursor: Any) -> None:
+        self._conn = conn
+        self._target_cursor = target_cursor
 
-    @staticmethod
-    async def connect(
-            target: Union[None, str, Callable] = None,
-            conninfo: str = "",
-            *args: Any,
-            **kwargs: Any) -> AsyncAwsWrapperConnection:
-        """Open a new async wrapper connection. SP-2 delivers the implementation."""
-        raise NotImplementedError(
-            "AsyncAwsWrapperConnection.connect is a stub; SP-2 delivers it."
+    @property
+    def connection(self) -> AsyncAwsWrapperConnection:
+        return self._conn
+
+    @property
+    def target_cursor(self) -> Any:
+        return self._target_cursor
+
+    @property
+    def description(self) -> Any:
+        return self._target_cursor.description
+
+    @property
+    def rowcount(self) -> int:
+        return self._target_cursor.rowcount
+
+    @property
+    def arraysize(self) -> int:
+        return self._target_cursor.arraysize
+
+    @arraysize.setter
+    def arraysize(self, value: int) -> None:
+        self._target_cursor.arraysize = value
+
+    async def execute(
+            self,
+            query: Any,
+            params: Any = None,
+            **kwargs: Any) -> AsyncAwsWrapperCursor:
+        async def _call() -> Any:
+            if params is None:
+                return await self._target_cursor.execute(query, **kwargs)
+            return await self._target_cursor.execute(query, params, **kwargs)
+
+        await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_EXECUTE, _call, query, params,
+        )
+        return self
+
+    async def executemany(
+            self,
+            query: Any,
+            seq_of_params: Sequence[Any],
+            **kwargs: Any) -> AsyncAwsWrapperCursor:
+        async def _call() -> Any:
+            return await self._target_cursor.executemany(
+                query, seq_of_params, **kwargs)
+
+        await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_EXECUTEMANY, _call, query, seq_of_params,
+        )
+        return self
+
+    async def fetchone(self) -> Any:
+        async def _call() -> Any:
+            return await self._target_cursor.fetchone()
+
+        return await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_FETCHONE, _call,
+        )
+
+    async def fetchmany(self, size: Optional[int] = None) -> List[Any]:
+        async def _call() -> Any:
+            if size is None:
+                return await self._target_cursor.fetchmany()
+            return await self._target_cursor.fetchmany(size)
+
+        return await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_FETCHMANY, _call, size,
+        )
+
+    async def fetchall(self) -> List[Any]:
+        async def _call() -> Any:
+            return await self._target_cursor.fetchall()
+
+        return await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_FETCHALL, _call,
         )
 
     async def close(self) -> None:
-        raise NotImplementedError
+        async def _call() -> Any:
+            return await self._target_cursor.close()
 
-    async def cursor(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
+        await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_CLOSE, _call,
+        )
 
-    async def commit(self) -> None:
-        raise NotImplementedError
-
-    async def rollback(self) -> None:
-        raise NotImplementedError
-
-    async def __aenter__(self) -> AsyncAwsWrapperConnection:
-        raise NotImplementedError
+    async def __aenter__(self) -> AsyncAwsWrapperCursor:
+        return self
 
     async def __aexit__(
             self,
             exc_type: Optional[Type[BaseException]],
             exc_val: Optional[BaseException],
             exc_tb: Any) -> None:
-        raise NotImplementedError
+        await self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy unknown attributes to the underlying cursor.
+
+        Lets driver-specific attrs (e.g., psycopg's ``statusmessage``) work
+        transparently when SA or application code asks for them.
+        """
+        return getattr(self._target_cursor, name)
+
+
+class AsyncAwsWrapperConnection:
+    """Async counterpart of :class:`AwsWrapperConnection`."""
+
+    __module__ = "aws_advanced_python_wrapper.aio"
+
+    def __init__(
+            self,
+            plugin_service: AsyncPluginServiceImpl,
+            plugin_manager: AsyncPluginManager,
+            target_conn: Any) -> None:
+        self._plugin_service = plugin_service
+        self._plugin_manager = plugin_manager
+        self._target_conn = target_conn
+
+    @property
+    def target_connection(self) -> Any:
+        """The underlying driver async connection."""
+        return self._target_conn
+
+    @staticmethod
+    async def connect(
+            target: Union[None, str, Callable] = None,
+            conninfo: str = "",
+            *args: Any,
+            plugins: Optional[List[AsyncPlugin]] = None,
+            **kwargs: Any) -> AsyncAwsWrapperConnection:
+        """Open a new async wrapper connection.
+
+        :param target: the target driver's async connect callable (e.g.,
+            ``psycopg.AsyncConnection.connect``). Required.
+        :param conninfo: connection info string (driver-specific format).
+        :param plugins: optional explicit list of :class:`AsyncPlugin`
+            instances. SP-2 does NOT resolve ``plugins="failover,efm"``
+            style connection-property strings into factories -- that's a
+            later SP's job. Pass plugin instances directly for now.
+        :param kwargs: merged into the connection properties alongside
+            ``conninfo``.
+        """
+        if not target:
+            raise AwsWrapperError(Messages.get("Wrapper.RequiredTargetDriver"))
+        if not callable(target):
+            raise AwsWrapperError(Messages.get("Wrapper.ConnectMethod"))
+        target_func: Callable = target
+
+        props: Properties = PropertiesUtils.parse_properties(
+            conn_info=conninfo, **kwargs)
+
+        # Pick the driver dialect. SP-2 hardcodes psycopg-async; later SPs
+        # will add a DriverDialectManager for async drivers so this becomes
+        # dispatch by target_func identity.
+        from aws_advanced_python_wrapper.aio.driver_dialect.psycopg import \
+            AsyncPsycopgDriverDialect
+        driver_dialect: AsyncDriverDialect = AsyncPsycopgDriverDialect()
+
+        host = props.get("host", "")
+        port_raw = props.get("port")
+        port = int(port_raw) if port_raw is not None else -1
+        host_info = HostInfo(host=host, port=port)
+
+        plugin_service = AsyncPluginServiceImpl(
+            props=props,
+            driver_dialect=driver_dialect,
+            host_info=host_info,
+        )
+        plugin_manager = AsyncPluginManager(
+            plugin_service=plugin_service,
+            props=props,
+            plugins=plugins,
+        )
+
+        target_conn = await plugin_manager.connect(
+            target_driver_func=target_func,
+            driver_dialect=driver_dialect,
+            host_info=host_info,
+            props=props,
+            is_initial_connection=True,
+        )
+
+        if target_conn is None:
+            raise AwsWrapperError(
+                Messages.get("AwsWrapperConnection.ConnectionNotOpen")
+            )
+
+        await plugin_service.set_current_connection(target_conn, host_info)
+        return AsyncAwsWrapperConnection(plugin_service, plugin_manager, target_conn)
+
+    def cursor(self, *args: Any, **kwargs: Any) -> AsyncAwsWrapperCursor:
+        """Return a new :class:`AsyncAwsWrapperCursor`.
+
+        Matches :meth:`psycopg.AsyncConnection.cursor` semantics: sync call
+        that returns an async cursor. Query execution on the cursor is async.
+        """
+        target_cursor = self._target_conn.cursor(*args, **kwargs)
+        return AsyncAwsWrapperCursor(self, target_cursor)
+
+    async def close(self) -> None:
+        async def _call() -> Any:
+            return await self._target_conn.close()
+
+        await self._plugin_manager.execute(
+            self, DbApiMethod.CONNECTION_CLOSE, _call,
+        )
+
+    async def commit(self) -> None:
+        async def _call() -> Any:
+            return await self._target_conn.commit()
+
+        await self._plugin_manager.execute(
+            self, DbApiMethod.CONNECTION_COMMIT, _call,
+        )
+
+    async def rollback(self) -> None:
+        async def _call() -> Any:
+            return await self._target_conn.rollback()
+
+        await self._plugin_manager.execute(
+            self, DbApiMethod.CONNECTION_ROLLBACK, _call,
+        )
+
+    async def __aenter__(self) -> AsyncAwsWrapperConnection:
+        return self
+
+    async def __aexit__(
+            self,
+            exc_type: Optional[Type[BaseException]],
+            exc_val: Optional[BaseException],
+            exc_tb: Any) -> None:
+        await self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy unknown attributes to the underlying connection.
+
+        Lets SA's PG dialect and application code reach driver-specific
+        state (``info``, ``pgconn``, ``adapters``, etc.) without special
+        casing. The connection field is hit only when the attribute is
+        NOT defined on the wrapper itself.
+        """
+        return getattr(self._target_conn, name)
