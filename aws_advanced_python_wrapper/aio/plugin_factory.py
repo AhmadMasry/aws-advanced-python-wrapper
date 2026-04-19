@@ -27,12 +27,14 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List,
 
 from aws_advanced_python_wrapper.aio.auth_plugins import (
     AsyncAwsSecretsManagerPlugin, AsyncIamAuthPlugin)
+from aws_advanced_python_wrapper.aio.custom_endpoint_monitor import \
+    AsyncCustomEndpointPlugin as AsyncCustomEndpointPluginActive
 from aws_advanced_python_wrapper.aio.failover_plugin import AsyncFailoverPlugin
 from aws_advanced_python_wrapper.aio.host_monitoring_plugin import \
     AsyncHostMonitoringPlugin
 from aws_advanced_python_wrapper.aio.minor_plugins import (
     AsyncAuroraConnectionTrackerPlugin, AsyncConnectTimePlugin,
-    AsyncCustomEndpointPlugin, AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
+    AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
 from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
     AsyncReadWriteSplittingPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
@@ -129,7 +131,8 @@ class _DeveloperFactory:
 class _CustomEndpointFactory:
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
-        return AsyncCustomEndpointPlugin()
+        # Active implementation post-Task 1-B (replaces SP-8 stub).
+        return AsyncCustomEndpointPluginActive(plugin_service, props)
 
 
 # ---- Registry ----------------------------------------------------------
