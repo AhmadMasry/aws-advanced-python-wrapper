@@ -66,7 +66,7 @@ class AsyncPlugin(ABC):
 
     async def execute(
             self,
-            target: type,
+            target: object,
             method_name: str,
             execute_func: Callable[..., Awaitable[Any]],
             *args: Any,
