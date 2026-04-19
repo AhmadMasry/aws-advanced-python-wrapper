@@ -98,6 +98,7 @@ def test_exception_hierarchy_roots():
 
 @pytest.mark.parametrize("module_name", [
     "aws_advanced_python_wrapper",
+    "aws_advanced_python_wrapper.psycopg",
 ])
 @pytest.mark.parametrize("attr_name", PEP249_NAMES + ("connect",))
 def test_module_exports_pep249_attr(module_name, attr_name):
