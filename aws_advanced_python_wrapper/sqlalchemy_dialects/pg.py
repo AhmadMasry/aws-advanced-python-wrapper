@@ -35,3 +35,15 @@ class AwsWrapperPGPsycopgDialect(PGDialect_psycopg):
     def import_dbapi(cls):
         import aws_advanced_python_wrapper.psycopg as dbapi
         return dbapi
+
+    def create_connect_args(self, url):
+        # SQLAlchemy's `create_engine` intercepts `plugins=` in the URL query
+        # to load SA engine plugins, stripping it before the dialect sees it.
+        # The wrapper's own `plugins` connection property would therefore be
+        # swallowed. Allow users to spell it as `wrapper_plugins=` in the URL
+        # and rename it to `plugins=` before handing kwargs to the DBAPI.
+        args, kwargs = super().create_connect_args(url)
+        wrapper_plugins = kwargs.pop("wrapper_plugins", None)
+        if wrapper_plugins is not None:
+            kwargs["plugins"] = wrapper_plugins
+        return args, kwargs

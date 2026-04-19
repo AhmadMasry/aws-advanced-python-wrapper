@@ -33,10 +33,24 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+import mysql.connector as _mysql_connector
 from mysql.connector import connect as _mysql_connect
 
 from aws_advanced_python_wrapper import _dbapi
 from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
+
+
+def __getattr__(name: str) -> Any:
+    """Forward missing attributes to the underlying mysql.connector module.
+
+    See ``aws_advanced_python_wrapper/psycopg.py`` for the rationale.
+    """
+    try:
+        return getattr(_mysql_connector, name)
+    except AttributeError:
+        raise AttributeError(
+            f"module 'aws_advanced_python_wrapper.mysql_connector' has no attribute {name!r}"
+        ) from None
 
 
 def connect(conninfo: str = "", **kwargs: Any) -> AwsWrapperConnection:

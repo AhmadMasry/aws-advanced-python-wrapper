@@ -33,10 +33,30 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+import psycopg as _psycopg
 from psycopg import Connection as _PGConnection
 
 from aws_advanced_python_wrapper import _dbapi
 from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
+
+
+def __getattr__(name: str) -> Any:
+    """Forward missing attributes to the underlying psycopg module.
+
+    PEP 562 module-level __getattr__. Only fires for names NOT defined here
+    (including not populated by ``_dbapi.install()``), so our PEP 249 exports
+    (`connect`, `Error`, `Date`, `STRING`, ...) and our own definitions take
+    precedence. SQLAlchemy's PGDialect_psycopg probes the DBAPI module for
+    psycopg-specific state (``adapters``, ``__version__``, ``pq``, ...);
+    forwarding lets it see the real driver for those reads while keeping our
+    wrapper's `connect` for the connection path.
+    """
+    try:
+        return getattr(_psycopg, name)
+    except AttributeError:
+        raise AttributeError(
+            f"module 'aws_advanced_python_wrapper.psycopg' has no attribute {name!r}"
+        ) from None
 
 
 def connect(conninfo: str = "", **kwargs: Any) -> AwsWrapperConnection:
