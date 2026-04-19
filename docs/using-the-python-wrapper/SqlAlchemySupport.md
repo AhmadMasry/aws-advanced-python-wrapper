@@ -69,6 +69,46 @@ finally:
 
 > **Note — `use_pure` + IAM authentication:** For Aurora MySQL, we recommend `use_pure=True` because the C extension's `is_connected` can block indefinitely on network failure. However, the [IAM Authentication Plugin](using-plugins/UsingTheIamAuthenticationPlugin.md) is incompatible with `use_pure=True` (the pure-Python driver truncates passwords at 255 chars; IAM tokens are longer). See the README's "Known Limitations" section for details.
 
+## Using the custom SQLAlchemy dialects (URL-based)
+
+The wrapper registers two SQLAlchemy dialects via entry-points so `create_engine` can be driven by URL alone — no `creator=` lambda needed. This is the idiomatic path for Alembic, 12-factor `DATABASE_URL` configs, and framework starters that expect a URL string.
+
+PostgreSQL:
+
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    "aws_wrapper_postgresql+psycopg://john:pwd@"
+    "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
+    "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm"
+)
+```
+
+MySQL:
+
+```python
+from sqlalchemy import create_engine
+
+engine = create_engine(
+    "aws_wrapper_mysql+mysqlconnector://john:pwd@"
+    "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
+    "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,efm&use_pure=True"
+)
+```
+
+### Naming
+
+The dialect names (`aws_wrapper_postgresql`, `aws_wrapper_mysql`) echo the JDBC wrapper's `jdbc:aws-wrapper:postgresql://` / `jdbc:aws-wrapper:mysql://` URL scheme, using underscores because SQLAlchemy's URL grammar (`(?P<name>[\w\+]+)://`) does not accept hyphens in the dialect name. The driver slot (`+psycopg`, `+mysqlconnector`) defaults to the wrapper's supported DBAPIs; bare `aws_wrapper_postgresql://` resolves to `+psycopg`.
+
+### URL parameter `wrapper_plugins` (not `plugins`)
+
+SQLAlchemy's `create_engine` reserves the query-string `plugins=` key for its own engine-plugin loader and strips it from the URL before the dialect sees it. To pass the wrapper's `plugins` connection property via URL, spell it **`wrapper_plugins=`** — the dialect translates it back to `plugins=` before calling the wrapper's `connect()`. In the creator-pattern path (where you call `connect()` directly in Python), continue to use the normal `plugins=` kwarg; the `wrapper_plugins` alias is URL-only.
+
+All other wrapper connection options (`wrapper_dialect`, plugin-specific parameters like `failover_timeout_sec`, auth parameters like `iam_region`, etc.) pass through the URL query string unchanged as kwargs to the underlying wrapper's `connect()`.
+
+Both the creator-pattern (shown above) and the URL-based path remain supported. Use whichever fits your configuration surface.
+
 ## Error handling
 
 Wrapper errors are classified so SQLAlchemy maps them to the correct `sqlalchemy.exc.*` subclass:
@@ -106,7 +146,6 @@ Plugins are configured identically to non-SA usage — via the `plugins` connect
 ## Limitations (current)
 
 - **Sync only.** Async support (`create_async_engine` via `psycopg.AsyncConnection`) is planned for a future release.
-- **No custom SA URL-scheme dialect yet.** A planned follow-up release will register `aws-wrapper-postgresql+psycopg://...` and `aws-wrapper-mysql+mysqlconnector://...` dialects so `create_engine` can be driven by URL alone (useful for Alembic / 12-factor config). Until then, the `creator=` pattern shown above is the supported path.
 
 ## See also
 
