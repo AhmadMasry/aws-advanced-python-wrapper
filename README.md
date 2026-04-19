@@ -143,6 +143,8 @@ The following table lists the connection properties used with the AWS Advanced P
 Technical documentation regarding the functionality of the AWS Advanced Python Wrapper will be maintained in this GitHub repository. Since the AWS Advanced Python Wrapper requires an underlying Python driver, please refer to the individual driver's documentation for driver-specific information.
 To find all the documentation and concrete examples on how to use the AWS Advanced Python Wrapper, please refer to the [AWS Advanced Python Wrapper Documentation](./docs/README.md) page.
 
+For SQLAlchemy integration (both PostgreSQL and MySQL), see [SQLAlchemy Support](./docs/using-the-python-wrapper/SqlAlchemySupport.md).
+
 ### Known Limitations
 
 #### Amazon RDS Blue/Green Deployments
