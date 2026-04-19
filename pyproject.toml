@@ -70,6 +70,12 @@ opentelemetry-sdk-extension-aws = "^2.0.1"
 pytest-timeout = "^2.3.1"
 pytest-repeat = "^0.9.3"
 
+[tool.poetry.plugins."sqlalchemy.dialects"]
+"aws_wrapper_postgresql" = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg:AwsWrapperPGPsycopgDialect"
+"aws_wrapper_postgresql.psycopg" = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg:AwsWrapperPGPsycopgDialect"
+"aws_wrapper_mysql" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
+"aws_wrapper_mysql.mysqlconnector" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
+
 [tool.isort]
 sections = "FUTURE,STDLIB,THIRDPARTY,FIRSTPARTY,LOCALFOLDER"
 no_lines_before = "LOCALFOLDER"
