@@ -275,26 +275,20 @@ def test_async_connection_provider_is_protocol():
     assert hasattr(AsyncConnectionProvider, "connect")
 
 
-def test_async_aws_wrapper_connection_is_stub():
-    """SP-0 ships the signature only; every method must raise NotImplementedError."""
+def test_async_aws_wrapper_connection_rejects_missing_target():
+    """AsyncAwsWrapperConnection.connect requires the target driver callable.
+
+    Regression guard (adapted from SP-0 where all methods were stubs):
+    SP-2 implements the class, but the contract that ``target`` must be a
+    callable still holds.
+    """
+    from aws_advanced_python_wrapper.errors import AwsWrapperError
 
     async def _body() -> None:
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(AwsWrapperError):
             await AsyncAwsWrapperConnection.connect()
-
-        inst = AsyncAwsWrapperConnection.__new__(AsyncAwsWrapperConnection)
-        with pytest.raises(NotImplementedError):
-            await inst.close()
-        with pytest.raises(NotImplementedError):
-            await inst.cursor()
-        with pytest.raises(NotImplementedError):
-            await inst.commit()
-        with pytest.raises(NotImplementedError):
-            await inst.rollback()
-        with pytest.raises(NotImplementedError):
-            await inst.__aenter__()
-        with pytest.raises(NotImplementedError):
-            await inst.__aexit__(None, None, None)
+        with pytest.raises(AwsWrapperError):
+            await AsyncAwsWrapperConnection.connect("not-a-callable")
 
     asyncio.run(_body())
 
