@@ -30,6 +30,8 @@ from aws_advanced_python_wrapper.aio.auth_plugins import (
 from aws_advanced_python_wrapper.aio.custom_endpoint_monitor import \
     AsyncCustomEndpointPlugin as AsyncCustomEndpointPluginActive
 from aws_advanced_python_wrapper.aio.failover_plugin import AsyncFailoverPlugin
+from aws_advanced_python_wrapper.aio.federated_auth_plugins import (
+    AsyncFederatedAuthPlugin, AsyncOktaAuthPlugin)
 from aws_advanced_python_wrapper.aio.host_monitoring_plugin import \
     AsyncHostMonitoringPlugin
 from aws_advanced_python_wrapper.aio.minor_plugins import (
@@ -104,6 +106,18 @@ class _AwsSecretsManagerFactory:
         return AsyncAwsSecretsManagerPlugin(plugin_service, props)
 
 
+class _FederatedAuthFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        return AsyncFederatedAuthPlugin(plugin_service, props)
+
+
+class _OktaAuthFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        return AsyncOktaAuthPlugin(plugin_service, props)
+
+
 class _AuroraConnectionTrackerFactory:
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
@@ -152,6 +166,8 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "read_write_splitting": _ReadWriteSplittingFactory(),
     "iam": _IamAuthFactory(),
     "aws_secrets_manager": _AwsSecretsManagerFactory(),
+    "federated_auth": _FederatedAuthFactory(),
+    "okta": _OktaAuthFactory(),
     "aurora_connection_tracker": _AuroraConnectionTrackerFactory(),
     "connect_time": _ConnectTimeFactory(),
     "execute_time": _ExecuteTimeFactory(),
@@ -170,6 +186,8 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _HostMonitoringFactory: 500,
     _IamAuthFactory: 700,
     _AwsSecretsManagerFactory: 800,
+    _FederatedAuthFactory: 820,
+    _OktaAuthFactory: 830,
     _ConnectTimeFactory: 900,
     _ExecuteTimeFactory: 910,
     _DeveloperFactory: 1000,
