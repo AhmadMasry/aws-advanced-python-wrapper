@@ -12,29 +12,28 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import sys
 from logging import DEBUG, getLogger
 
-from .cleanup import release_resources
-from .utils.utils import LogUtils
-from .wrapper import AwsWrapperConnection
+from aws_advanced_python_wrapper import _dbapi
+from aws_advanced_python_wrapper.cleanup import release_resources
+from aws_advanced_python_wrapper.utils.utils import LogUtils
+from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
 
-# PEP249 compliance
-connect = AwsWrapperConnection.connect
-apilevel = "2.0"
-threadsafety = 2
-paramstyle = "pyformat"
-
-# Public API
-__all__ = [
-    'connect',
-    'AwsWrapperConnection',
-    'release_resources',
-    'set_logger',
-    'apilevel',
-    'threadsafety',
-    'paramstyle'
-]
+# Populate the full PEP 249 module surface (exceptions, type ctors/singletons,
+# apilevel/threadsafety/paramstyle). `connect` stays bound to
+# AwsWrapperConnection.connect for back-compat with existing callers.
+_dbapi.install(sys.modules[__name__].__dict__, connect=AwsWrapperConnection.connect)
 
 
-def set_logger(name='aws_advanced_python_wrapper', level=DEBUG, format_string=None):
+def set_logger(name="aws_advanced_python_wrapper", level=DEBUG, format_string=None):
     LogUtils.setup_logger(getLogger(name), level, format_string)
+
+
+__all__ = (
+    "AwsWrapperConnection",
+    "release_resources",
+    "set_logger",
+    *_dbapi._PEP249_NAMES,
+    "connect",
+)

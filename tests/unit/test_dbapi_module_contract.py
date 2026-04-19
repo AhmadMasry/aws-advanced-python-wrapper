@@ -12,6 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import importlib
+
+import pytest
+
 from aws_advanced_python_wrapper import _dbapi
 
 PEP249_NAMES = (
@@ -90,3 +94,18 @@ def test_exception_hierarchy_roots():
     for sub in ("DataError", "OperationalError", "IntegrityError",
                 "InternalError", "ProgrammingError", "NotSupportedError"):
         assert issubclass(ns[sub], ns["DatabaseError"])
+
+
+@pytest.mark.parametrize("module_name", [
+    "aws_advanced_python_wrapper",
+])
+@pytest.mark.parametrize("attr_name", PEP249_NAMES + ("connect",))
+def test_module_exports_pep249_attr(module_name, attr_name):
+    mod = importlib.import_module(module_name)
+    assert hasattr(mod, attr_name), f"{module_name} missing {attr_name}"
+
+
+def test_top_level_connect_is_awswrapperconnection_connect():
+    import aws_advanced_python_wrapper as aaw
+    from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
+    assert aaw.connect is AwsWrapperConnection.connect
