@@ -29,6 +29,12 @@ Typical usage (once SP-2 lands the implementation)::
 See the F3-B master spec for the overall design.
 """
 
+from aws_advanced_python_wrapper.aio.cleanup import (register_shutdown_hook,
+                                                     release_resources_async)
 from aws_advanced_python_wrapper.aio.wrapper import AsyncAwsWrapperConnection
 
-__all__ = ["AsyncAwsWrapperConnection"]
+__all__ = [
+    "AsyncAwsWrapperConnection",
+    "release_resources_async",
+    "register_shutdown_hook",
+]

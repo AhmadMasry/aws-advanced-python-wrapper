@@ -143,9 +143,50 @@ Plugins are configured identically to non-SA usage — via the `plugins` connect
 - [IAM Authentication Plugin](using-plugins/UsingTheIamAuthenticationPlugin.md)
 - [AWS Secrets Manager Plugin](using-plugins/UsingTheAwsSecretsManagerPlugin.md)
 
+## Async usage (3.0.0+)
+
+Starting in 3.0.0, the wrapper exposes a native async path. `create_async_engine` works with the URL-based dialect:
+
+```python
+import asyncio
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from aws_advanced_python_wrapper.aio import release_resources_async
+
+
+async def main() -> None:
+    engine = create_async_engine(
+        "aws_wrapper_postgresql+psycopg_async://john:pwd@"
+        "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
+        "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm"
+    )
+    try:
+        async with engine.connect() as conn:
+            row = await conn.execute(
+                text("SELECT pg_catalog.aurora_db_instance_identifier()")
+            )
+            print(row.scalar_one())
+    finally:
+        await engine.dispose()
+        await release_resources_async()
+
+
+asyncio.run(main())
+```
+
+The async path:
+
+- Drives `psycopg.AsyncConnection` end-to-end (no greenlet hops through the wrapper's own pipeline).
+- Supports the same wrapper plugins via `wrapper_plugins`: `failover`, `efm` (host monitoring), `read_write_splitting`, `iam`, `aws_secrets_manager`, plus the minor/observability plugins.
+- MySQL async is deferred until an async MySQL driver is formally supported.
+
+At shutdown, call `engine.dispose()` first, then `aws_advanced_python_wrapper.aio.release_resources_async()` to drain async background tasks, then (optionally) the sync `release_resources()` to drain any sync-side threads the app may also have spun up.
+
 ## Limitations (current)
 
-- **Sync only.** Async support (`create_async_engine` via `psycopg.AsyncConnection`) is planned for a future release.
+- **Async MySQL is not supported in 3.0.0.** Only async PostgreSQL via psycopg v3. An async MySQL driver (aiomysql / asyncmy / a future official mysql-connector async API) can be added later as a ~5-file change per the F3-B master spec (invariant 8a).
 
 ## See also
 
