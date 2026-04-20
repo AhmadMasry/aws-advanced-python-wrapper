@@ -38,7 +38,39 @@ from aws_advanced_python_wrapper.utils.properties import (Properties,
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
+    from aws_advanced_python_wrapper.aio.host_list_provider import \
+        AsyncHostListProvider
     from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
+
+
+_TOPOLOGY_REQUIRING_PLUGINS = frozenset({
+    "failover",
+    "failover_v2",
+    "read_write_splitting",
+    "custom_endpoint",
+    "aurora_connection_tracker",
+})
+
+
+def _build_host_list_provider(
+        props: Properties,
+        driver_dialect: AsyncDriverDialect) -> AsyncHostListProvider:
+    """Pick an async host list provider based on the plugin list.
+
+    If `plugins` property references any topology-requiring plugin,
+    return an :class:`AsyncAuroraHostListProvider`. Otherwise a
+    :class:`AsyncStaticHostListProvider` is sufficient (and cheaper --
+    no topology queries).
+    """
+    from aws_advanced_python_wrapper.aio.host_list_provider import (
+        AsyncAuroraHostListProvider, AsyncStaticHostListProvider)
+    from aws_advanced_python_wrapper.aio.plugin_factory import \
+        parse_plugins_property
+
+    codes = parse_plugins_property(props) or []
+    if any(c.strip() in _TOPOLOGY_REQUIRING_PLUGINS for c in codes):
+        return AsyncAuroraHostListProvider(props, driver_dialect)
+    return AsyncStaticHostListProvider(props)
 
 
 class AsyncAwsWrapperCursor:
@@ -185,17 +217,21 @@ class AsyncAwsWrapperConnection:
             target: Union[None, str, Callable] = None,
             conninfo: str = "",
             *args: Any,
-            plugins: Optional[List[AsyncPlugin]] = None,
+            plugins: Union[None, str, List[AsyncPlugin]] = None,
             **kwargs: Any) -> AsyncAwsWrapperConnection:
         """Open a new async wrapper connection.
 
         :param target: the target driver's async connect callable (e.g.,
             ``psycopg.AsyncConnection.connect``). Required.
         :param conninfo: connection info string (driver-specific format).
-        :param plugins: optional explicit list of :class:`AsyncPlugin`
-            instances. SP-2 does NOT resolve ``plugins="failover,efm"``
-            style connection-property strings into factories -- that's a
-            later SP's job. Pass plugin instances directly for now.
+        :param plugins: accepts three shapes:
+            * ``list[AsyncPlugin]`` -- explicit plugin instances; takes
+              precedence over any ``plugins`` connection-property string.
+            * ``str`` -- comma-separated plugin codes (e.g.,
+              ``"failover,efm"``); routed into the props dict and
+              resolved via :mod:`plugin_factory`.
+            * ``None`` -- defer to the ``plugins`` connection-property
+              string (if present); when absent, no plugins load.
         :param kwargs: merged into the connection properties alongside
             ``conninfo``.
         """
@@ -204,6 +240,12 @@ class AsyncAwsWrapperConnection:
         if not callable(target):
             raise AwsWrapperError(Messages.get("Wrapper.ConnectMethod"))
         target_func: Callable = target
+
+        # Normalize `plugins` kwarg: string form folds into the props
+        # dict so the factory path resolves it just like a property.
+        if isinstance(plugins, str):
+            kwargs["plugins"] = plugins
+            plugins = None
 
         props: Properties = PropertiesUtils.parse_properties(
             conn_info=conninfo, **kwargs)
@@ -225,6 +267,24 @@ class AsyncAwsWrapperConnection:
             driver_dialect=driver_dialect,
             host_info=host_info,
         )
+
+        # Host-list-provider selection: if `plugins=...` references any
+        # topology-requiring plugin (failover, rws), build an Aurora
+        # provider; otherwise static is enough.
+        host_list_provider = _build_host_list_provider(props, driver_dialect)
+
+        # Resolve plugin list. Explicit `plugins=[...]` wins; otherwise
+        # parse the `plugins` connection-property string via the factory
+        # registry (Task 1-A).
+        if plugins is None:
+            from aws_advanced_python_wrapper.aio.plugin_factory import \
+                build_async_plugins
+            plugins = build_async_plugins(
+                plugin_service=plugin_service,
+                props=props,
+                host_list_provider=host_list_provider,
+            )
+
         plugin_manager = AsyncPluginManager(
             plugin_service=plugin_service,
             props=props,
