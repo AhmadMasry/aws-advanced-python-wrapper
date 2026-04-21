@@ -261,17 +261,31 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
         """
         for alias, events in changes.items():
             if HostEvent.CONVERTED_TO_READER in events:
-                host_part, _, port_part = alias.partition(":")
-                try:
-                    port = int(port_part) if port_part else 5432
-                except ValueError:
-                    port = 5432
-                h = HostInfo(host=host_part, port=port)
+                host_part, port_part = self._parse_alias(alias)
+                h = HostInfo(host=host_part, port=port_part)
                 self._spawn_invalidation(h)
             if HostEvent.CONVERTED_TO_WRITER in events:
                 # Force writer recheck on next execute via
                 # _update_writer_from_topology.
                 self._current_writer = None
+
+    @staticmethod
+    def _parse_alias(alias: str) -> tuple:
+        """Split a ``host:port`` alias into ``(host, port)``.
+
+        Uses ``rpartition(':')`` so IPv6 aliases of the form
+        ``[::1]:5432`` split correctly on the LAST colon. Falls back to
+        port 5432 when the alias has no colon (or the port part isn't
+        numeric).
+        """
+        host_part, sep, port_part = alias.rpartition(":")
+        if not sep:
+            # No colon -> treat entire alias as host, port defaults.
+            return alias, 5432
+        try:
+            return host_part, int(port_part)
+        except ValueError:
+            return host_part, 5432
 
 
 __all__ = ["AsyncAuroraConnectionTrackerPlugin", "AsyncOpenedConnectionTracker"]
