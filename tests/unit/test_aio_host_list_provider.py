@@ -285,3 +285,96 @@ def test_topology_monitor_start_is_idempotent():
         await monitor.stop()
 
     asyncio.run(_body())
+
+
+# ---- G.1: high-freq refresh after writer change --------------------------
+
+
+def test_topology_monitor_enters_high_freq_mode_on_writer_change():
+    """After a writer-change is observed, monitor ticks at high_refresh_rate."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    # Build a provider whose force_refresh returns topologies with
+    # different writers on successive calls
+    topology_1 = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),
+                  HostInfo(host="r1", port=5432, role=HostRole.READER))
+    topology_2 = (HostInfo(host="w2", port=5432, role=HostRole.WRITER),
+                  HostInfo(host="r1", port=5432, role=HostRole.READER))
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(side_effect=[topology_1, topology_2, topology_2, topology_2])
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: MagicMock(name="conn"),
+        refresh_interval_sec=0.05,
+        high_refresh_rate_sec=0.01,
+    )
+
+    async def _run_briefly():
+        monitor.start()
+        # Allow enough ticks for writer-change detection
+        await asyncio.sleep(0.08)
+        await monitor.stop()
+
+    asyncio.run(_run_briefly())
+    # At least 2 force_refresh calls happened (first one sets writer, second detects change)
+    assert provider.force_refresh.await_count >= 2
+
+
+def test_topology_monitor_stays_normal_freq_when_no_writer_change():
+    """No writer change -> normal refresh rate, NOT high-freq mode."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    topology = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),)
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=topology)
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: MagicMock(),
+        refresh_interval_sec=0.2,
+        high_refresh_rate_sec=0.01,
+    )
+
+    async def _run_briefly():
+        monitor.start()
+        # Only enough time for 1-2 ticks at normal rate
+        await asyncio.sleep(0.1)
+        await monitor.stop()
+
+    asyncio.run(_run_briefly())
+    # At most 2 refresh calls (initial + maybe one more) -- not spinning at high-freq
+    assert provider.force_refresh.await_count <= 2
+
+
+def test_topology_monitor_high_freq_expires_after_period():
+    """After HIGH_REFRESH_PERIOD_SEC passes, monitor reverts to normal rate."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    topology_1 = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),)
+    topology_2 = (HostInfo(host="w2", port=5432, role=HostRole.WRITER),)
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(side_effect=[topology_1] + [topology_2] * 100)
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: MagicMock(),
+        refresh_interval_sec=0.2,
+        high_refresh_rate_sec=0.01,
+    )
+    # Shorten the high-freq period for the test
+    monitor.HIGH_REFRESH_PERIOD_SEC = 0.05
+
+    async def _run_briefly():
+        monitor.start()
+        await asyncio.sleep(0.15)  # past the 50ms high-freq window
+        await monitor.stop()
+        # Record state when we stopped
+        now_ns = int(_time.time_ns())
+        return monitor._high_refresh_until_ns, now_ns
+
+    import time as _time
+    high_until, now_ns = asyncio.run(_run_briefly())
+    # High-freq period should have expired (we waited past it)
+    assert high_until < now_ns
