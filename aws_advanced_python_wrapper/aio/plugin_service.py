@@ -23,14 +23,17 @@ service, status storage) lands in later SPs that need it.
 from __future__ import annotations
 
 from typing import (TYPE_CHECKING, Any, ClassVar, FrozenSet, List, Optional,
-                    Protocol, Set)
+                    Protocol, Set, Tuple)
 
+from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
 from aws_advanced_python_wrapper.utils.storage.cache_map import CacheMap
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
+    from aws_advanced_python_wrapper.aio.host_list_provider import \
+        AsyncHostListProvider
     from aws_advanced_python_wrapper.aio.plugin_manager import \
         AsyncPluginManager
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
@@ -102,6 +105,24 @@ class AsyncPluginService(Protocol):
     def plugin_manager(self, value: AsyncPluginManager) -> None:
         ...
 
+    @property
+    def host_list_provider(self) -> Optional[AsyncHostListProvider]:
+        ...
+
+    @host_list_provider.setter
+    def host_list_provider(self, value: AsyncHostListProvider) -> None:
+        ...
+
+    async def refresh_host_list(
+            self,
+            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+        ...
+
+    async def force_refresh_host_list(
+            self,
+            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+        ...
+
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         ...
 
@@ -158,6 +179,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._database_dialect: Optional[DatabaseDialect] = None
         self._exception_manager: ExceptionManager = ExceptionManager()
         self._plugin_manager: Optional[AsyncPluginManager] = None
+        self._host_list_provider: Optional[AsyncHostListProvider] = None
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
 
@@ -234,6 +256,30 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         if self._plugin_manager is None:
             return None
         return self._plugin_manager.get_host_info_by_strategy(role, strategy, host_list)
+
+    @property
+    def host_list_provider(self) -> Optional[AsyncHostListProvider]:
+        return self._host_list_provider
+
+    @host_list_provider.setter
+    def host_list_provider(self, value: AsyncHostListProvider) -> None:
+        self._host_list_provider = value
+
+    async def refresh_host_list(
+            self,
+            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+        if self._host_list_provider is None:
+            raise AwsWrapperError("AsyncPluginService.host_list_provider is not set")
+        conn = connection if connection is not None else self._current_connection
+        return await self._host_list_provider.refresh(conn)
+
+    async def force_refresh_host_list(
+            self,
+            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+        if self._host_list_provider is None:
+            raise AwsWrapperError("AsyncPluginService.host_list_provider is not set")
+        conn = connection if connection is not None else self._current_connection
+        return await self._host_list_provider.force_refresh(conn)
 
     @property
     def network_bound_methods(self) -> Set[str]:

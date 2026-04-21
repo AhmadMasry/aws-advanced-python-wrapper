@@ -1,8 +1,11 @@
 # tests/unit/test_aio_plugin_service_expansion.py
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 from unittest.mock import MagicMock
+
+import pytest
 
 from aws_advanced_python_wrapper.aio.default_plugin import AsyncDefaultPlugin
 from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -11,6 +14,7 @@ from aws_advanced_python_wrapper.aio.plugin_manager import AsyncPluginManager
 from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
 from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
+from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.utils.properties import Properties
@@ -123,3 +127,62 @@ def test_accepts_strategy_returns_false_when_plugin_manager_unbound():
 def test_get_host_info_by_strategy_returns_none_when_plugin_manager_unbound():
     svc = _make_service()
     assert svc.get_host_info_by_strategy(HostRole.READER, "random", None) is None
+
+
+class _FakeHostListProvider:
+    """Minimal AsyncHostListProvider stand-in for delegation tests."""
+
+    def __init__(self):
+        self.refresh_calls = 0
+        self.force_refresh_calls = 0
+        self._topology = (HostInfo(host="writer-1", port=5432, role=HostRole.WRITER),)
+
+    async def refresh(self, connection):
+        self.refresh_calls += 1
+        return self._topology
+
+    async def force_refresh(self, connection):
+        self.force_refresh_calls += 1
+        return self._topology
+
+
+def test_host_list_provider_defaults_to_none():
+    svc = _make_service()
+    assert svc.host_list_provider is None
+
+
+def test_host_list_provider_is_settable():
+    svc = _make_service()
+    hlp = _FakeHostListProvider()
+    svc.host_list_provider = hlp
+    assert svc.host_list_provider is hlp
+
+
+def test_refresh_host_list_delegates_to_provider():
+    svc = _make_service()
+    hlp = _FakeHostListProvider()
+    svc.host_list_provider = hlp
+    topology = asyncio.run(svc.refresh_host_list())
+    assert topology == hlp._topology
+    assert hlp.refresh_calls == 1
+
+
+def test_force_refresh_host_list_delegates_to_provider():
+    svc = _make_service()
+    hlp = _FakeHostListProvider()
+    svc.host_list_provider = hlp
+    topology = asyncio.run(svc.force_refresh_host_list())
+    assert topology == hlp._topology
+    assert hlp.force_refresh_calls == 1
+
+
+def test_refresh_raises_when_no_provider():
+    svc = _make_service()
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(svc.refresh_host_list())
+
+
+def test_force_refresh_raises_when_no_provider():
+    svc = _make_service()
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(svc.force_refresh_host_list())
