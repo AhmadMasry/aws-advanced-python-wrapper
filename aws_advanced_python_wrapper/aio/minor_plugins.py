@@ -33,7 +33,8 @@ Each plugin is kept intentionally small; none spawn background tasks.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, List,
+                    Optional, Set)
 
 # Re-export: moved to its own module in Phase D.1. Keeping the import path stable
 # so downstream users and the plugin factory don't care where the class lives.
@@ -126,23 +127,90 @@ class AsyncExecuteTimePlugin(AsyncPlugin):
 
 
 class AsyncDeveloperPlugin(AsyncPlugin):
-    """Test-only plugin that injects an exception on the next pipeline call.
+    """Test-only plugin that injects exceptions / callbacks into the pipeline.
 
-    Useful for simulating failover conditions in unit tests. Sync counterpart
-    exists for the same purpose.
+    Mirrors the sync ``DeveloperPlugin`` + ``ExceptionSimulatorManager`` pair.
+    Supports four injection modes, all stored as ``ClassVar`` so tests and
+    debuggers can reach them without holding a plugin instance:
+
+    * ``set_next_connect_exception`` — one-shot exception raised from the next
+      :meth:`connect` call; cleared after firing.
+    * ``set_connect_callback`` — callable invoked on every connect; may raise
+      (the raise is propagated) or return normally. Stays installed until
+      cleared explicitly.
+    * ``set_next_method_exception`` — one-shot exception for the next
+      :meth:`execute`; cleared after firing.
+    * ``set_method_callback`` — callable invoked on every execute. Same
+      semantics as the connect callback.
+
+    Callbacks may be sync or async; if a callback returns a coroutine, the
+    plugin awaits it. :meth:`clear` resets all four slots and is wired into
+    the unit-test ``pytest_runtest_setup`` hook to prevent cross-test leaks
+    (see ``tests/unit/conftest.py``).
+
+    Kept as a test helper; not safe for production use.
     """
 
     _SUBSCRIBED: Set[str] = {DbApiMethod.ALL.method_name}
 
-    def __init__(self) -> None:
-        self._next_exception: Optional[BaseException] = None
+    _next_connect_exception: ClassVar[Optional[BaseException]] = None
+    _connect_callback: ClassVar[Optional[Callable[..., Any]]] = None
+    _next_method_exception: ClassVar[Optional[BaseException]] = None
+    _method_callback: ClassVar[Optional[Callable[..., Any]]] = None
 
+    # Retained for backwards compat with the one-shot execute-only API
+    # shipped before this plugin grew the 4-mode surface. Delegates to
+    # ``set_next_method_exception``; new callers should use the explicit name.
     def set_next_exception(self, exc: BaseException) -> None:
-        self._next_exception = exc
+        AsyncDeveloperPlugin._next_method_exception = exc
+
+    @classmethod
+    def set_next_connect_exception(cls, exc: BaseException) -> None:
+        cls._next_connect_exception = exc
+
+    @classmethod
+    def set_connect_callback(cls, cb: Callable[..., Any]) -> None:
+        cls._connect_callback = cb
+
+    @classmethod
+    def set_next_method_exception(cls, exc: BaseException) -> None:
+        cls._next_method_exception = exc
+
+    @classmethod
+    def set_method_callback(cls, cb: Callable[..., Any]) -> None:
+        cls._method_callback = cb
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._next_connect_exception = None
+        cls._connect_callback = None
+        cls._next_method_exception = None
+        cls._method_callback = None
 
     @property
     def subscribed_methods(self) -> Set[str]:
         return set(self._SUBSCRIBED)
+
+    async def connect(
+            self,
+            target_driver_func: Callable,
+            driver_dialect: AsyncDriverDialect,
+            host_info: HostInfo,
+            props: Properties,
+            is_initial_connection: bool,
+            connect_func: Callable[..., Awaitable[Any]]) -> Any:
+        # Callback fires first; a raise here propagates and does NOT consume
+        # the one-shot exception slot (callbacks are persistent, not one-shot).
+        cb = AsyncDeveloperPlugin._connect_callback
+        if cb is not None:
+            result = cb(host_info, props)
+            if asyncio.iscoroutine(result):
+                await result
+        exc = AsyncDeveloperPlugin._next_connect_exception
+        if exc is not None:
+            AsyncDeveloperPlugin._next_connect_exception = None
+            raise exc
+        return await connect_func()
 
     async def execute(
             self,
@@ -151,9 +219,14 @@ class AsyncDeveloperPlugin(AsyncPlugin):
             execute_func: Callable[..., Awaitable[Any]],
             *args: Any,
             **kwargs: Any) -> Any:
-        if self._next_exception is not None:
-            exc = self._next_exception
-            self._next_exception = None
+        cb = AsyncDeveloperPlugin._method_callback
+        if cb is not None:
+            result = cb(method_name, args, kwargs)
+            if asyncio.iscoroutine(result):
+                await result
+        exc = AsyncDeveloperPlugin._next_method_exception
+        if exc is not None:
+            AsyncDeveloperPlugin._next_method_exception = None
             raise exc
         return await execute_func()
 

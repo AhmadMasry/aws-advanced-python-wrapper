@@ -14,6 +14,7 @@
 
 from aws_advanced_python_wrapper.aio.aurora_connection_tracker import \
     AsyncOpenedConnectionTracker
+from aws_advanced_python_wrapper.aio.minor_plugins import AsyncDeveloperPlugin
 from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
 from aws_advanced_python_wrapper.connection_provider import \
@@ -32,6 +33,7 @@ def pytest_runtest_setup(item):
     AsyncPluginServiceImpl._host_availability_expiring_cache.clear()
     DatabaseDialectManager._known_endpoint_dialects.clear()
     AsyncOpenedConnectionTracker._tracked.clear()
+    AsyncDeveloperPlugin.clear()
 
     ConnectionProviderManager.reset_provider()
     DatabaseDialectManager.reset_custom_dialect()
