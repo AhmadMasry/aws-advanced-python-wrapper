@@ -34,6 +34,7 @@ from urllib.parse import urljoin
 
 from aws_advanced_python_wrapper.aio.auth_plugins import AsyncAuthPluginBase
 from aws_advanced_python_wrapper.errors import AwsWrapperError
+from aws_advanced_python_wrapper.utils.iam_utils import IamAuthUtils
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 
 if TYPE_CHECKING:
@@ -176,6 +177,18 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
         AsyncAuthPluginBase.__init__(self, plugin_service, props)
         _RdsTokenMixin.__init__(self)
 
+    def _default_port(self) -> int:
+        """Dialect-aware default port fallback.
+
+        Uses database_dialect.default_port when available (populated by
+        AsyncAwsWrapperConnection.connect); falls back to 5432 only if
+        no dialect is bound. Matches E.2's pattern for AsyncIamAuthPlugin.
+        """
+        dialect = self._plugin_service.database_dialect
+        if dialect is not None:
+            return dialect.default_port
+        return 5432
+
     async def _resolve_credentials(
             self,
             host_info: HostInfo,
@@ -186,11 +199,7 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
                 "Federated auth requires 'db_user' connection property"
             )
         host = WrapperProperties.IAM_HOST.get(props) or host_info.host
-        port = (
-            WrapperProperties.IAM_DEFAULT_PORT.get_int(props)
-            or host_info.port
-            or 5432
-        )
+        port = IamAuthUtils.get_port(props, host_info, self._default_port())
         region = WrapperProperties.IAM_REGION.get(props)
 
         # 1. Token cache check before expensive SAML round-trip.
@@ -234,11 +243,7 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
         if not db_user:
             return
         host = WrapperProperties.IAM_HOST.get(props) or host_info.host
-        port = (
-            WrapperProperties.IAM_DEFAULT_PORT.get_int(props)
-            or host_info.port
-            or 5432
-        )
+        port = IamAuthUtils.get_port(props, host_info, self._default_port())
         region = WrapperProperties.IAM_REGION.get(props)
         cache_key = self._rds_token_cache_key(
             host, int(port), db_user, region)

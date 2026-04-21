@@ -380,3 +380,38 @@ def test_okta_extract_saml_raises_when_form_missing():
     """Okta override error path."""
     with pytest.raises(AwsWrapperError):
         AsyncOktaAuthPlugin._extract_saml_assertion("<html>nope</html>")
+
+
+def test_federated_port_falls_back_to_database_dialect_default():
+    """When IAM_DEFAULT_PORT is unset and host_info.port is -1, the port
+    comes from database_dialect.default_port (e.g. 3306 for MySQL)."""
+    from aws_advanced_python_wrapper.aio.federated_auth_plugins import \
+        AsyncFederatedAuthPlugin
+
+    props = Properties({
+        "host": "db.us-east-1.rds.amazonaws.com",
+        # port OMITTED
+        "idp_endpoint": "adfs.example.com",
+        "idp_username": "u",
+        "idp_password": "p",
+        "iam_role_arn": "arn:aws:iam::123:role/r",
+        "iam_idp_arn": "arn:aws:iam::123:saml-provider/adfs",
+        "db_user": "dbuser",
+        "iam_region": "us-east-1",
+    })
+    svc = MagicMock()
+    fake_dialect = MagicMock()
+    fake_dialect.default_port = 3306
+    svc.database_dialect = fake_dialect
+    plugin = AsyncFederatedAuthPlugin(svc, props)
+
+    # host_info with no port (-1 sentinel)
+    host = HostInfo(host="db.us-east-1.rds.amazonaws.com")
+
+    # Call the port helper directly -- simpler than exercising the full flow
+    assert plugin._default_port() == 3306
+
+    # And check that IamAuthUtils.get_port receives this default
+    from aws_advanced_python_wrapper.utils.iam_utils import IamAuthUtils
+    port = IamAuthUtils.get_port(props, host, plugin._default_port())
+    assert port == 3306
