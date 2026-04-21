@@ -134,16 +134,40 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
 
         topology = await self._host_list_provider.refresh(current)
         reader_candidates = [h for h in topology if h.role == HostRole.READER]
-        strategy = (WrapperProperties.READER_HOST_SELECTOR_STRATEGY.get(self._props)
-                    or "random")
-        reader = self._plugin_service.get_host_info_by_strategy(
-            HostRole.READER, strategy, reader_candidates)
-        if reader is None:
+        if not reader_candidates:
             raise ReadWriteSplittingError(
                 "No reader host available in the current topology.")
-        new_conn = await self._open(driver_dialect, reader)
-        self._reader_conn = new_conn
-        await self._plugin_service.set_current_connection(new_conn, reader)
+
+        strategy = (WrapperProperties.READER_HOST_SELECTOR_STRATEGY.get(self._props)
+                    or "random")
+
+        # Sync parity (read_write_splitting_plugin.py:578-593): iterate up
+        # to 2*len candidates, removing the dead ones. A non-deterministic
+        # strategy (round_robin with cluster-level state) may repeat picks;
+        # removing from the pool ensures we make forward progress.
+        remaining = list(reader_candidates)
+        last_error: Optional[Exception] = None
+        for _ in range(2 * len(reader_candidates)):
+            if not remaining:
+                break
+            reader = self._plugin_service.get_host_info_by_strategy(
+                HostRole.READER, strategy, remaining)
+            if reader is None:
+                break
+            try:
+                new_conn = await self._open(driver_dialect, reader)
+            except Exception as exc:
+                last_error = exc
+                remaining = [h for h in remaining if h != reader]
+                continue
+            self._reader_conn = new_conn
+            await self._plugin_service.set_current_connection(new_conn, reader)
+            return
+
+        raise ReadWriteSplittingError(
+            f"Could not open a reader connection after "
+            f"{2 * len(reader_candidates)} candidate attempts."
+        ) from last_error
 
     async def _switch_to_writer(
             self,

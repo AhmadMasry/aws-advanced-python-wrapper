@@ -402,3 +402,89 @@ def test_switch_to_reader_allowed_when_not_in_transaction():
 
     asyncio.run(_run())  # no exception
     assert plugin._reader_conn is not None
+
+
+def test_reader_switch_retries_next_candidate_on_connect_failure():
+    """Dead reader is skipped; next candidate tried."""
+    r1 = HostInfo(host="r1.example", port=5432, role=HostRole.READER)
+    r2 = HostInfo(host="r2.example", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="writer.example", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, dd, _ = _build(topology=(writer, r1, r2))
+
+    # Strategy returns r1 first, then r2
+    svc.get_host_info_by_strategy = MagicMock(side_effect=[r1, r2])
+
+    # First connect fails; second succeeds
+    attempts = []
+
+    async def _connect(host_info, props, fn):
+        attempts.append(host_info.host)
+        if host_info is r1:
+            raise OSError("r1 down")
+        return MagicMock(name=f"conn-to-{host_info.host}")
+
+    dd.connect = AsyncMock(side_effect=_connect)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())
+    assert attempts == ["r1.example", "r2.example"]
+    # r2 is now the cached reader
+    assert plugin._reader_conn is not None
+
+
+def test_reader_switch_raises_when_all_candidates_fail():
+    """All readers dead -> ReadWriteSplittingError."""
+    r = HostInfo(host="r.example", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="w.example", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, dd, _ = _build(topology=(writer, r))
+    svc.get_host_info_by_strategy = MagicMock(side_effect=[r, None])
+    dd.connect = AsyncMock(side_effect=OSError("dead"))
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    with pytest.raises(ReadWriteSplittingError):
+        asyncio.run(_run())
+
+
+def test_reader_switch_bounded_by_2x_hosts():
+    """Retry loop stops after 2*len(hosts) attempts (sync parity)."""
+    r1 = HostInfo(host="r1", port=5432, role=HostRole.READER)
+    r2 = HostInfo(host="r2", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="w", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, dd, _ = _build(topology=(writer, r1, r2))
+
+    # Strategy returns a candidate repeatedly even after "removal" (simulate
+    # a broken strategy that doesn't update internal state). The plugin's
+    # own remove-from-list should exhaust candidates eventually.
+    svc.get_host_info_by_strategy = MagicMock(
+        side_effect=lambda role, strategy, candidates: (
+            candidates[0] if candidates else None))
+    dd.connect = AsyncMock(side_effect=OSError("always fail"))
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    with pytest.raises(ReadWriteSplittingError):
+        asyncio.run(_run())
+    # 2 readers in topology -> max 2 attempts (since we remove dead ones
+    # each iteration, the 4 iterations of sync's loop become 2 effective
+    # attempts). Verify we didn't spin more than necessary.
+    assert dd.connect.await_count <= 4  # generous upper bound
