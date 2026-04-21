@@ -12,6 +12,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from aws_advanced_python_wrapper.aio.plugin_service import \
+    AsyncPluginServiceImpl
 from aws_advanced_python_wrapper.connection_provider import \
     ConnectionProviderManager
 from aws_advanced_python_wrapper.database_dialect import DatabaseDialectManager
@@ -25,6 +27,7 @@ from aws_advanced_python_wrapper.utils import services_container
 def pytest_runtest_setup(item):
     services_container.get_storage_service().clear_all()
     PluginServiceImpl._host_availability_expiring_cache.clear()
+    AsyncPluginServiceImpl._host_availability_expiring_cache.clear()
     DatabaseDialectManager._known_endpoint_dialects.clear()
 
     ConnectionProviderManager.reset_provider()
