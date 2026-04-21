@@ -270,3 +270,20 @@ def test_release_resources_skips_provider_without_hook():
     svc.host_list_provider = _FakeHostListProvider()  # No release_resources method
     # Must not raise; must not attempt to call release on a provider lacking the method
     asyncio.run(svc.release_resources())
+
+
+def test_is_read_only_connection_exception_returns_false_when_no_dialect():
+    svc = _make_service()
+    assert svc.is_read_only_connection_exception(error=Exception("boom")) is False
+
+
+def test_is_read_only_connection_exception_delegates_to_dialect_handler():
+    dialect = MagicMock(spec=DatabaseDialect)
+    handler = MagicMock()
+    handler.is_read_only_connection_exception.return_value = True
+    dialect.exception_handler = handler
+    svc = _make_service(database_dialect=dialect)
+    err = Exception("read-only connection")
+    assert svc.is_read_only_connection_exception(error=err, sql_state="25006") is True
+    handler.is_read_only_connection_exception.assert_called_once_with(
+        error=err, sql_state="25006")

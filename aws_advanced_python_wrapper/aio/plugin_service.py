@@ -90,6 +90,12 @@ class AsyncPluginService(Protocol):
             sql_state: Optional[str] = None) -> bool:
         ...
 
+    def is_read_only_connection_exception(
+            self,
+            error: Optional[Exception] = None,
+            sql_state: Optional[str] = None) -> bool:
+        ...
+
     def set_availability(
             self,
             host_aliases: FrozenSet[str],
@@ -241,6 +247,13 @@ class AsyncPluginServiceImpl(AsyncPluginService):
             error: Optional[Exception] = None,
             sql_state: Optional[str] = None) -> bool:
         return self._exception_manager.is_login_exception(
+            self._database_dialect, error=error, sql_state=sql_state)
+
+    def is_read_only_connection_exception(
+            self,
+            error: Optional[Exception] = None,
+            sql_state: Optional[str] = None) -> bool:
+        return self._exception_manager.is_read_only_connection_exception(
             self._database_dialect, error=error, sql_state=sql_state)
 
     def set_availability(
