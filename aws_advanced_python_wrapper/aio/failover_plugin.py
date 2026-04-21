@@ -33,6 +33,7 @@ from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import (
     AwsWrapperError, FailoverFailedError, FailoverSuccessError,
     TransactionResolutionUnknownError)
+from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.failover_mode import (FailoverMode,
@@ -158,7 +159,14 @@ class AsyncFailoverPlugin(AsyncPlugin):
         ) from original_exc
 
     async def _do_failover(self, driver_dialect: AsyncDriverDialect) -> None:
-        """Orchestrate the failover: probe topology, pick target, reconnect."""
+        """Orchestrate the failover: probe topology, pick target, reconnect.
+
+        On connection attempts, mark each candidate's availability
+        through the plugin service so the retry loop (and other
+        plugins) stop hammering hosts that are known-dead and so a
+        host that recovers is put back into rotation promptly
+        (B.3 / A.3 TTL cache).
+        """
         deadline = asyncio.get_event_loop().time() + self._failover_timeout_sec
         last_error: Optional[BaseException] = None
 
@@ -167,17 +175,30 @@ class AsyncFailoverPlugin(AsyncPlugin):
                 topology = await self._host_list_provider.force_refresh(
                     self._plugin_service.current_connection
                 )
-                target = self._pick_target(topology)
-                if target is None:
-                    await asyncio.sleep(1.0)
-                    continue
-
-                new_conn = await self._open_connection(target, driver_dialect)
-                if new_conn is not None:
-                    await self._plugin_service.set_current_connection(new_conn, target)
-                    return
             except Exception as e:
                 last_error = e
+                await asyncio.sleep(1.0)
+                continue
+
+            target = self._pick_target(topology)
+            if target is None:
+                await asyncio.sleep(1.0)
+                continue
+
+            try:
+                new_conn = await self._open_connection(target, driver_dialect)
+            except Exception as e:
+                self._plugin_service.set_availability(
+                    frozenset({target.as_alias()}), HostAvailability.UNAVAILABLE)
+                last_error = e
+                await asyncio.sleep(1.0)
+                continue
+
+            if new_conn is not None:
+                self._plugin_service.set_availability(
+                    frozenset({target.as_alias()}), HostAvailability.AVAILABLE)
+                await self._plugin_service.set_current_connection(new_conn, target)
+                return
 
             await asyncio.sleep(1.0)
 

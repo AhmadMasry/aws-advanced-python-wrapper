@@ -28,6 +28,7 @@ from aws_advanced_python_wrapper.aio.plugin_service import \
 from aws_advanced_python_wrapper.errors import (
     FailoverFailedError, FailoverSuccessError,
     TransactionResolutionUnknownError)
+from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.utils.failover_mode import FailoverMode
 from aws_advanced_python_wrapper.utils.properties import Properties
@@ -376,3 +377,42 @@ def test_failover_no_current_connection_treated_as_not_in_txn():
 
     with pytest.raises(FailoverSuccessError):
         asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _raising))
+
+
+# ---- B.3: set_availability on connect success / failure ----------------
+
+
+def test_failover_marks_connected_host_available():
+    """Successful reconnect -> host marked AVAILABLE."""
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin()
+    svc.set_availability = MagicMock()
+
+    # Force topology to a single writer that will succeed
+    writer = HostInfo(host="w1", port=5432, role=HostRole.WRITER)
+    host_list_provider.force_refresh = AsyncMock(return_value=(writer,))
+
+    # Stub _open_connection to succeed
+    plugin._open_connection = AsyncMock(return_value=MagicMock(name="new_conn"))
+
+    asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
+
+    svc.set_availability.assert_any_call(
+        frozenset({writer.as_alias()}), HostAvailability.AVAILABLE)
+
+
+def test_failover_marks_failed_host_unavailable():
+    """Connect failure -> host marked UNAVAILABLE."""
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin(timeout_sec=0.5)
+    svc.set_availability = MagicMock()
+
+    writer = HostInfo(host="dead-writer", port=5432, role=HostRole.WRITER)
+    host_list_provider.force_refresh = AsyncMock(return_value=(writer,))
+
+    # Open always fails
+    plugin._open_connection = AsyncMock(side_effect=OSError("refused"))
+
+    with pytest.raises(FailoverFailedError):
+        asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
+
+    svc.set_availability.assert_any_call(
+        frozenset({writer.as_alias()}), HostAvailability.UNAVAILABLE)
