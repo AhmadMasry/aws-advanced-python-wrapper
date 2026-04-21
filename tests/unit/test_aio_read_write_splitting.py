@@ -69,6 +69,9 @@ def _build(topology: Optional[tuple] = None):
 
     plugin = AsyncReadWriteSplittingPlugin(svc, hlp, props)
     plugin._writer_conn = writer_conn
+    plugin._writer_host_info = HostInfo(
+        host="writer.example", port=5432, role=HostRole.WRITER
+    )
     return plugin, svc, hlp, driver_dialect, writer_conn
 
 
@@ -488,3 +491,87 @@ def test_reader_switch_bounded_by_2x_hosts():
     # each iteration, the 4 iterations of sync's loop become 2 effective
     # attempts). Verify we didn't spin more than necessary.
     assert dd.connect.await_count <= 4  # generous upper bound
+
+
+def test_switch_to_reader_discards_cached_conn_when_host_not_in_topology():
+    """If the cached reader's host was removed from topology, drop cache + reopen."""
+    old_reader = HostInfo(host="old-reader", port=5432, role=HostRole.READER)
+    new_reader = HostInfo(host="new-reader", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="w", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, dd, _ = _build(topology=(writer, new_reader))
+
+    # Seed a cached reader that's NOT in the new topology
+    old_reader_conn = MagicMock(name="old_reader_conn")
+    plugin._reader_conn = old_reader_conn
+    plugin._reader_host_info = old_reader
+
+    svc.get_host_info_by_strategy = MagicMock(return_value=new_reader)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())
+    # The cached reader was discarded, a new one opened for new_reader
+    dd.connect.assert_awaited()
+    # _reader_host_info now reflects the NEW reader, not the old one
+    assert plugin._reader_host_info is new_reader
+
+
+def test_switch_to_writer_discards_cached_conn_when_host_not_in_topology():
+    """Same but for writer-side cache."""
+    old_writer = HostInfo(host="old-w", port=5432, role=HostRole.WRITER)
+    new_writer = HostInfo(host="new-w", port=5432, role=HostRole.WRITER)
+    reader = HostInfo(host="r", port=5432, role=HostRole.READER)
+    plugin, svc, hlp, dd, _ = _build(topology=(new_writer, reader))
+
+    old_writer_conn = MagicMock(name="old_writer_conn")
+    plugin._writer_conn = old_writer_conn
+    plugin._writer_host_info = old_writer
+
+    # Start as if we're on a reader -- flipping read_only=False triggers writer swap
+    current_reader_conn = MagicMock(name="current_reader_conn")
+    svc._current_connection = current_reader_conn
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, False)
+
+    asyncio.run(_run())
+    # A new writer connection was opened to new_writer
+    dd.connect.assert_awaited()
+    assert plugin._writer_host_info is new_writer
+
+
+def test_cached_reader_reuse_still_works_when_host_in_topology():
+    """Sanity: when the cached reader IS in topology, reuse is preserved."""
+    reader = HostInfo(host="r", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="w", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, dd, _ = _build(topology=(writer, reader))
+
+    cached_reader_conn = MagicMock(name="cached_reader")
+    plugin._reader_conn = cached_reader_conn
+    plugin._reader_host_info = reader
+
+    initial_connect_count = dd.connect.await_count
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())
+    # No new connect -- cached reader reused
+    assert dd.connect.await_count == initial_connect_count
+    assert plugin._reader_conn is cached_reader_conn

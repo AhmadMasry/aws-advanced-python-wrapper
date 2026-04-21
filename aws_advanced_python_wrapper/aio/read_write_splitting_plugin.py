@@ -58,7 +58,9 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         self._host_list_provider = host_list_provider
         self._props = props
         self._writer_conn: Optional[Any] = None
+        self._writer_host_info: Optional[HostInfo] = None
         self._reader_conn: Optional[Any] = None
+        self._reader_host_info: Optional[HostInfo] = None
 
     @property
     def subscribed_methods(self) -> Set[str]:
@@ -77,6 +79,7 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         # set_read_only flip doesn't need to re-open the writer later.
         if is_initial_connection and self._writer_conn is None:
             self._writer_conn = conn
+            self._writer_host_info = host_info
         return conn
 
     async def execute(
@@ -115,6 +118,16 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             await self._switch_to_writer(driver_dialect, current)
         return await execute_func()
 
+    @staticmethod
+    def _host_in_topology(
+            host_info: HostInfo,
+            topology: tuple) -> bool:
+        """Return True if ``host_info`` (by host+port) is in the topology."""
+        for h in topology:
+            if h.host == host_info.host and h.port == host_info.port:
+                return True
+        return False
+
     async def _switch_to_reader(
             self,
             driver_dialect: AsyncDriverDialect,
@@ -122,17 +135,25 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         # Cache the writer we came from so we can bounce back quickly.
         if self._writer_conn is None:
             self._writer_conn = current
-
-        # Reuse an existing reader connection if we have one.
-        if self._reader_conn is not None:
-            if not await driver_dialect.is_closed(self._reader_conn):
-                await self._plugin_service.set_current_connection(
-                    self._reader_conn,
-                    self._plugin_service.current_host_info,  # type: ignore[arg-type]
-                )
-                return
+            if self._plugin_service.current_host_info is not None:
+                self._writer_host_info = self._plugin_service.current_host_info
 
         topology = await self._host_list_provider.refresh(current)
+
+        # Try to reuse cached reader if (a) it's not closed AND (b) its
+        # host is still in topology.
+        if (self._reader_conn is not None
+                and self._reader_host_info is not None
+                and self._host_in_topology(self._reader_host_info, topology)
+                and not await driver_dialect.is_closed(self._reader_conn)):
+            await self._plugin_service.set_current_connection(
+                self._reader_conn, self._reader_host_info)
+            return
+
+        # Cache invalid -> drop and reopen
+        self._reader_conn = None
+        self._reader_host_info = None
+
         reader_candidates = [h for h in topology if h.role == HostRole.READER]
         if not reader_candidates:
             raise ReadWriteSplittingError(
@@ -161,6 +182,7 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
                 remaining = [h for h in remaining if h != reader]
                 continue
             self._reader_conn = new_conn
+            self._reader_host_info = reader
             await self._plugin_service.set_current_connection(new_conn, reader)
             return
 
@@ -173,15 +195,22 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             self,
             driver_dialect: AsyncDriverDialect,
             current: Any) -> None:
-        if self._writer_conn is not None and self._writer_conn is not current:
-            if not await driver_dialect.is_closed(self._writer_conn):
-                await self._plugin_service.set_current_connection(
-                    self._writer_conn,
-                    self._plugin_service.current_host_info,  # type: ignore[arg-type]
-                )
-                return
-
         topology = await self._host_list_provider.refresh(current)
+
+        # Try to reuse cached writer if valid + in topology + not closed.
+        if (self._writer_conn is not None
+                and self._writer_conn is not current
+                and self._writer_host_info is not None
+                and self._host_in_topology(self._writer_host_info, topology)
+                and not await driver_dialect.is_closed(self._writer_conn)):
+            await self._plugin_service.set_current_connection(
+                self._writer_conn, self._writer_host_info)
+            return
+
+        # Cache invalid -> drop and reopen
+        self._writer_conn = None
+        self._writer_host_info = None
+
         writer = next(
             (h for h in topology if h.role == HostRole.WRITER),
             None,
@@ -192,6 +221,7 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             )
         new_conn = await self._open(driver_dialect, writer)
         self._writer_conn = new_conn
+        self._writer_host_info = writer
         await self._plugin_service.set_current_connection(new_conn, writer)
 
     async def _open(
