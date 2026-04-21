@@ -199,3 +199,15 @@ def test_refresh_does_not_mutate_all_hosts_on_error():
     with pytest.raises(AwsWrapperError):
         asyncio.run(svc.refresh_host_list())
     assert svc.all_hosts == ()
+
+
+def test_initial_connection_host_info_defaults_to_none():
+    svc = _make_service()
+    assert svc.initial_connection_host_info is None
+
+
+def test_initial_connection_host_info_is_settable():
+    svc = _make_service()
+    host = HostInfo(host="writer-1", port=5432, role=HostRole.WRITER)
+    svc.initial_connection_host_info = host
+    assert svc.initial_connection_host_info is host

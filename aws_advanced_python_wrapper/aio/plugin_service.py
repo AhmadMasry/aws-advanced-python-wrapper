@@ -119,6 +119,15 @@ class AsyncPluginService(Protocol):
         """Last-refreshed topology. Empty tuple before first refresh."""
         ...
 
+    @property
+    def initial_connection_host_info(self) -> Optional[HostInfo]:
+        """First host the user connected to. ``None`` before connect."""
+        ...
+
+    @initial_connection_host_info.setter
+    def initial_connection_host_info(self, value: Optional[HostInfo]) -> None:
+        ...
+
     async def refresh_host_list(
             self,
             connection: Optional[Any] = None) -> None:
@@ -187,6 +196,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._plugin_manager: Optional[AsyncPluginManager] = None
         self._host_list_provider: Optional[AsyncHostListProvider] = None
         self._all_hosts: Tuple[HostInfo, ...] = ()
+        self._initial_connection_host_info: Optional[HostInfo] = None
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
 
@@ -275,6 +285,14 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     @property
     def all_hosts(self) -> Tuple[HostInfo, ...]:
         return self._all_hosts
+
+    @property
+    def initial_connection_host_info(self) -> Optional[HostInfo]:
+        return self._initial_connection_host_info
+
+    @initial_connection_host_info.setter
+    def initial_connection_host_info(self, value: Optional[HostInfo]) -> None:
+        self._initial_connection_host_info = value
 
     async def refresh_host_list(
             self,
