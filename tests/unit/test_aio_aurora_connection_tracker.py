@@ -57,14 +57,14 @@ def test_tracker_records_connection_on_connect():
             connect_func=_connect_func)
 
     asyncio.run(_run())
-    tracked = tracker._tracked_for(host.as_aliases())
+    tracked = tracker._tracked_for(host)
     assert conn in tracked
 
 
 def test_tracker_returns_empty_set_for_unknown_host():
     tracker = AsyncOpenedConnectionTracker()
     h = HostInfo(host="ghost", port=5432)
-    assert len(tracker._tracked_for(h.as_aliases())) == 0
+    assert len(tracker._tracked_for(h)) == 0
 
 
 def test_invalidate_all_closes_tracked_connections():
@@ -191,9 +191,9 @@ def test_tracker_remove_drops_connection_from_set():
     host = HostInfo(host="w", port=5432, role=HostRole.WRITER)
     conn = MagicMock(name="conn")
     tracker.track(host, conn)
-    assert conn in tracker._tracked_for(host.as_aliases())
+    assert conn in tracker._tracked_for(host)
     tracker.remove(host, conn)
-    assert conn not in tracker._tracked_for(host.as_aliases())
+    assert conn not in tracker._tracked_for(host)
 
 
 def test_tracker_state_is_shared_across_instances():
@@ -206,7 +206,7 @@ def test_tracker_state_is_shared_across_instances():
 
     tracker_a.track(host, conn)
     # tracker_b should see it too
-    assert conn in tracker_b._tracked_for(host.as_aliases())
+    assert conn in tracker_b._tracked_for(host)
 
     # And invalidating via tracker_b closes it
     asyncio.run(tracker_b.invalidate_all(host))
@@ -358,3 +358,42 @@ def test_parse_alias_helper():
     assert AsyncAuroraConnectionTrackerPlugin._parse_alias("[::1]:5432") == ("[::1]", 5432)
     assert AsyncAuroraConnectionTrackerPlugin._parse_alias("h-no-port") == ("h-no-port", 5432)
     assert AsyncAuroraConnectionTrackerPlugin._parse_alias("h:not-a-port") == ("h", 5432)
+
+
+def test_tracker_keys_by_instance_endpoint_for_cluster_connected_conn():
+    """When tracking via a cluster endpoint HostInfo whose aliases
+    include the instance endpoint, the canonical key is the instance
+    endpoint -- so notify-based invalidation by instance alias finds it."""
+    tracker = AsyncOpenedConnectionTracker()
+    # Cluster endpoint hostname that is NOT an RDS instance per is_rds_instance,
+    # but aliases include the instance endpoint.
+    cluster_host = HostInfo(
+        host="mydb.cluster-abc123.us-east-1.rds.amazonaws.com",
+        port=5432,
+        role=HostRole.WRITER,
+    )
+    # Add a known RDS instance alias
+    cluster_host.add_alias("myinstance.abc123.us-east-1.rds.amazonaws.com:5432")
+
+    conn = MagicMock(name="conn")
+    conn.close = MagicMock()
+    tracker.track(cluster_host, conn)
+
+    # Canonical key is the instance alias, not the cluster host:port
+    assert AsyncOpenedConnectionTracker._canonical_key(cluster_host) == \
+        "myinstance.abc123.us-east-1.rds.amazonaws.com:5432"
+
+    # invalidate_all via a HostInfo that resolves to the same instance alias
+    # should close the tracked conn
+    instance_host = HostInfo(
+        host="myinstance.abc123.us-east-1.rds.amazonaws.com",
+        port=5432,
+    )
+    asyncio.run(tracker.invalidate_all(instance_host))
+    conn.close.assert_called()
+
+
+def test_tracker_fallback_to_host_port_for_non_rds_host():
+    """Non-RDS hostnames use host:port as the canonical key (no RDS alias found)."""
+    host = HostInfo(host="custom.example.com", port=5432)
+    assert AsyncOpenedConnectionTracker._canonical_key(host) == "custom.example.com:5432"

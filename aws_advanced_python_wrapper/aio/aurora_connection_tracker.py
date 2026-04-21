@@ -16,11 +16,11 @@
 
 Port of sync ``aurora_connection_tracker_plugin.py``. Tracks every
 connection opened through the plugin pipeline in a class-level
-:class:`AsyncOpenedConnectionTracker` registry keyed by host alias
-set. On writer change (detected via ``AsyncPluginService.all_hosts``
-or a raised :class:`FailoverError`), closes every tracked connection
-to the old writer so pooled consumers don't reuse a stale
-demoted-writer socket.
+:class:`AsyncOpenedConnectionTracker` registry keyed by the RDS
+instance-endpoint alias (mirroring sync normalization). On writer
+change (detected via ``AsyncPluginService.all_hosts`` or a raised
+:class:`FailoverError`), closes every tracked connection to the old
+writer so pooled consumers don't reuse a stale demoted-writer socket.
 
 Simpler than the sync implementation:
 
@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict,
-                    FrozenSet, Optional, Set)
+                    Optional, Set)
 from weakref import WeakSet
 
 from aws_advanced_python_wrapper.aio.cleanup import register_shutdown_hook
@@ -49,6 +49,7 @@ from aws_advanced_python_wrapper.errors import FailoverError
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.notifications import HostEvent
+from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -60,6 +61,17 @@ if TYPE_CHECKING:
 
 class AsyncOpenedConnectionTracker:
     """Alias-keyed registry of open connections, shared across plugin instances.
+
+    Keys by the RDS **instance** endpoint alias when one is present in
+    ``host_info.as_aliases()`` -- matching sync's
+    :class:`OpenedConnectionTracker` at
+    ``aurora_connection_tracker_plugin.py:47``. Falls back to
+    ``host_info.as_alias()`` when no RDS instance alias is
+    discoverable (non-Aurora or custom endpoint connections).
+
+    This lets a cluster-endpoint-connected session still be
+    invalidated when a later ``CONVERTED_TO_READER`` notification
+    carries the instance alias.
 
     Class-level ``_tracked`` mirrors sync ``OpenedConnectionTracker`` at
     ``aurora_connection_tracker_plugin.py:47`` so multiple pooled
@@ -73,32 +85,49 @@ class AsyncOpenedConnectionTracker:
     * :meth:`invalidate_all` awaits ``conn.close()`` (async or sync) directly.
     """
 
-    _tracked: ClassVar[Dict[FrozenSet[str], WeakSet[Any]]] = {}
+    _tracked: ClassVar[Dict[str, WeakSet[Any]]] = {}
 
     def __init__(self) -> None:
         # Instance-level nothing -- all state lives on the class dict.
         pass
 
+    @staticmethod
+    def _canonical_key(host_info: HostInfo) -> str:
+        """Return the instance-endpoint alias if available, else host:port.
+
+        Mirrors sync's multi-alias normalization in
+        ``populate_opened_connection_set``/``invalidate_all_connections``/
+        ``remove_connection_tracking`` at
+        ``aurora_connection_tracker_plugin.py:116-137``.
+        """
+        rds_utils = RdsUtils()
+        if rds_utils.is_rds_instance(host_info.host):
+            return host_info.as_alias()
+        for alias in host_info.as_aliases():
+            if rds_utils.is_rds_instance(rds_utils.remove_port(alias)):
+                return alias
+        return host_info.as_alias()
+
     def track(self, host_info: HostInfo, conn: Any) -> None:
-        aliases = host_info.as_aliases()
+        key = self._canonical_key(host_info)
         conn_set = AsyncOpenedConnectionTracker._tracked.setdefault(
-            aliases, WeakSet())
+            key, WeakSet())
         conn_set.add(conn)
 
     def remove(self, host_info: HostInfo, conn: Any) -> None:
-        aliases = host_info.as_aliases()
-        conn_set = AsyncOpenedConnectionTracker._tracked.get(aliases)
+        key = self._canonical_key(host_info)
+        conn_set = AsyncOpenedConnectionTracker._tracked.get(key)
         if conn_set is not None:
             conn_set.discard(conn)
 
     async def invalidate_all(self, host_info: HostInfo) -> None:
-        """Close every tracked connection to ``host_info``'s aliases.
+        """Close every tracked connection to ``host_info``'s canonical key.
 
         Best-effort: individual close failures are swallowed so one
         broken connection doesn't block closing the rest.
         """
-        aliases = host_info.as_aliases()
-        conn_set = AsyncOpenedConnectionTracker._tracked.get(aliases)
+        key = self._canonical_key(host_info)
+        conn_set = AsyncOpenedConnectionTracker._tracked.get(key)
         if conn_set is None:
             return
         snapshot = list(conn_set)
@@ -113,13 +142,14 @@ class AsyncOpenedConnectionTracker:
             except Exception:  # noqa: BLE001 - close is best-effort
                 pass
         try:
-            del AsyncOpenedConnectionTracker._tracked[aliases]
+            del AsyncOpenedConnectionTracker._tracked[key]
         except KeyError:
             pass
 
-    def _tracked_for(self, aliases: FrozenSet[str]) -> WeakSet[Any]:
-        """Test-only accessor; returns the tracked ``WeakSet`` or an empty one."""
-        return AsyncOpenedConnectionTracker._tracked.get(aliases, WeakSet())
+    def _tracked_for(self, host_info: HostInfo) -> WeakSet[Any]:
+        """Test-only accessor using the canonical key derivation."""
+        key = self._canonical_key(host_info)
+        return AsyncOpenedConnectionTracker._tracked.get(key, WeakSet())
 
 
 class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
@@ -249,15 +279,10 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
           :attr:`_current_writer` so the next ``execute`` re-detects the
           new writer via :meth:`_update_writer_from_topology`.
 
-        Limitation: the incoming ``alias`` is a single ``host:port``
-        string; :meth:`AsyncOpenedConnectionTracker.invalidate_all` keys
-        by ``host_info.as_aliases()`` which will also be the same single
-        alias (round-trip through :class:`HostInfo`). If the pool tracked
-        the host via a different alias (e.g. cluster endpoint vs
-        instance endpoint), invalidation misses. Sync handles
-        multi-alias reconciliation via its ``_rds_utils``-driven
-        ``populate_opened_connection_set`` normalization -- out of scope
-        for Phase D.
+        With the tracker's canonical-key normalization (instance alias
+        over cluster alias), a notify carrying the instance alias for a
+        cluster-connected session now correctly finds and invalidates
+        the tracked entries.
         """
         for alias, events in changes.items():
             if HostEvent.CONVERTED_TO_READER in events:
