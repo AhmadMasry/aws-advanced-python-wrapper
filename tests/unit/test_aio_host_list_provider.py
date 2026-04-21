@@ -378,3 +378,73 @@ def test_topology_monitor_high_freq_expires_after_period():
     high_until, now_ns = asyncio.run(_run_briefly())
     # High-freq period should have expired (we waited past it)
     assert high_until < now_ns
+
+
+# ---- G.2: ignore-request window after writer found -----------------------
+
+
+def test_topology_monitor_ignores_requests_after_writer_confirmed():
+    """After an internal refresh sees a writer, should_ignore_refresh_request
+    returns True for IGNORE_REQUEST_SEC."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    topology = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),)
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=topology)
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: MagicMock(),
+        refresh_interval_sec=0.05,
+        high_refresh_rate_sec=0.01,
+    )
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.08)  # let at least one tick complete
+        ignore_during = monitor.should_ignore_refresh_request()
+        await monitor.stop()
+        return ignore_during
+
+    ignored = asyncio.run(_run())
+    assert ignored is True
+
+
+def test_topology_monitor_does_not_ignore_when_no_writer_seen():
+    """Before any tick observes a writer, requests are NOT ignored."""
+    monitor = AsyncClusterTopologyMonitor(
+        provider=MagicMock(),
+        connection_getter=lambda: MagicMock(),
+        refresh_interval_sec=30.0,
+    )
+    assert monitor.should_ignore_refresh_request() is False
+
+
+def test_topology_monitor_ignore_window_expires():
+    """After IGNORE_REQUEST_SEC passes, requests are no longer ignored."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    topology = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),)
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=topology)
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: MagicMock(),
+        refresh_interval_sec=0.05,
+        high_refresh_rate_sec=0.01,
+    )
+    # Shorten window for the test
+    monitor.IGNORE_REQUEST_SEC = 0.05
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.02)  # initial tick happens
+        assert monitor.should_ignore_refresh_request() is True
+        await asyncio.sleep(0.1)  # past the 50ms window
+        ignore_after = monitor.should_ignore_refresh_request()
+        await monitor.stop()
+        return ignore_after
+
+    ignored = asyncio.run(_run())
+    assert ignored is False

@@ -48,6 +48,7 @@ class AsyncClusterTopologyMonitor:
     """Drive periodic topology refresh against the current connection."""
 
     HIGH_REFRESH_PERIOD_SEC: float = 30.0
+    IGNORE_REQUEST_SEC: float = 10.0
 
     def __init__(
             self,
@@ -75,6 +76,7 @@ class AsyncClusterTopologyMonitor:
         self._stop_event = asyncio.Event()
         self._last_known_writer: Optional[str] = None
         self._high_refresh_until_ns: int = 0
+        self._ignore_requests_until_ns: int = 0
 
     @property
     def high_refresh_rate_sec(self) -> float:
@@ -137,13 +139,31 @@ class AsyncClusterTopologyMonitor:
                 break
         if new_writer is None:
             return
-        if (self._last_known_writer is not None
-                and new_writer != self._last_known_writer):
+        writer_changed = (self._last_known_writer is not None
+                          and new_writer != self._last_known_writer)
+        is_new_writer = self._last_known_writer is None
+        if writer_changed:
             # Writer changed -- enter high-freq mode.
             self._high_refresh_until_ns = (
                 time.time_ns()
                 + int(self.HIGH_REFRESH_PERIOD_SEC * 1_000_000_000))
         self._last_known_writer = new_writer
+        # Writer is confirmed (first-seen or changed) -- start the
+        # ignore-request window. Subsequent ticks that re-observe the
+        # same writer do NOT re-extend the window, so it naturally
+        # expires IGNORE_REQUEST_SEC after the last writer transition.
+        if is_new_writer or writer_changed:
+            self._ignore_requests_until_ns = (
+                time.time_ns()
+                + int(self.IGNORE_REQUEST_SEC * 1_000_000_000))
+
+    def should_ignore_refresh_request(self) -> bool:
+        """Return True if the monitor recently confirmed the writer and
+        external refresh requests should be deferred.
+
+        Mirrors sync cluster_topology_monitor.py:136-141.
+        """
+        return time.time_ns() < self._ignore_requests_until_ns
 
     async def stop(self) -> None:
         """Signal the task to exit and await its termination."""
