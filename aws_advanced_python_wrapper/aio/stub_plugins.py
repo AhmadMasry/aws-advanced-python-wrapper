@@ -69,13 +69,7 @@ class AsyncBlueGreenStubPlugin(_AsyncStubPlugin):
     _STUB_NAME = "bg"
 
 
-class AsyncFastestResponseStrategyStubPlugin(_AsyncStubPlugin):
-    """Stub for sync FastestResponseStrategyPlugin ('fastest_response_strategy')."""
-    _STUB_NAME = "fastest_response_strategy"
-
-
 __all__ = [
     "AsyncBlueGreenStubPlugin",
-    "AsyncFastestResponseStrategyStubPlugin",
     "AsyncLimitlessStubPlugin",
 ]

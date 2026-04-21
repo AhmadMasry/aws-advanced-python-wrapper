@@ -41,8 +41,7 @@ from aws_advanced_python_wrapper.aio.minor_plugins import (
 from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
     AsyncReadWriteSplittingPlugin
 from aws_advanced_python_wrapper.aio.stub_plugins import (
-    AsyncBlueGreenStubPlugin, AsyncFastestResponseStrategyStubPlugin,
-    AsyncLimitlessStubPlugin)
+    AsyncBlueGreenStubPlugin, AsyncLimitlessStubPlugin)
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
@@ -183,6 +182,16 @@ class _InitialConnectionFactory:
         return AsyncAuroraInitialConnectionStrategyPlugin(plugin_service)
 
 
+class _FastestResponseFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        # Local import keeps module load-order cheap -- users who don't
+        # opt into the fastest_response strategy never load the probe path.
+        from aws_advanced_python_wrapper.aio.fastest_response_strategy_plugin import \
+            AsyncFastestResponseStrategyPlugin
+        return AsyncFastestResponseStrategyPlugin(plugin_service, props)
+
+
 class _AsyncStubFactory:
     """Factory that instantiates a pass-through stub plugin.
 
@@ -203,8 +212,6 @@ class _AsyncStubFactory:
 
 _LimitlessFactory = _AsyncStubFactory(AsyncLimitlessStubPlugin)
 _BlueGreenFactory = _AsyncStubFactory(AsyncBlueGreenStubPlugin)
-_FastestResponseFactory = _AsyncStubFactory(
-    AsyncFastestResponseStrategyStubPlugin)
 
 
 # ---- Registry ----------------------------------------------------------
@@ -234,13 +241,13 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "custom_endpoint": _CustomEndpointFactory(),
     "stale_dns": _StaleDnsFactory(),
     "initial_connection": _InitialConnectionFactory(),
+    "fastest_response_strategy": _FastestResponseFactory(),
     # ---- Phase H.2 stubs: plugin codes not yet ported to async. ----
     # Registered so users can keep sync/async `plugins="..."` config
     # strings identical. Each stub subscribes to nothing and logs a
     # WARNING on construction; full async ports land in later phases.
     "limitless": _LimitlessFactory,
     "bg": _BlueGreenFactory,
-    "fastest_response_strategy": _FastestResponseFactory,
 }
 
 
@@ -259,6 +266,7 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _AwsSecretsManagerFactory: 800,
     _FederatedAuthFactory: 820,
     _OktaAuthFactory: 830,
+    _FastestResponseFactory: 600,
     _ConnectTimeFactory: 900,
     _ExecuteTimeFactory: 910,
     _DeveloperFactory: 1000,
