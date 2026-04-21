@@ -147,7 +147,7 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         self._monitor_stop = asyncio.Event()
         self._consecutive_failures = 0
         driver_dialect = self._plugin_service.driver_dialect
-        self._monitor_task = asyncio.get_event_loop().create_task(
+        self._monitor_task = asyncio.create_task(
             self._monitor(conn, driver_dialect, self._monitor_stop)
         )
 

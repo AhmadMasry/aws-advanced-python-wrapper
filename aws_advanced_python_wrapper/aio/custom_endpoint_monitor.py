@@ -82,7 +82,7 @@ class AsyncCustomEndpointMonitor:
         if self.is_running():
             return
         self._stop_event.clear()
-        self._task = asyncio.get_event_loop().create_task(self._run())
+        self._task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
         try:
