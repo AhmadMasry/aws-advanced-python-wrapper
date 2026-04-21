@@ -27,6 +27,7 @@ from typing import (TYPE_CHECKING, Any, ClassVar, FrozenSet, List, Optional,
 
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
+from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.storage.cache_map import CacheMap
 
 if TYPE_CHECKING:
@@ -113,14 +114,19 @@ class AsyncPluginService(Protocol):
     def host_list_provider(self, value: AsyncHostListProvider) -> None:
         ...
 
+    @property
+    def all_hosts(self) -> Tuple[HostInfo, ...]:
+        """Last-refreshed topology. Empty tuple before first refresh."""
+        ...
+
     async def refresh_host_list(
             self,
-            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+            connection: Optional[Any] = None) -> None:
         ...
 
     async def force_refresh_host_list(
             self,
-            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+            connection: Optional[Any] = None) -> None:
         ...
 
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
@@ -180,6 +186,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._exception_manager: ExceptionManager = ExceptionManager()
         self._plugin_manager: Optional[AsyncPluginManager] = None
         self._host_list_provider: Optional[AsyncHostListProvider] = None
+        self._all_hosts: Tuple[HostInfo, ...] = ()
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
 
@@ -265,21 +272,27 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     def host_list_provider(self, value: AsyncHostListProvider) -> None:
         self._host_list_provider = value
 
+    @property
+    def all_hosts(self) -> Tuple[HostInfo, ...]:
+        return self._all_hosts
+
     async def refresh_host_list(
             self,
-            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+            connection: Optional[Any] = None) -> None:
         if self._host_list_provider is None:
-            raise AwsWrapperError("AsyncPluginService.host_list_provider is not set")
+            raise AwsWrapperError(
+                Messages.get("AsyncPluginService.HostListProviderNotSet"))
         conn = connection if connection is not None else self._current_connection
-        return await self._host_list_provider.refresh(conn)
+        self._all_hosts = await self._host_list_provider.refresh(conn)
 
     async def force_refresh_host_list(
             self,
-            connection: Optional[Any] = None) -> Tuple[HostInfo, ...]:
+            connection: Optional[Any] = None) -> None:
         if self._host_list_provider is None:
-            raise AwsWrapperError("AsyncPluginService.host_list_provider is not set")
+            raise AwsWrapperError(
+                Messages.get("AsyncPluginService.HostListProviderNotSet"))
         conn = connection if connection is not None else self._current_connection
-        return await self._host_list_provider.force_refresh(conn)
+        self._all_hosts = await self._host_list_provider.force_refresh(conn)
 
     @property
     def network_bound_methods(self) -> Set[str]:

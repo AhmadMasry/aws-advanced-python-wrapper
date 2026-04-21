@@ -162,8 +162,8 @@ def test_refresh_host_list_delegates_to_provider():
     svc = _make_service()
     hlp = _FakeHostListProvider()
     svc.host_list_provider = hlp
-    topology = asyncio.run(svc.refresh_host_list())
-    assert topology == hlp._topology
+    asyncio.run(svc.refresh_host_list())
+    assert svc.all_hosts == hlp._topology
     assert hlp.refresh_calls == 1
 
 
@@ -171,8 +171,8 @@ def test_force_refresh_host_list_delegates_to_provider():
     svc = _make_service()
     hlp = _FakeHostListProvider()
     svc.host_list_provider = hlp
-    topology = asyncio.run(svc.force_refresh_host_list())
-    assert topology == hlp._topology
+    asyncio.run(svc.force_refresh_host_list())
+    assert svc.all_hosts == hlp._topology
     assert hlp.force_refresh_calls == 1
 
 
@@ -186,3 +186,16 @@ def test_force_refresh_raises_when_no_provider():
     svc = _make_service()
     with pytest.raises(AwsWrapperError):
         asyncio.run(svc.force_refresh_host_list())
+
+
+def test_all_hosts_defaults_to_empty_tuple():
+    svc = _make_service()
+    assert svc.all_hosts == ()
+
+
+def test_refresh_does_not_mutate_all_hosts_on_error():
+    svc = _make_service()
+    # No provider set; refresh raises. all_hosts must remain ().
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(svc.refresh_host_list())
+    assert svc.all_hosts == ()
