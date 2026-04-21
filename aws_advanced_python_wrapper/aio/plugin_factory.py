@@ -40,6 +40,10 @@ from aws_advanced_python_wrapper.aio.minor_plugins import (
     AsyncConnectTimePlugin, AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
 from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
     AsyncReadWriteSplittingPlugin
+from aws_advanced_python_wrapper.aio.stub_plugins import (
+    AsyncAuroraInitialConnectionStrategyStubPlugin, AsyncBlueGreenStubPlugin,
+    AsyncFastestResponseStrategyStubPlugin, AsyncLimitlessStubPlugin,
+    AsyncSimpleReadWriteSplittingStubPlugin, AsyncStaleDnsStubPlugin)
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
@@ -150,6 +154,35 @@ class _CustomEndpointFactory:
         return AsyncCustomEndpointPluginActive(plugin_service, props)
 
 
+class _AsyncStubFactory:
+    """Factory that instantiates a pass-through stub plugin.
+
+    Each stub class is paired with a unique _AsyncStubFactory instance
+    so PLUGIN_FACTORY_WEIGHTS can rank them independently if ever
+    needed. All stub factories share the same *type*, which is what
+    :data:`PLUGIN_FACTORY_WEIGHTS` keys on, so one weight entry covers
+    every stub.
+    """
+
+    def __init__(self, stub_cls: Type[AsyncPlugin]) -> None:
+        self._stub_cls = stub_cls
+
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        return self._stub_cls()
+
+
+_SimpleReadWriteSplittingFactory = _AsyncStubFactory(
+    AsyncSimpleReadWriteSplittingStubPlugin)
+_StaleDnsFactory = _AsyncStubFactory(AsyncStaleDnsStubPlugin)
+_InitialConnectionFactory = _AsyncStubFactory(
+    AsyncAuroraInitialConnectionStrategyStubPlugin)
+_LimitlessFactory = _AsyncStubFactory(AsyncLimitlessStubPlugin)
+_BlueGreenFactory = _AsyncStubFactory(AsyncBlueGreenStubPlugin)
+_FastestResponseFactory = _AsyncStubFactory(
+    AsyncFastestResponseStrategyStubPlugin)
+
+
 # ---- Registry ----------------------------------------------------------
 
 
@@ -174,6 +207,16 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "execute_time": _ExecuteTimeFactory(),
     "dev": _DeveloperFactory(),
     "custom_endpoint": _CustomEndpointFactory(),
+    # ---- Phase H.2 stubs: plugin codes not yet ported to async. ----
+    # Registered so users can keep sync/async `plugins="..."` config
+    # strings identical. Each stub subscribes to nothing and logs a
+    # WARNING on construction; full async ports land in later phases.
+    "srw": _SimpleReadWriteSplittingFactory,
+    "stale_dns": _StaleDnsFactory,
+    "initial_connection": _InitialConnectionFactory,
+    "limitless": _LimitlessFactory,
+    "bg": _BlueGreenFactory,
+    "fastest_response_strategy": _FastestResponseFactory,
 }
 
 
@@ -192,6 +235,10 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _ConnectTimeFactory: 900,
     _ExecuteTimeFactory: 910,
     _DeveloperFactory: 1000,
+    # All stub factories share one type; a single entry covers all six
+    # Phase H.2 stubs. Weight sits above _DeveloperFactory so stubs sort
+    # last (they subscribe to nothing, so order is cosmetic).
+    _AsyncStubFactory: 2000,
 }
 
 
