@@ -205,6 +205,7 @@ def test_secrets_manager_uses_custom_keys():
         props = Properties({
             "host": "h", "port": "5432",
             "secrets_manager_secret_id": "my-secret",
+            "secrets_manager_region": "us-east-1",
             "secrets_manager_secret_username_key": "db_login",
             "secrets_manager_secret_password_key": "db_pass",
         })
@@ -258,12 +259,13 @@ def test_secrets_manager_caches_result():
         props = Properties({
             "host": "h", "port": "5432",
             "secrets_manager_secret_id": "my-secret",
+            "secrets_manager_region": "us-east-1",
         })
         plugin = AsyncAwsSecretsManagerPlugin(_svc(props), props)
 
         call_count = [0]
 
-        def _fetch(secret_id, region):
+        def _fetch(secret_id, region, endpoint=None):
             call_count[0] += 1
             return {"username": f"u{call_count[0]}", "password": f"p{call_count[0]}"}
 
@@ -548,3 +550,117 @@ def test_iam_plugin_uses_database_dialect_default_port_when_port_missing():
     # _generate_token_blocking signature: (host, port, user, region)
     args = gen.call_args[0]
     assert args[1] == 3306  # port argument was 3306, not 5432
+
+
+# ---- Secrets Manager: TTL + endpoint + ARN region + invalidate (E.3) -----
+
+
+def test_secrets_plugin_uses_secrets_manager_expiration_property():
+    """Per-entry TTL honors SECRETS_MANAGER_EXPIRATION (seconds)."""
+    props = Properties({
+        "host": "h", "port": "5432",
+        "secrets_manager_secret_id": "my-secret",
+        "secrets_manager_region": "us-east-1",
+        "secrets_manager_expiration": "60",
+    })
+    plugin = AsyncAwsSecretsManagerPlugin(_svc(props), props)
+    host = HostInfo(host="h", port=5432)
+
+    with patch.object(AsyncAwsSecretsManagerPlugin, "_fetch_secret_blocking",
+                      return_value={"username": "u", "password": "p"}) as fetch:
+        asyncio.run(plugin._resolve_credentials(host, props))
+        asyncio.run(plugin._resolve_credentials(host, props))
+    assert fetch.call_count == 1  # second call cached
+
+
+def test_secrets_plugin_passes_endpoint_override_to_boto3():
+    """SECRETS_MANAGER_ENDPOINT is forwarded to boto3.client as endpoint_url."""
+    props = Properties({
+        "host": "h", "port": "5432",
+        "secrets_manager_secret_id": "my-secret",
+        "secrets_manager_region": "us-east-1",
+        "secrets_manager_endpoint": "https://vpc-endpoint.example.com",
+    })
+    plugin = AsyncAwsSecretsManagerPlugin(_svc(props), props)
+    host = HostInfo(host="h", port=5432)
+
+    with patch("boto3.client") as boto_client:
+        mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {
+            "SecretString": '{"username": "u", "password": "p"}'
+        }
+        boto_client.return_value = mock_client
+        asyncio.run(plugin._resolve_credentials(host, props))
+
+    _, kwargs = boto_client.call_args
+    assert kwargs.get("endpoint_url") == "https://vpc-endpoint.example.com"
+
+
+def test_secrets_plugin_extracts_region_from_arn_when_region_unset():
+    """ARN-form secret_id provides region when SECRETS_MANAGER_REGION is absent."""
+    props = Properties({
+        "host": "h", "port": "5432",
+        "secrets_manager_secret_id": "arn:aws:secretsmanager:us-west-2:123456789012:secret:my-secret-AbCdEf",
+        # No secrets_manager_region
+    })
+    plugin = AsyncAwsSecretsManagerPlugin(_svc(props), props)
+    host = HostInfo(host="h", port=5432)
+
+    with patch("boto3.client") as boto_client:
+        mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {
+            "SecretString": '{"username": "u", "password": "p"}'
+        }
+        boto_client.return_value = mock_client
+        asyncio.run(plugin._resolve_credentials(host, props))
+
+    _, kwargs = boto_client.call_args
+    assert kwargs.get("region_name") == "us-west-2"
+
+
+def test_secrets_plugin_raises_when_no_region_and_no_arn():
+    """Non-ARN secret_id without SECRETS_MANAGER_REGION -> AwsWrapperError."""
+    props = Properties({
+        "host": "h", "port": "5432",
+        "secrets_manager_secret_id": "my-secret",
+        # No region, not an ARN
+    })
+    plugin = AsyncAwsSecretsManagerPlugin(_svc(props), props)
+    host = HostInfo(host="h", port=5432)
+
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(plugin._resolve_credentials(host, props))
+
+
+def test_secrets_plugin_invalidate_cache_drops_entry():
+    props = Properties({
+        "host": "h", "port": "5432",
+        "secrets_manager_secret_id": "my-secret",
+        "secrets_manager_region": "us-east-1",
+    })
+    plugin = AsyncAwsSecretsManagerPlugin(_svc(props), props)
+    host = HostInfo(host="h", port=5432)
+
+    with patch.object(AsyncAwsSecretsManagerPlugin, "_fetch_secret_blocking",
+                      return_value={"username": "u", "password": "p"}):
+        asyncio.run(plugin._resolve_credentials(host, props))
+    assert plugin._secret_cache
+    plugin._invalidate_cache(host, props)
+    assert not plugin._secret_cache
+
+
+def test_secrets_plugin_resolve_credentials_returns_was_cached_flag():
+    props = Properties({
+        "host": "h", "port": "5432",
+        "secrets_manager_secret_id": "my-secret",
+        "secrets_manager_region": "us-east-1",
+    })
+    plugin = AsyncAwsSecretsManagerPlugin(_svc(props), props)
+    host = HostInfo(host="h", port=5432)
+
+    with patch.object(AsyncAwsSecretsManagerPlugin, "_fetch_secret_blocking",
+                      return_value={"username": "u", "password": "p"}):
+        _, _, was1 = asyncio.run(plugin._resolve_credentials(host, props))
+        _, _, was2 = asyncio.run(plugin._resolve_credentials(host, props))
+    assert was1 is False
+    assert was2 is True

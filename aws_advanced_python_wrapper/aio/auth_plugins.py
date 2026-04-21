@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional,
                     Set, Tuple)
 
@@ -284,14 +285,33 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
     Manager's default JSON shape (``{"username": "...", "password": "..."}``)
     and the common RDS-auto-created ``{"username": ..., "password": ...}``
     schema.
+
+    Features (E.3):
+
+    * Per-entry TTL honored via ``SECRETS_MANAGER_EXPIRATION`` (seconds);
+      negative or absent falls back to 1 year, matching the sync plugin's
+      "effectively forever" sentinel.
+    * Optional custom endpoint via ``SECRETS_MANAGER_ENDPOINT`` (for VPC
+      endpoint / test doubles) forwarded to ``boto3.client`` as
+      ``endpoint_url=``.
+    * ARN-shaped ``secret_id`` (``arn:aws:secretsmanager:<region>:...``)
+      provides the region when ``SECRETS_MANAGER_REGION`` is absent.
     """
+
+    _DEFAULT_TTL_SEC = 365 * 24 * 3600  # 1 year (matches sync fallback)
+
+    # Extract region from ARN: arn:aws:secretsmanager:<region>:<account>:secret:<name>
+    _ARN_REGION_RE = re.compile(
+        r"^arn:aws:secretsmanager:(?P<region>[a-z0-9-]+):")
 
     def __init__(
             self,
             plugin_service: AsyncPluginService,
             props: Properties) -> None:
         super().__init__(plugin_service, props)
-        self._secret_cache: dict = {}
+        self._secret_cache: Dict[
+            Tuple[str, Optional[str]],
+            Tuple[Optional[str], Optional[str], float]] = {}
 
     async def _resolve_credentials(
             self,
@@ -302,16 +322,31 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
             raise AwsWrapperError(
                 "AWS Secrets Manager plugin requires 'secrets_manager_secret_id'"
             )
-        region = WrapperProperties.SECRETS_MANAGER_REGION.get(props)
+        # Use raw props.get to bypass the WrapperProperty default of
+        # "us-east-1" -- the sync plugin relies on RegionUtils.get_region
+        # which also reads the raw property, so ARN extraction only kicks
+        # in when the user didn't explicitly set a region.
+        region = props.get(WrapperProperties.SECRETS_MANAGER_REGION.name)
+        if not region:
+            region = self._extract_region_from_arn(secret_id)
+        if not region:
+            raise AwsWrapperError(
+                "AWS Secrets Manager plugin requires "
+                f"'{WrapperProperties.SECRETS_MANAGER_REGION.name}' "
+                "(or provide an ARN as secret_id)."
+            )
+        endpoint = WrapperProperties.SECRETS_MANAGER_ENDPOINT.get(props)
 
         cache_key = (secret_id, region)
+        now = asyncio.get_event_loop().time()
         cached = self._secret_cache.get(cache_key)
         if cached is not None:
-            user, password = cached
-            return user, password, True
+            user, password, expires_at = cached
+            if now < expires_at:
+                return user, password, True
 
         secret = await asyncio.to_thread(
-            self._fetch_secret_blocking, secret_id, region
+            self._fetch_secret_blocking, secret_id, region, endpoint
         )
         # Allow custom field names via *_KEY properties (e.g. Terraform secrets
         # with non-default schemas).
@@ -326,17 +361,42 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
         user = secret.get(user_key)
         password = secret.get(password_key)
 
-        self._secret_cache[cache_key] = (user, password)
+        ttl_sec = WrapperProperties.SECRETS_MANAGER_EXPIRATION.get_int(props)
+        if ttl_sec is None or ttl_sec < 0:
+            ttl_sec = self._DEFAULT_TTL_SEC
+        self._secret_cache[cache_key] = (user, password, now + ttl_sec)
         return user, password, False
+
+    def _invalidate_cache(
+            self,
+            host_info: HostInfo,
+            props: Properties) -> None:
+        """Drop the cached secret for this (secret_id, region) so a
+        subsequent ``_resolve_credentials`` call refetches it."""
+        secret_id = WrapperProperties.SECRETS_MANAGER_SECRET_ID.get(props)
+        if not secret_id:
+            return
+        region = props.get(WrapperProperties.SECRETS_MANAGER_REGION.name)
+        if not region:
+            region = self._extract_region_from_arn(secret_id)
+        self._secret_cache.pop((secret_id, region), None)
+
+    @staticmethod
+    def _extract_region_from_arn(secret_id: str) -> Optional[str]:
+        match = AsyncAwsSecretsManagerPlugin._ARN_REGION_RE.match(secret_id)
+        return match.group("region") if match else None
 
     @staticmethod
     def _fetch_secret_blocking(
             secret_id: str,
-            region: Optional[str]) -> dict:
+            region: Optional[str],
+            endpoint: Optional[str] = None) -> dict:
         import boto3
         kwargs: dict = {}
         if region:
             kwargs["region_name"] = region
+        if endpoint:
+            kwargs["endpoint_url"] = endpoint
         client = boto3.client("secretsmanager", **kwargs)
         resp = client.get_secret_value(SecretId=secret_id)
         secret_str = resp.get("SecretString")
