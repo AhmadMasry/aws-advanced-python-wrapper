@@ -28,6 +28,7 @@ from typing import (TYPE_CHECKING, Any, Callable, List, Optional, Sequence,
 from aws_advanced_python_wrapper.aio.plugin_manager import AsyncPluginManager
 from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
+from aws_advanced_python_wrapper.database_dialect import DatabaseDialectManager
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.host_list_provider import \
         AsyncHostListProvider
     from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
+    from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
 
 
 _TOPOLOGY_REQUIRING_PLUGINS = frozenset({
@@ -71,6 +73,20 @@ def _build_host_list_provider(
     if any(c.strip() in _TOPOLOGY_REQUIRING_PLUGINS for c in codes):
         return AsyncAuroraHostListProvider(props, driver_dialect)
     return AsyncStaticHostListProvider(props)
+
+
+def _resolve_database_dialect(
+        driver_dialect: AsyncDriverDialect,
+        props: Properties) -> DatabaseDialect:
+    """Minimal DatabaseDialect resolution for Phase A.
+
+    Honors the ``wrapper_dialect`` prop if set; otherwise falls back to the
+    driver-dialect's default database dialect via :class:`DatabaseDialectManager`.
+    Full auto-upgrade (Aurora-vs-stock detection via DB query) lands in a
+    later phase.
+    """
+    manager = DatabaseDialectManager(props)
+    return manager.get_dialect(driver_dialect.dialect_code, props)
 
 
 class AsyncAwsWrapperCursor:
@@ -262,16 +278,23 @@ class AsyncAwsWrapperConnection:
         port = int(port_raw) if port_raw is not None else -1
         host_info = HostInfo(host=host, port=port)
 
+        # Host-list-provider selection: if `plugins=...` references any
+        # topology-requiring plugin (failover, rws), build an Aurora
+        # provider; otherwise static is enough. Resolved before the
+        # plugin service so it can be wired in as a slot below.
+        host_list_provider = _build_host_list_provider(props, driver_dialect)
+
         plugin_service = AsyncPluginServiceImpl(
             props=props,
             driver_dialect=driver_dialect,
             host_info=host_info,
         )
-
-        # Host-list-provider selection: if `plugins=...` references any
-        # topology-requiring plugin (failover, rws), build an Aurora
-        # provider; otherwise static is enough.
-        host_list_provider = _build_host_list_provider(props, driver_dialect)
+        # Phase A wiring: populate plugin service slots so plugins that
+        # reach for them in their own ``connect`` hook (e.g., failover
+        # checking ``is_network_exception``) have them available.
+        plugin_service.database_dialect = _resolve_database_dialect(driver_dialect, props)
+        plugin_service.host_list_provider = host_list_provider
+        plugin_service.initial_connection_host_info = host_info
 
         # Resolve plugin list. Explicit `plugins=[...]` wins; otherwise
         # parse the `plugins` connection-property string via the factory
@@ -290,6 +313,7 @@ class AsyncAwsWrapperConnection:
             props=props,
             plugins=plugins,
         )
+        plugin_service.plugin_manager = plugin_manager
 
         target_conn = await plugin_manager.connect(
             target_driver_func=target_func,

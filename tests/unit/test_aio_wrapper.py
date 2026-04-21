@@ -374,3 +374,39 @@ def test_psycopg_driver_dialect_network_bound_methods_covers_core():
     assert DbApiMethod.CONNECT.method_name in nb
     assert DbApiMethod.CURSOR_EXECUTE.method_name in nb
     assert DbApiMethod.CONNECTION_COMMIT.method_name in nb
+
+
+def test_connect_populates_plugin_service_slots():
+    """AsyncAwsWrapperConnection.connect populates database_dialect,
+    host_list_provider, plugin_manager, and initial_connection_host_info
+    on the plugin service."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from aws_advanced_python_wrapper.aio.wrapper import \
+        AsyncAwsWrapperConnection
+    from aws_advanced_python_wrapper.database_dialect import PgDatabaseDialect
+
+    async def _fake_target(**kwargs):
+        mock = MagicMock(spec=["close", "cursor"])
+        mock.close = MagicMock()
+        return mock
+
+    conn = asyncio.run(
+        AsyncAwsWrapperConnection.connect(
+            target=_fake_target,
+            host="localhost",
+            dbname="test",
+            user="u",
+            password="p",
+        )
+    )
+
+    # The plugin service slots should be populated
+    svc = conn._plugin_service
+    assert isinstance(svc.database_dialect, PgDatabaseDialect), \
+        f"database_dialect was {svc.database_dialect!r}"
+    assert svc.host_list_provider is not None
+    assert svc.plugin_manager is not None
+    assert svc.initial_connection_host_info is not None
+    assert svc.initial_connection_host_info.host == "localhost"
