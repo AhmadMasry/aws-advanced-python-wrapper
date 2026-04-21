@@ -29,19 +29,30 @@ shortens its tick interval to ``high_refresh_rate_sec`` (default 1s)
 for ``HIGH_REFRESH_PERIOD_SEC`` (default 30s) before reverting to the
 normal cadence. Mirrors the sync implementation at
 ``cluster_topology_monitor.py:86, :121, :192-210, :273-282``.
+
+Phase G.4 adds parallel-probe panic mode: when ``connection_getter``
+returns ``None`` (no monitoring connection -- e.g., post-failover) and
+a ``probe_host`` callable was injected at construction, the monitor
+spawns one :class:`asyncio.Task` per host in ``_last_topology``. Each
+probe opens a raw connection and classifies its role; the first to
+find a writer wins via :class:`asyncio.Event`, and its connection is
+stashed as verified-writer state for the caller (failover) to claim.
+Mirrors sync ``cluster_topology_monitor.py:230-320``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional,
+                    Set, Tuple)
 
 from aws_advanced_python_wrapper.hostinfo import HostRole
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.host_list_provider import (
         AsyncAuroraHostListProvider, Topology)
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
 
 
 class AsyncClusterTopologyMonitor:
@@ -55,7 +66,10 @@ class AsyncClusterTopologyMonitor:
             provider: AsyncAuroraHostListProvider,
             connection_getter: Any,
             refresh_interval_sec: float = 30.0,
-            high_refresh_rate_sec: float = 1.0) -> None:
+            high_refresh_rate_sec: float = 1.0,
+            probe_host: Optional[
+                Callable[[HostInfo], Awaitable[Tuple[Any, HostRole]]]] = None,
+    ) -> None:
         """
         :param provider: the host list provider whose ``force_refresh`` to
             call each tick.
@@ -67,17 +81,32 @@ class AsyncClusterTopologyMonitor:
         :param high_refresh_rate_sec: seconds between refreshes while in
             the post-writer-change high-frequency window. Must be small
             enough to catch topology settling quickly (default 1s).
+        :param probe_host: optional async callable ``(host_info) ->
+            (conn, role)`` used during panic mode. When ``None``, panic
+            mode is disabled (backwards compatible). Production wiring
+            constructs it from ``AsyncDialectUtils.get_host_role`` plus a
+            connection-opener helper.
         """
         self._provider = provider
         self._connection_getter = connection_getter
         self._interval_sec = max(0.005, float(refresh_interval_sec))
         self._high_refresh_rate_sec = max(0.005, float(high_refresh_rate_sec))
+        self._probe_host = probe_host
+
         self._task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
         self._last_known_writer: Optional[str] = None
         self._high_refresh_until_ns: int = 0
         self._ignore_requests_until_ns: int = 0
         self._last_topology: Topology = ()
+
+        # Panic mode state
+        self._is_verified_writer_connection: bool = False
+        self._verified_writer_conn: Optional[Any] = None
+        self._verified_writer_host_info: Optional[HostInfo] = None
+        self._submitted_host_aliases: Set[str] = set()
+        self._probe_tasks: Dict[str, asyncio.Task] = {}
+        self._writer_found_event: asyncio.Event = asyncio.Event()
 
     @property
     def high_refresh_rate_sec(self) -> float:
@@ -91,6 +120,28 @@ class AsyncClusterTopologyMonitor:
 
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    def is_in_panic_mode(self) -> bool:
+        """True when panic-mode probe tasks are currently running."""
+        return bool(self._probe_tasks)
+
+    def claim_verified_writer(self) -> Optional[Tuple[Any, HostInfo]]:
+        """Transfer ownership of the verified writer conn to the caller.
+
+        One-shot: subsequent calls return ``None`` until panic mode finds
+        another writer.
+        """
+        if not self._is_verified_writer_connection:
+            return None
+        conn = self._verified_writer_conn
+        host_info = self._verified_writer_host_info
+        self._verified_writer_conn = None
+        self._verified_writer_host_info = None
+        self._is_verified_writer_connection = False
+        self._writer_found_event.clear()
+        if conn is None or host_info is None:
+            return None
+        return (conn, host_info)
 
     def start(self) -> None:
         """Spawn the background refresh task. No-op if already running."""
@@ -112,6 +163,9 @@ class AsyncClusterTopologyMonitor:
                         # Monitor failures shouldn't crash the task;
                         # cached topology remains usable.
                         pass
+                elif self._should_panic():
+                    self._spawn_panic_probes()
+
                 # Pick tick interval based on whether we're in high-freq mode.
                 interval = self._current_tick_interval()
                 try:
@@ -122,6 +176,78 @@ class AsyncClusterTopologyMonitor:
                     continue
         except asyncio.CancelledError:
             return
+        finally:
+            # Cancel any in-flight probes on shutdown.
+            for t in list(self._probe_tasks.values()):
+                if not t.done():
+                    t.cancel()
+            self._probe_tasks.clear()
+
+    def _should_panic(self) -> bool:
+        """Enter panic mode iff ``probe_host`` is wired, we have a known
+        topology to probe, and we don't already have a verified writer.
+        """
+        if self._probe_host is None:
+            return False
+        if self._is_verified_writer_connection:
+            return False
+        if not self._last_topology:
+            return False
+        return True
+
+    def _spawn_panic_probes(self) -> None:
+        """Spawn probe tasks for each host in ``last_topology`` not already
+        submitted. Deduped by ``host_info.as_alias()``.
+        """
+        # Opportunistic cleanup of finished task refs.
+        finished = [k for k, t in self._probe_tasks.items() if t.done()]
+        for k in finished:
+            self._probe_tasks.pop(k, None)
+            # Release dedup slot so a retry can happen on a later tick if
+            # the earlier probe failed/returned non-writer.
+            self._submitted_host_aliases.discard(k)
+
+        for host_info in self._last_topology:
+            alias = host_info.as_alias()
+            if alias in self._submitted_host_aliases:
+                continue
+            self._submitted_host_aliases.add(alias)
+            task = asyncio.create_task(self._probe_and_report(host_info))
+            self._probe_tasks[alias] = task
+
+    async def _probe_and_report(self, host_info: HostInfo) -> None:
+        """Run one probe; stash the conn + host on winner, close on loser."""
+        assert self._probe_host is not None  # _should_panic gates this
+        conn: Optional[Any] = None
+        try:
+            conn, role = await self._probe_host(host_info)
+        except Exception:
+            # Probe failures are expected (network, auth, etc.) -- don't
+            # crash the monitor task.
+            return
+        # Guard: the race-winner may have finished before us.
+        if role == HostRole.WRITER and not self._writer_found_event.is_set():
+            self._verified_writer_conn = conn
+            self._verified_writer_host_info = host_info
+            self._is_verified_writer_connection = True
+            self._writer_found_event.set()
+            return
+        # Loser or reader: close the conn best-effort.
+        if conn is not None:
+            await self._close_best_effort(conn)
+
+    @staticmethod
+    async def _close_best_effort(conn: Any) -> None:
+        try:
+            close = getattr(conn, "close", None)
+            if close is None:
+                return
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            # Best-effort: swallow close errors.
+            pass
 
     def _current_tick_interval(self) -> float:
         """High-freq window active -> short interval; else normal interval."""

@@ -581,3 +581,225 @@ def test_force_refresh_with_connection_bypass_ignore_window():
     result = asyncio.run(_run())
     assert result == topology  # fresh, not stale
     provider.force_refresh.assert_awaited_once()
+
+
+# ---- G.4: parallel-probe panic mode --------------------------------------
+
+
+def test_topology_monitor_panic_mode_disabled_without_probe_host():
+    """Without probe_host, monitor never enters panic mode (backwards compat)."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,  # no conn
+        refresh_interval_sec=0.05,
+    )
+    monitor._last_topology = (HostInfo(host="h", port=5432, role=HostRole.WRITER),)
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.08)
+        await monitor.stop()
+
+    asyncio.run(_run())
+    assert monitor.is_in_panic_mode() is False
+
+
+def test_topology_monitor_enters_panic_mode_when_no_connection():
+    """With probe_host + no monitoring conn + seeded topology -> panic probes fire."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    h1 = HostInfo(host="h1", port=5432, role=HostRole.WRITER)
+    h2 = HostInfo(host="h2", port=5432, role=HostRole.READER)
+
+    probed = []
+
+    async def _probe(host_info):
+        probed.append(host_info.host)
+        # Both return as reader; no winner
+        return MagicMock(name=f"conn-{host_info.host}"), HostRole.READER
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+        probe_host=_probe,
+    )
+    monitor._last_topology = (h1, h2)
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.15)
+        await monitor.stop()
+
+    asyncio.run(_run())
+    # Both hosts probed
+    assert "h1" in probed and "h2" in probed
+    # No writer found -> no verified state
+    assert monitor._is_verified_writer_connection is False
+
+
+def test_topology_monitor_probe_winner_sets_verified_writer():
+    """First probe to return (conn, WRITER) sets verified-writer state."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    h1 = HostInfo(host="h1", port=5432, role=HostRole.READER)
+    h2 = HostInfo(host="h2", port=5432, role=HostRole.WRITER)
+
+    winner_conn = MagicMock(name="winner_conn")
+
+    async def _probe(host_info):
+        if host_info.host == "h2":
+            return winner_conn, HostRole.WRITER
+        return MagicMock(name=f"conn-{host_info.host}"), HostRole.READER
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+        probe_host=_probe,
+    )
+    monitor._last_topology = (h1, h2)
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.1)
+        await monitor.stop()
+
+    asyncio.run(_run())
+    assert monitor._is_verified_writer_connection is True
+    assert monitor._verified_writer_conn is winner_conn
+    assert monitor._verified_writer_host_info is h2
+
+
+def test_topology_monitor_claim_verified_writer_is_one_shot():
+    """claim_verified_writer returns the winner once, then clears state."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    winner_conn = MagicMock()
+    winner_host = HostInfo(host="w", port=5432, role=HostRole.WRITER)
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=MagicMock(),
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+    )
+    monitor._is_verified_writer_connection = True
+    monitor._verified_writer_conn = winner_conn
+    monitor._verified_writer_host_info = winner_host
+
+    first = monitor.claim_verified_writer()
+    assert first == (winner_conn, winner_host)
+    assert monitor._is_verified_writer_connection is False
+    assert monitor._verified_writer_conn is None
+
+    second = monitor.claim_verified_writer()
+    assert second is None
+
+
+def test_topology_monitor_probe_dedup():
+    """Same host doesn't get probed twice across consecutive panic ticks."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    h = HostInfo(host="only-host", port=5432, role=HostRole.READER)
+    call_count = [0]
+
+    async def _probe(host_info):
+        call_count[0] += 1
+        # Simulate long-running probe so it's still pending when next tick fires
+        await asyncio.sleep(0.5)
+        return MagicMock(), HostRole.READER
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=0.02,  # many ticks
+        probe_host=_probe,
+    )
+    monitor._last_topology = (h,)
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.15)  # enough for 5-7 ticks
+        await monitor.stop()
+
+    asyncio.run(_run())
+    # Only one probe fired despite multiple ticks (dedup)
+    assert call_count[0] == 1
+
+
+def test_topology_monitor_probe_failure_does_not_crash_loop():
+    """A probe raising an exception doesn't kill the monitor task."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    h = HostInfo(host="flaky", port=5432, role=HostRole.READER)
+
+    async def _probe(host_info):
+        raise RuntimeError("probe failed")
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+        probe_host=_probe,
+    )
+    monitor._last_topology = (h,)
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.1)
+        assert monitor.is_running()
+        await monitor.stop()
+
+    asyncio.run(_run())
+    assert monitor._is_verified_writer_connection is False
+
+
+def test_topology_monitor_loser_probe_closes_its_conn():
+    """Non-winner probe closes its returned conn."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    h1 = HostInfo(host="fast-reader", port=5432, role=HostRole.READER)
+    h2 = HostInfo(host="slow-writer", port=5432, role=HostRole.WRITER)
+
+    loser_conn = MagicMock(name="loser")
+    loser_conn.close = MagicMock()
+    winner_conn = MagicMock(name="winner")
+    winner_conn.close = MagicMock()
+
+    async def _probe(host_info):
+        if host_info.host == "slow-writer":
+            await asyncio.sleep(0.05)  # let the loser complete first
+            return winner_conn, HostRole.WRITER
+        return loser_conn, HostRole.READER
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+        probe_host=_probe,
+    )
+    monitor._last_topology = (h1, h2)
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.15)
+        await monitor.stop()
+
+    asyncio.run(_run())
+    # Loser closed; winner retained
+    loser_conn.close.assert_called()
+    winner_conn.close.assert_not_called()
