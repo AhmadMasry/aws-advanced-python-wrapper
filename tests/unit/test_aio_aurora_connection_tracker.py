@@ -273,3 +273,43 @@ def test_notify_ignores_events_that_are_not_converted():
     asyncio.run(_run())
     # WENT_DOWN is not a CONVERTED_* event -> no invalidation
     conn.close.assert_not_called()
+
+
+def test_release_resources_async_drains_pending_invalidations():
+    from aws_advanced_python_wrapper.aio.cleanup import release_resources_async
+
+    plugin, svc, driver_dialect, tracker = _build()
+    old = HostInfo(host="old-w", port=5432, role=HostRole.WRITER)
+    new = HostInfo(host="new-w", port=5432, role=HostRole.WRITER)
+
+    # Slow close to ensure the invalidation task is still running when
+    # release_resources_async is called.
+    close_started = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    async def _slow_close():
+        close_started.set()
+        await asyncio.sleep(0.05)
+        close_finished.set()
+
+    conn = MagicMock(name="slow_conn")
+    conn.close = MagicMock(side_effect=lambda: _slow_close())
+    tracker.track(old, conn)
+
+    svc._all_hosts = (old,)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        svc._all_hosts = (new,)
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        # Wait until close has actually started, then release
+        await close_started.wait()
+        await release_resources_async()
+
+    asyncio.run(_run())
+
+    # close_finished should have been set -- the invalidation task ran to completion
+    assert close_finished.is_set()

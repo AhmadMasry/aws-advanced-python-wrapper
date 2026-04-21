@@ -43,6 +43,7 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict,
                     FrozenSet, Optional, Set)
 from weakref import WeakSet
 
+from aws_advanced_python_wrapper.aio.cleanup import register_shutdown_hook
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import FailoverError
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
@@ -152,6 +153,8 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
         self._current_writer: Optional[HostInfo] = None
         self._pending_invalidations: Set[asyncio.Task] = set()
 
+        register_shutdown_hook(self._shutdown)
+
     @property
     def last_known_writer_host(self) -> Optional[str]:
         """Backwards-compat accessor (was present on the SP-8 stub)."""
@@ -220,6 +223,18 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
         task = asyncio.create_task(self._tracker.invalidate_all(old_writer))
         self._pending_invalidations.add(task)
         task.add_done_callback(self._pending_invalidations.discard)
+
+    async def _shutdown(self) -> None:
+        """Drain pending invalidation tasks on release_resources_async.
+
+        Async apps calling release_resources_async() on exit will see
+        every tracked connection's close() attempt complete rather than
+        get cut off when the loop tears down.
+        """
+        if not self._pending_invalidations:
+            return
+        pending = list(self._pending_invalidations)
+        await asyncio.gather(*pending, return_exceptions=True)
 
     def notify_host_list_changed(
             self,
