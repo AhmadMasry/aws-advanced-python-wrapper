@@ -432,3 +432,49 @@ def test_notify_host_list_changed_ignores_unrelated_hosts():
 
     stopped = asyncio.run(_start_then_notify())
     assert stopped is False
+
+
+# ---- C.4 shutdown hook -------------------------------------------------
+
+
+def test_release_resources_async_cancels_monitor_task():
+    from aws_advanced_python_wrapper.aio.cleanup import release_resources_async
+
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=100, interval_ms=100)
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        task = plugin._monitor_task
+        assert task is not None
+        assert not task.done()
+        await release_resources_async()
+        return task
+
+    task = asyncio.run(_run())
+    # After release_resources_async the task should be finished (cancelled or completed)
+    assert task.done()
+
+
+def test_shutdown_hook_clears_monitor_task():
+    """After shutdown hook runs, _monitor_task is None."""
+    from aws_advanced_python_wrapper.aio.cleanup import release_resources_async
+
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=100, interval_ms=100)
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        assert plugin._monitor_task is not None
+        await release_resources_async()
+
+    asyncio.run(_run())
+    assert plugin._monitor_task is None

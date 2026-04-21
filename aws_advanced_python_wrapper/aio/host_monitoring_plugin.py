@@ -33,6 +33,7 @@ import asyncio
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, FrozenSet,
                     Optional, Set)
 
+from aws_advanced_python_wrapper.aio.cleanup import register_shutdown_hook
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.host_availability import HostAvailability
@@ -98,6 +99,8 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         self._consecutive_failures: int = 0
         self._monitored_aliases: FrozenSet[str] = frozenset()
         self._host_unavailable: bool = False
+
+        register_shutdown_hook(self._shutdown)
 
     @property
     def subscribed_methods(self) -> Set[str]:
@@ -241,6 +244,22 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
             if HostEvent.WENT_DOWN in events or HostEvent.HOST_DELETED in events:
                 self._monitor_stop.set()
                 return
+
+    async def _shutdown(self) -> None:
+        """Cancel the standing monitor task cleanly.
+
+        Registered with aio.cleanup.register_shutdown_hook in __init__ so
+        users calling release_resources_async() on exit don't leak the
+        monitor task. Idempotent -- safe to call multiple times.
+        """
+        self._monitor_stop.set()
+        if self._monitor_task is not None:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._monitor_task = None
 
 
 # Optional alias for consistency with sync "v2" naming.
