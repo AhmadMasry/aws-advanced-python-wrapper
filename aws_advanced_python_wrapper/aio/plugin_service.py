@@ -149,6 +149,12 @@ class AsyncPluginService(Protocol):
         """Best-effort shutdown. Idempotent. Does not raise."""
         ...
 
+    async def get_host_role(
+            self,
+            connection: Optional[Any] = None,
+            timeout_sec: float = 5.0) -> HostRole:
+        ...
+
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         ...
 
@@ -352,6 +358,33 @@ class AsyncPluginServiceImpl(AsyncPluginService):
                 await hlp.release_resources()
             except Exception:  # noqa: BLE001
                 pass
+
+    async def get_host_role(
+            self,
+            connection: Optional[Any] = None,
+            timeout_sec: float = 5.0) -> HostRole:
+        """Probe ``connection`` (or current_connection) to learn its role.
+
+        Uses the resolved DatabaseDialect's ``is_reader_query`` via
+        AsyncDialectUtils. Raises AwsWrapperError if no dialect is set,
+        if the connection is None, or if the probe fails.
+        """
+        conn = connection if connection is not None else self._current_connection
+        if conn is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.get_host_role requires a connection")
+        if self._database_dialect is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.get_host_role requires a database_dialect; "
+                "it is populated by AsyncAwsWrapperConnection.connect.")
+        from aws_advanced_python_wrapper.aio.dialect_utils import \
+            AsyncDialectUtils
+        return await AsyncDialectUtils.get_host_role(
+            conn,
+            self._driver_dialect,
+            self._database_dialect.is_reader_query,
+            timeout_sec=timeout_sec,
+        )
 
     @property
     def network_bound_methods(self) -> Set[str]:

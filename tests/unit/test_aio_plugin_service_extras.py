@@ -286,3 +286,40 @@ def test_is_read_only_connection_exception_delegates_to_dialect_handler():
     assert svc.is_read_only_connection_exception(error=err, sql_state="25006") is True
     handler.is_read_only_connection_exception.assert_called_once_with(
         error=err, sql_state="25006")
+
+
+def test_plugin_service_get_host_role_delegates_to_dialect_utils():
+    svc = _make_service()
+    dialect = MagicMock(spec=DatabaseDialect)
+    dialect.is_reader_query = "SELECT pg_is_in_recovery()"
+    svc.database_dialect = dialect
+
+    # Build a conn with an async cursor that returns (True,)
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.fetchone = AsyncMock(return_value=(True,))
+    cursor.close = MagicMock()
+    conn = MagicMock()
+    conn.cursor = MagicMock(return_value=cursor)
+    svc._current_connection = conn
+
+    role = asyncio.run(svc.get_host_role())
+    assert role == HostRole.READER
+
+
+def test_plugin_service_get_host_role_raises_without_dialect():
+    svc = _make_service()
+    svc._current_connection = MagicMock()
+    # No database_dialect set
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(svc.get_host_role())
+
+
+def test_plugin_service_get_host_role_raises_without_connection():
+    svc = _make_service()
+    dialect = MagicMock(spec=DatabaseDialect)
+    dialect.is_reader_query = "SELECT 1"
+    svc.database_dialect = dialect
+
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(svc.get_host_role())
