@@ -45,15 +45,15 @@ from weakref import WeakSet
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import FailoverError
-from aws_advanced_python_wrapper.hostinfo import HostRole
+from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.notifications import HostEvent
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
     from aws_advanced_python_wrapper.aio.plugin_service import \
         AsyncPluginService
-    from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -220,6 +220,43 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
         task = asyncio.create_task(self._tracker.invalidate_all(old_writer))
         self._pending_invalidations.add(task)
         task.add_done_callback(self._pending_invalidations.discard)
+
+    def notify_host_list_changed(
+            self,
+            changes: Dict[str, Set[HostEvent]]) -> None:
+        """React to topology changes.
+
+        Mirrors sync ``aurora_connection_tracker_plugin.py:344-349``:
+
+        * ``CONVERTED_TO_READER`` for a tracked host -> invalidate that
+          host's connections.
+        * ``CONVERTED_TO_WRITER`` for any host -> clear
+          :attr:`_current_writer` so the next ``execute`` re-detects the
+          new writer via :meth:`_update_writer_from_topology`.
+
+        Limitation: the incoming ``alias`` is a single ``host:port``
+        string; :meth:`AsyncOpenedConnectionTracker.invalidate_all` keys
+        by ``host_info.as_aliases()`` which will also be the same single
+        alias (round-trip through :class:`HostInfo`). If the pool tracked
+        the host via a different alias (e.g. cluster endpoint vs
+        instance endpoint), invalidation misses. Sync handles
+        multi-alias reconciliation via its ``_rds_utils``-driven
+        ``populate_opened_connection_set`` normalization -- out of scope
+        for Phase D.
+        """
+        for alias, events in changes.items():
+            if HostEvent.CONVERTED_TO_READER in events:
+                host_part, _, port_part = alias.partition(":")
+                try:
+                    port = int(port_part) if port_part else 5432
+                except ValueError:
+                    port = 5432
+                h = HostInfo(host=host_part, port=port)
+                self._spawn_invalidation(h)
+            if HostEvent.CONVERTED_TO_WRITER in events:
+                # Force writer recheck on next execute via
+                # _update_writer_from_topology.
+                self._current_writer = None
 
 
 __all__ = ["AsyncAuroraConnectionTrackerPlugin", "AsyncOpenedConnectionTracker"]

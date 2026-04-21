@@ -211,3 +211,65 @@ def test_tracker_state_is_shared_across_instances():
     # And invalidating via tracker_b closes it
     asyncio.run(tracker_b.invalidate_all(host))
     conn.close.assert_called()
+
+
+def test_notify_converted_to_reader_invalidates_that_host():
+    plugin, svc, driver_dialect, tracker = _build()
+    host = HostInfo(host="demoted-w", port=5432, role=HostRole.WRITER)
+    conn = MagicMock(name="conn")
+    conn.close = MagicMock()
+    tracker.track(host, conn)
+
+    from aws_advanced_python_wrapper.utils.notifications import HostEvent
+    alias = host.as_alias()
+
+    async def _run():
+        plugin.notify_host_list_changed({alias: {HostEvent.CONVERTED_TO_READER}})
+        # Give the spawned invalidation task a moment
+        await asyncio.sleep(0.01)
+
+    asyncio.run(_run())
+    conn.close.assert_called()
+
+
+def test_notify_converted_to_writer_resets_current_writer():
+    plugin, svc, driver_dialect, tracker = _build()
+    old_writer = HostInfo(host="old-w", port=5432, role=HostRole.WRITER)
+    svc._all_hosts = (old_writer,)
+
+    async def _first_execute():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+
+    asyncio.run(_first_execute())
+    # Plugin has pinned old_writer as its _current_writer
+    assert plugin._current_writer is not None
+    assert plugin._current_writer.host == "old-w"
+
+    # Notify CONVERTED_TO_WRITER for a new host -- plugin should reset _current_writer
+    from aws_advanced_python_wrapper.utils.notifications import HostEvent
+    plugin.notify_host_list_changed(
+        {"new-w:5432": {HostEvent.CONVERTED_TO_WRITER}})
+    assert plugin._current_writer is None
+
+
+def test_notify_ignores_events_that_are_not_converted():
+    """WENT_DOWN, HOST_ADDED etc. don't trigger invalidation via notify."""
+    plugin, svc, driver_dialect, tracker = _build()
+    host = HostInfo(host="some-host", port=5432, role=HostRole.READER)
+    conn = MagicMock(name="conn")
+    conn.close = MagicMock()
+    tracker.track(host, conn)
+
+    from aws_advanced_python_wrapper.utils.notifications import HostEvent
+
+    async def _run():
+        plugin.notify_host_list_changed(
+            {host.as_alias(): {HostEvent.WENT_DOWN}})
+        await asyncio.sleep(0.01)
+
+    asyncio.run(_run())
+    # WENT_DOWN is not a CONVERTED_* event -> no invalidation
+    conn.close.assert_not_called()
