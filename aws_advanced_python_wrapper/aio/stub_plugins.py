@@ -59,11 +59,6 @@ class _AsyncStubPlugin(AsyncPlugin):
         return set()
 
 
-class AsyncAuroraInitialConnectionStrategyStubPlugin(_AsyncStubPlugin):
-    """Stub for sync AuroraInitialConnectionStrategyPlugin ('initial_connection')."""
-    _STUB_NAME = "initial_connection"
-
-
 class AsyncLimitlessStubPlugin(_AsyncStubPlugin):
     """Stub for sync LimitlessPlugin ('limitless')."""
     _STUB_NAME = "limitless"
@@ -80,7 +75,6 @@ class AsyncFastestResponseStrategyStubPlugin(_AsyncStubPlugin):
 
 
 __all__ = [
-    "AsyncAuroraInitialConnectionStrategyStubPlugin",
     "AsyncBlueGreenStubPlugin",
     "AsyncFastestResponseStrategyStubPlugin",
     "AsyncLimitlessStubPlugin",
