@@ -575,3 +575,71 @@ def test_cached_reader_reuse_still_works_when_host_in_topology():
     # No new connect -- cached reader reused
     assert dd.connect.await_count == initial_connect_count
     assert plugin._reader_conn is cached_reader_conn
+
+
+def test_swap_to_reader_releases_pool_backed_writer_conn():
+    """Pool-backed current conn is closed after swap so it returns to the pool."""
+    reader = HostInfo(host="r", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="w", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, dd, _ = _build(topology=(writer, reader))
+
+    # Replace current connection with a SA-pool-looking mock
+    pool_conn = MagicMock(name="pool_conn")
+    pool_conn.close = MagicMock()
+    # Fake the __module__ on the MagicMock's type so the helper detects it
+    type(pool_conn).__module__ = "sqlalchemy.pool.base"
+    svc._current_connection = pool_conn
+
+    svc.get_host_info_by_strategy = MagicMock(return_value=reader)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())
+    pool_conn.close.assert_called()
+
+
+def test_swap_does_not_close_non_pool_conn():
+    """Non-SA-pool current conn is NOT closed by the swap helper."""
+    reader = HostInfo(host="r", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="w", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, dd, _ = _build(topology=(writer, reader))
+
+    # Plain MagicMock -- __module__ is unittest.mock
+    raw_conn = MagicMock(name="raw_conn")
+    raw_conn.close = MagicMock()
+    svc._current_connection = raw_conn
+
+    svc.get_host_info_by_strategy = MagicMock(return_value=reader)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())
+    raw_conn.close.assert_not_called()
+
+
+def test_is_pool_connection_helper():
+    from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
+        AsyncReadWriteSplittingPlugin
+    assert AsyncReadWriteSplittingPlugin._is_pool_connection(None) is False
+
+    class _FakePool:
+        pass
+    _FakePool.__module__ = "sqlalchemy.pool.impl"
+    assert AsyncReadWriteSplittingPlugin._is_pool_connection(_FakePool()) is True
+
+    class _FakeRaw:
+        pass
+    _FakeRaw.__module__ = "psycopg"
+    assert AsyncReadWriteSplittingPlugin._is_pool_connection(_FakeRaw()) is False

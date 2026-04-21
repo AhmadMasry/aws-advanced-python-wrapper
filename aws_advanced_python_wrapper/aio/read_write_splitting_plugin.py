@@ -23,6 +23,7 @@ is cheap.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Set
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
@@ -128,6 +129,43 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
                 return True
         return False
 
+    @staticmethod
+    def _is_pool_connection(conn: Any) -> bool:
+        """Return True if ``conn`` appears to be managed by SQLAlchemy's
+        internal pool.
+
+        Sync uses ConnectionProviderManager to look up the provider class
+        (read_write_splitting_plugin.py:214-216). Async uses a simpler
+        heuristic: check the connection's module path. Misses custom
+        pool wrappers but covers the common SA pool case.
+        """
+        if conn is None:
+            return False
+        module = getattr(type(conn), "__module__", "")
+        return module.startswith("sqlalchemy.pool")
+
+    async def _release_pool_conn(
+            self,
+            conn: Any,
+            driver_dialect: AsyncDriverDialect) -> None:
+        """Close ``conn`` if it's from SQLAlchemy's pool so it returns to
+        the pool rather than staying held by our plugin.
+        """
+        if not self._is_pool_connection(conn):
+            return
+        try:
+            if await driver_dialect.is_closed(conn):
+                return
+        except Exception:  # noqa: BLE001 - probe is best-effort
+            return
+        try:
+            close = conn.close
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:  # noqa: BLE001 - close is best-effort
+            pass
+
     async def _switch_to_reader(
             self,
             driver_dialect: AsyncDriverDialect,
@@ -148,6 +186,7 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
                 and not await driver_dialect.is_closed(self._reader_conn)):
             await self._plugin_service.set_current_connection(
                 self._reader_conn, self._reader_host_info)
+            await self._release_pool_conn(current, driver_dialect)
             return
 
         # Cache invalid -> drop and reopen
@@ -184,6 +223,7 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             self._reader_conn = new_conn
             self._reader_host_info = reader
             await self._plugin_service.set_current_connection(new_conn, reader)
+            await self._release_pool_conn(current, driver_dialect)
             return
 
         raise ReadWriteSplittingError(
@@ -205,6 +245,7 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
                 and not await driver_dialect.is_closed(self._writer_conn)):
             await self._plugin_service.set_current_connection(
                 self._writer_conn, self._writer_host_info)
+            await self._release_pool_conn(current, driver_dialect)
             return
 
         # Cache invalid -> drop and reopen
@@ -223,6 +264,7 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         self._writer_conn = new_conn
         self._writer_host_info = writer
         await self._plugin_service.set_current_connection(new_conn, writer)
+        await self._release_pool_conn(current, driver_dialect)
 
     async def _open(
             self,
