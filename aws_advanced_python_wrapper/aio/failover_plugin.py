@@ -122,16 +122,19 @@ class AsyncFailoverPlugin(AsyncPlugin):
     def _should_failover(self, exc: Exception) -> bool:
         """Decide whether ``exc`` indicates a failover-worthy error.
 
-        3.0.0 uses a minimal heuristic: any ``OperationalError``-like
-        exception from the underlying driver triggers failover. SP-4 v2
-        will tighten this using the existing sync ``ExceptionHandler``
-        (PG/MySQL-specific SQLSTATE + errno maps).
+        Mirrors sync v2 _should_exception_trigger_connection_switch at
+        failover_v2_plugin.py:416-427: delegate to the dialect-aware
+        ExceptionHandler through the plugin service, with a STRICT_WRITER
+        escape hatch for read-only-connection exceptions (promotes stale
+        read-only replicas to failover triggers).
         """
         # Avoid catching our own failover signals.
         if isinstance(exc, (FailoverSuccessError, FailoverFailedError)):
             return False
-        name = type(exc).__name__.lower()
-        return "operational" in name or "interface" in name or "connection" in name
+        if self._plugin_service.is_network_exception(error=exc):
+            return True
+        return (self._mode == FailoverMode.STRICT_WRITER
+                and self._plugin_service.is_read_only_connection_exception(error=exc))
 
     async def _do_failover(self, driver_dialect: AsyncDriverDialect) -> None:
         """Orchestrate the failover: probe topology, pick target, reconnect."""

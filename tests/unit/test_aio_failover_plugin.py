@@ -118,6 +118,10 @@ def test_disabled_failover_passes_exceptions_through_unchanged():
 def test_enabled_failover_converts_network_error_to_failover_success():
     async def _body() -> None:
         plugin, svc, host_list_provider, driver_dialect = _build_plugin()
+        # No dialect is attached to the svc in unit tests, so the real
+        # ExceptionHandler would classify everything as non-network. Force
+        # the classification used by _should_failover to True here.
+        svc.is_network_exception = MagicMock(return_value=True)
 
         async def _raiser() -> Any:
             raise ConnectionError("boom")
@@ -139,6 +143,7 @@ def test_enabled_failover_converts_network_error_to_failover_success():
 def test_enabled_failover_picks_writer_by_default():
     async def _body() -> None:
         plugin, svc, host_list_provider, driver_dialect = _build_plugin()
+        svc.is_network_exception = MagicMock(return_value=True)
 
         async def _raiser() -> Any:
             raise ConnectionError("boom")
@@ -157,7 +162,8 @@ def test_enabled_failover_picks_writer_by_default():
 
 def test_enabled_failover_picks_reader_in_strict_reader_mode():
     async def _body() -> None:
-        plugin, _svc, _hlp, driver_dialect = _build_plugin(mode="strict_reader")
+        plugin, svc, _hlp, driver_dialect = _build_plugin(mode="strict_reader")
+        svc.is_network_exception = MagicMock(return_value=True)
 
         async def _raiser() -> Any:
             raise ConnectionError("boom")
@@ -174,9 +180,10 @@ def test_enabled_failover_picks_reader_in_strict_reader_mode():
 
 def test_failover_raises_failover_failed_when_topology_has_no_target():
     async def _body() -> None:
-        plugin, _, host_list_provider, driver_dialect = _build_plugin(
+        plugin, svc, host_list_provider, driver_dialect = _build_plugin(
             topology=(), timeout_sec=0.3,
         )
+        svc.is_network_exception = MagicMock(return_value=True)
         # Override force_refresh to always return empty; also make
         # driver_dialect.connect fail if invoked (it shouldn't be).
         host_list_provider.force_refresh = AsyncMock(return_value=())
@@ -242,3 +249,53 @@ def test_connect_pass_through_is_not_intercepted_for_initial_connect():
         assert result is raw_conn
 
     asyncio.run(_body())
+
+
+# ---- B.1: dialect-aware _should_failover classification ----------------
+
+
+def test_should_failover_uses_plugin_service_is_network_exception():
+    """Replaces the string-match heuristic with is_network_exception."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    assert plugin._should_failover(Exception("arbitrary")) is True
+    svc.is_network_exception.assert_called_once()
+
+
+def test_should_failover_returns_false_when_dialect_classifies_not_network():
+    """Non-network, non-read-only exception: no failover."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    assert plugin._should_failover(Exception("arbitrary")) is False
+
+
+def test_should_failover_strict_writer_triggers_on_read_only_exception():
+    """STRICT_WRITER mode treats read-only-connection exception as failover trigger."""
+    plugin, svc, *_ = _build_plugin(mode="strict_writer")
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=True)
+
+    assert plugin._should_failover(Exception("read only")) is True
+
+
+def test_should_failover_strict_reader_does_not_trigger_on_read_only():
+    """STRICT_READER mode does NOT treat read-only as failover trigger."""
+    plugin, svc, *_ = _build_plugin(mode="strict_reader")
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=True)
+
+    assert plugin._should_failover(Exception("read only")) is False
+
+
+def test_should_not_failover_on_self_raised_signals():
+    """FailoverSuccessError / FailoverFailedError must not re-enter failover."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    assert plugin._should_failover(FailoverSuccessError("noop")) is False
+    assert plugin._should_failover(FailoverFailedError("noop")) is False
