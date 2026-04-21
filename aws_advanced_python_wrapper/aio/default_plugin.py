@@ -39,7 +39,12 @@ if TYPE_CHECKING:
 class AsyncDefaultPlugin(AsyncPlugin):
     """Terminal plugin. Always last in the pipeline; drives the raw driver call."""
 
-    _SELECTORS = DriverConnectionProvider._accepted_strategies  # reuse sync's 4-selector dict
+    # Reuse sync's 4-entry HostSelector dict so both sync and async share
+    # the same RoundRobinHostSelector rotation state and selector registry.
+    # Accesses a leading-underscore attr on DriverConnectionProvider -- a
+    # public classmethod on sync side would be cleaner but is out of scope
+    # for Phase A. Tracked as a follow-up.
+    _SELECTORS = DriverConnectionProvider._accepted_strategies
 
     @property
     def subscribed_methods(self) -> Set[str]:

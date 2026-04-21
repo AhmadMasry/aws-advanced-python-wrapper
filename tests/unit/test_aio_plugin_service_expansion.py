@@ -113,3 +113,13 @@ def test_plugin_service_delegates_strategy_through_manager():
     reader = HostInfo(host="reader-1", port=5432, role=HostRole.READER)
     got = svc.get_host_info_by_strategy(HostRole.READER, "random", [reader])
     assert got is reader
+
+
+def test_accepts_strategy_returns_false_when_plugin_manager_unbound():
+    svc = _make_service()
+    assert svc.accepts_strategy(HostRole.READER, "random") is False
+
+
+def test_get_host_info_by_strategy_returns_none_when_plugin_manager_unbound():
+    svc = _make_service()
+    assert svc.get_host_info_by_strategy(HostRole.READER, "random", None) is None

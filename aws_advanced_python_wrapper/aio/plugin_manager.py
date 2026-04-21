@@ -129,9 +129,13 @@ class AsyncPluginManager:
         )
 
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
+        all_methods = DbApiMethod.ALL.method_name
+        strategy_method = DbApiMethod.GET_HOST_INFO_BY_STRATEGY.method_name
         for plugin in self._plugins:
-            if plugin.accepts_strategy(role, strategy):
-                return True
+            subs = plugin.subscribed_methods
+            if all_methods in subs or strategy_method in subs:
+                if plugin.accepts_strategy(role, strategy):
+                    return True
         return False
 
     def get_host_info_by_strategy(
@@ -139,10 +143,14 @@ class AsyncPluginManager:
             role: HostRole,
             strategy: str,
             host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        all_methods = DbApiMethod.ALL.method_name
+        strategy_method = DbApiMethod.GET_HOST_INFO_BY_STRATEGY.method_name
         for plugin in self._plugins:
-            host = plugin.get_host_info_by_strategy(role, strategy, host_list)
-            if host is not None:
-                return host
+            subs = plugin.subscribed_methods
+            if all_methods in subs or strategy_method in subs:
+                host = plugin.get_host_info_by_strategy(role, strategy, host_list)
+                if host is not None:
+                    return host
         return None
 
     # ------------------------------------------------------------------
