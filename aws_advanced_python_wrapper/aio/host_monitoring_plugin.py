@@ -34,6 +34,8 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, FrozenSet,
                     Optional, Set)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
+from aws_advanced_python_wrapper.errors import AwsWrapperError
+from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 
@@ -119,6 +121,11 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         if not self._enabled:
             return await execute_func()
 
+        if self._host_unavailable:
+            raise AwsWrapperError(
+                f"Host is unavailable after {self._failure_count_threshold}"
+                " consecutive failed health checks.")
+
         conn = self._plugin_service.current_connection
         host_info = self._plugin_service.current_host_info
         if conn is None or host_info is None:
@@ -173,6 +180,10 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
                 else:
                     self._consecutive_failures += 1
 
+                if self._consecutive_failures >= self._failure_count_threshold:
+                    await self._mark_host_unavailable(conn, driver_dialect)
+                    return
+
                 try:
                     await asyncio.wait_for(
                         stop_event.wait(), timeout=self._interval_sec
@@ -182,6 +193,25 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
                     continue
         except asyncio.CancelledError:
             return
+
+    async def _mark_host_unavailable(
+            self,
+            conn: Any,
+            driver_dialect: AsyncDriverDialect) -> None:
+        """Threshold breach: mark UNAVAILABLE, abort, flag the plugin.
+
+        Mirrors sync host_monitoring_plugin.py:139-151.
+        """
+        try:
+            self._plugin_service.set_availability(
+                self._monitored_aliases, HostAvailability.UNAVAILABLE)
+        except Exception:  # noqa: BLE001 - best-effort bookkeeping
+            pass
+        try:
+            await driver_dialect.abort_connection(conn)
+        except Exception:  # noqa: BLE001 - abort is best-effort
+            pass
+        self._host_unavailable = True
 
 
 # Optional alias for consistency with sync "v2" naming.

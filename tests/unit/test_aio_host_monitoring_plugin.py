@@ -110,13 +110,13 @@ def test_monitor_task_persists_after_execute_returns():
     asyncio.run(_body())
 
 
-def test_failures_accumulate_across_probes_no_abort_in_c1():
-    """C.1 tracks accumulating failures on the instance but does NOT abort
-    on threshold (that's C.2). The counter should grow past the threshold
+def test_failures_accumulate_across_probes_no_abort_below_threshold():
+    """Failures accumulate on the instance; abort only fires when the
+    threshold is crossed (C.2). With a high threshold the counter grows
     without abort_connection being called."""
     async def _body() -> None:
         plugin, _, driver_dialect, _conn = _build(
-            grace_ms=0, interval_ms=5, count=2
+            grace_ms=0, interval_ms=5, count=1000
         )
         # All pings fail.
         driver_dialect.ping = AsyncMock(return_value=False)
@@ -126,7 +126,8 @@ def test_failures_accumulate_across_probes_no_abort_in_c1():
             return "done"
 
         await plugin.execute(object(), "Cursor.execute", _slow_work)
-        # C.2 will add abort_connection; C.1 does NOT call it.
+        # Threshold is huge -- counter accumulates but no abort.
+        assert plugin._consecutive_failures > 0
         driver_dialect.abort_connection.assert_not_called()
 
     asyncio.run(_body())
@@ -283,3 +284,63 @@ def test_monitor_tracks_host_aliases():
 
     asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _noop))
     assert plugin._monitored_aliases == host.as_aliases()
+
+
+def test_threshold_breach_marks_host_unavailable_and_aborts():
+    from aws_advanced_python_wrapper.host_availability import HostAvailability
+
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=0, interval_ms=10, count=2)
+    host = HostInfo(host="h.example", port=5432)
+    svc._current_host_info = host
+    svc.set_availability = MagicMock()
+    driver_dialect.ping = AsyncMock(return_value=False)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        # Give the monitor enough iterations to hit the threshold
+        await asyncio.sleep(0.2)
+
+    asyncio.run(_run())
+
+    svc.set_availability.assert_any_call(
+        host.as_aliases(), HostAvailability.UNAVAILABLE)
+    driver_dialect.abort_connection.assert_awaited()
+    assert plugin._host_unavailable is True
+
+
+def test_execute_raises_when_host_already_unavailable():
+    from aws_advanced_python_wrapper.errors import AwsWrapperError
+
+    plugin, svc, driver_dialect, conn = _build()
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+    plugin._host_unavailable = True  # simulate prior threshold breach
+
+    async def _noop():
+        return None
+
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _noop))
+
+
+def test_monitor_exits_loop_after_threshold_breach():
+    """After threshold hit, the monitor task finishes cleanly — doesn't keep probing."""
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=0, interval_ms=10, count=2)
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+    driver_dialect.ping = AsyncMock(return_value=False)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        # Give the monitor enough iterations to hit threshold and exit
+        await asyncio.sleep(0.3)
+        return plugin._monitor_task.done()
+
+    done = asyncio.run(_run())
+    assert done is True
