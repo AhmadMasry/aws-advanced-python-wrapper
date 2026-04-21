@@ -159,68 +159,127 @@ class AsyncFailoverPlugin(AsyncPlugin):
         ) from original_exc
 
     async def _do_failover(self, driver_dialect: AsyncDriverDialect) -> None:
-        """Orchestrate the failover: probe topology, pick target, reconnect.
+        """Dispatch failover based on failover_mode.
 
-        On connection attempts, mark each candidate's availability
-        through the plugin service so the retry loop (and other
-        plugins) stop hammering hosts that are known-dead and so a
-        host that recovers is put back into rotation promptly
-        (B.3 / A.3 TTL cache).
+        Mirrors sync v2 _failover_reader / _failover_writer at
+        failover_v2_plugin.py:254-310 / :323-390.
         """
         deadline = asyncio.get_event_loop().time() + self._failover_timeout_sec
         last_error: Optional[BaseException] = None
 
+        try:
+            topology = await self._host_list_provider.force_refresh(
+                self._plugin_service.current_connection)
+        except Exception as e:  # noqa: BLE001 - refresh failure is recoverable
+            topology = ()
+            last_error = e
+
+        # Fall back to the host the user originally connected to if the
+        # topology provider returned nothing (e.g. monitor broken).
+        if not topology and self._plugin_service.initial_connection_host_info is not None:
+            topology = (self._plugin_service.initial_connection_host_info,)
+
+        if self._mode == FailoverMode.STRICT_WRITER:
+            await self._failover_writer(topology, driver_dialect, deadline, last_error)
+        else:
+            await self._failover_reader(topology, driver_dialect, deadline, last_error)
+
+    async def _failover_reader(
+            self,
+            topology: Topology,
+            driver_dialect: AsyncDriverDialect,
+            deadline: float,
+            last_error: Optional[BaseException]) -> None:
+        reader_candidates = [h for h in topology if h.role == HostRole.READER]
+        original_writer = next(
+            (h for h in topology if h.role == HostRole.WRITER), None)
+        strategy = (WrapperProperties.FAILOVER_READER_HOST_SELECTOR_STRATEGY
+                    .get(self._props) or "random")
+
         while asyncio.get_event_loop().time() < deadline:
-            try:
-                topology = await self._host_list_provider.force_refresh(
-                    self._plugin_service.current_connection
-                )
-            except Exception as e:
-                last_error = e
-                await asyncio.sleep(1.0)
-                continue
+            remaining = list(reader_candidates)
+            while remaining and asyncio.get_event_loop().time() < deadline:
+                try:
+                    candidate = self._plugin_service.get_host_info_by_strategy(
+                        HostRole.READER, strategy, remaining)
+                except Exception as e:  # noqa: BLE001
+                    last_error = e
+                    break
+                if candidate is None:
+                    break
 
-            target = self._pick_target(topology)
-            if target is None:
-                await asyncio.sleep(1.0)
-                continue
+                try:
+                    new_conn = await self._open_connection(candidate, driver_dialect)
+                except Exception as e:  # noqa: BLE001
+                    self._plugin_service.set_availability(
+                        candidate.as_aliases(), HostAvailability.UNAVAILABLE)
+                    last_error = e
+                    if candidate in remaining:
+                        remaining.remove(candidate)
+                    continue
 
-            try:
-                new_conn = await self._open_connection(target, driver_dialect)
-            except Exception as e:
                 self._plugin_service.set_availability(
-                    target.as_aliases(), HostAvailability.UNAVAILABLE)
-                last_error = e
-                await asyncio.sleep(1.0)
-                continue
-
-            if new_conn is not None:
-                self._plugin_service.set_availability(
-                    target.as_aliases(), HostAvailability.AVAILABLE)
-                await self._plugin_service.set_current_connection(new_conn, target)
+                    candidate.as_aliases(), HostAvailability.AVAILABLE)
+                await self._plugin_service.set_current_connection(new_conn, candidate)
                 return
+
+            # Readers exhausted for this pass. Try original writer if mode allows.
+            if (original_writer is not None
+                    and self._mode != FailoverMode.STRICT_READER
+                    and asyncio.get_event_loop().time() < deadline):
+                try:
+                    new_conn = await self._open_connection(original_writer, driver_dialect)
+                except Exception as e:  # noqa: BLE001
+                    self._plugin_service.set_availability(
+                        original_writer.as_aliases(), HostAvailability.UNAVAILABLE)
+                    last_error = e
+                else:
+                    self._plugin_service.set_availability(
+                        original_writer.as_aliases(), HostAvailability.AVAILABLE)
+                    await self._plugin_service.set_current_connection(
+                        new_conn, original_writer)
+                    return
 
             await asyncio.sleep(1.0)
 
         raise FailoverFailedError(
-            "Failover could not establish a new connection within "
+            "Failover could not establish a new reader within "
             f"{self._failover_timeout_sec}s"
         ) from last_error
 
-    def _pick_target(self, topology: Topology) -> Optional[HostInfo]:
-        if not topology:
-            return None
-        if self._mode == FailoverMode.STRICT_READER:
-            readers = [h for h in topology if h.role == HostRole.READER]
-            return readers[0] if readers else None
-        if self._mode == FailoverMode.READER_OR_WRITER:
-            # Prefer readers but fall back to writer.
-            readers = [h for h in topology if h.role == HostRole.READER]
-            if readers:
-                return readers[0]
-        # STRICT_WRITER or READER_OR_WRITER-no-readers fallback.
-        writers = [h for h in topology if h.role == HostRole.WRITER]
-        return writers[0] if writers else None
+    async def _failover_writer(
+            self,
+            topology: Topology,
+            driver_dialect: AsyncDriverDialect,
+            deadline: float,
+            last_error: Optional[BaseException]) -> None:
+        while asyncio.get_event_loop().time() < deadline:
+            writer = next(
+                (h for h in topology if h.role == HostRole.WRITER), None)
+            if writer is not None:
+                try:
+                    new_conn = await self._open_connection(writer, driver_dialect)
+                except Exception as e:  # noqa: BLE001
+                    self._plugin_service.set_availability(
+                        writer.as_aliases(), HostAvailability.UNAVAILABLE)
+                    last_error = e
+                else:
+                    self._plugin_service.set_availability(
+                        writer.as_aliases(), HostAvailability.AVAILABLE)
+                    await self._plugin_service.set_current_connection(new_conn, writer)
+                    return
+
+            await asyncio.sleep(1.0)
+            try:
+                topology = await self._host_list_provider.force_refresh(
+                    self._plugin_service.current_connection)
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+
+        raise FailoverFailedError(
+            "Failover could not establish a new writer within "
+            f"{self._failover_timeout_sec}s"
+        ) from last_error
 
     async def _open_connection(
             self,

@@ -166,6 +166,12 @@ def test_enabled_failover_picks_reader_in_strict_reader_mode():
     async def _body() -> None:
         plugin, svc, _hlp, driver_dialect = _build_plugin(mode="strict_reader")
         svc.is_network_exception = MagicMock(return_value=True)
+        # B.4: reader failover goes through get_host_info_by_strategy.
+        # The real plugin_manager isn't wired in unit tests, so stub it to
+        # return the reader from the topology _build_plugin seeded.
+        reader_host = HostInfo(
+            host="reader.example.com", port=5432, role=HostRole.READER)
+        svc.get_host_info_by_strategy = MagicMock(return_value=reader_host)
 
         async def _raiser() -> Any:
             raise ConnectionError("boom")
@@ -416,3 +422,149 @@ def test_failover_marks_failed_host_unavailable():
 
     svc.set_availability.assert_any_call(
         writer.as_aliases(), HostAvailability.UNAVAILABLE)
+
+
+# ---- B.4: reader retry loop + strategy + writer fallback ---------------
+
+
+def test_reader_failover_uses_configured_strategy():
+    """Reader failover picks via plugin_service.get_host_info_by_strategy
+    with the configured strategy name."""
+    props_extra = {"failover_mode": "strict-reader",  # noqa: F841
+                   "failover_reader_host_selector_strategy": "round_robin"}
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin(  # noqa: F841
+        mode="strict-reader")
+    # Inject the strategy prop into the plugin's internal props dict.
+    # _build_plugin doesn't take an arbitrary kwarg; instead construct the
+    # plugin with our own props.
+    props = Properties({
+        "host": "cluster.example.com",
+        "port": "5432",
+        "enable_failover": "true",
+        "failover_timeout_sec": "1.0",
+        "failover_mode": "strict-reader",
+        "failover_reader_host_selector_strategy": "round_robin",
+    })
+    # Rebuild svc + plugin with our props
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginServiceImpl
+    dd = MagicMock()
+    dd.connect = AsyncMock(return_value=MagicMock(name="new_conn"))
+    dd.transfer_session_state = AsyncMock()
+    svc = AsyncPluginServiceImpl(props, dd)
+
+    reader = HostInfo(host="r1", port=5432, role=HostRole.READER)
+    hlp = MagicMock()
+    hlp.force_refresh = AsyncMock(return_value=(reader,))
+
+    plugin = AsyncFailoverPlugin(plugin_service=svc, host_list_provider=hlp, props=props)
+    svc.get_host_info_by_strategy = MagicMock(return_value=reader)
+    plugin._open_connection = AsyncMock(return_value=MagicMock())
+
+    asyncio.run(plugin._do_failover(driver_dialect=dd))
+
+    svc.get_host_info_by_strategy.assert_called()
+    first_call = svc.get_host_info_by_strategy.call_args_list[0]
+    # Positional: (role, strategy, host_list)
+    assert first_call.args[1] == "round_robin"
+
+
+def test_reader_failover_cycles_through_candidates():
+    """Failed reader is removed from remaining; next candidate tried."""
+    props = Properties({
+        "host": "cluster.example.com",
+        "port": "5432",
+        "enable_failover": "true",
+        "failover_timeout_sec": "1.0",
+        "failover_mode": "strict-reader",
+    })
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginServiceImpl
+    dd = MagicMock()
+    dd.connect = AsyncMock(return_value=MagicMock(name="new_conn"))
+    dd.transfer_session_state = AsyncMock()
+    svc = AsyncPluginServiceImpl(props, dd)
+
+    r1 = HostInfo(host="r1", port=5432, role=HostRole.READER)
+    r2 = HostInfo(host="r2", port=5432, role=HostRole.READER)
+
+    hlp = MagicMock()
+    hlp.force_refresh = AsyncMock(return_value=(r1, r2))
+
+    plugin = AsyncFailoverPlugin(plugin_service=svc, host_list_provider=hlp, props=props)
+
+    # Strategy picks r1 first, then r2
+    svc.get_host_info_by_strategy = MagicMock(side_effect=[r1, r2])
+
+    attempts = []
+
+    async def _open(target, _driver_dialect):
+        attempts.append(target.host)
+        if target is r1:
+            raise OSError("r1 down")
+        return MagicMock()
+
+    plugin._open_connection = _open  # type: ignore[method-assign]
+
+    asyncio.run(plugin._do_failover(driver_dialect=dd))
+
+    assert attempts == ["r1", "r2"]
+
+
+def test_reader_failover_falls_back_to_original_writer_in_reader_or_writer_mode():
+    """READER_OR_WRITER: when all readers fail, try the original writer."""
+    props = Properties({
+        "host": "cluster.example.com",
+        "port": "5432",
+        "enable_failover": "true",
+        "failover_timeout_sec": "1.0",
+        "failover_mode": "reader-or-writer",
+    })
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginServiceImpl
+    dd = MagicMock()
+    dd.connect = AsyncMock(return_value=MagicMock(name="new_conn"))
+    dd.transfer_session_state = AsyncMock()
+    svc = AsyncPluginServiceImpl(props, dd)
+
+    r1 = HostInfo(host="r1", port=5432, role=HostRole.READER)
+    w = HostInfo(host="w1", port=5432, role=HostRole.WRITER)
+
+    hlp = MagicMock()
+    hlp.force_refresh = AsyncMock(return_value=(r1, w))
+
+    plugin = AsyncFailoverPlugin(plugin_service=svc, host_list_provider=hlp, props=props)
+    # Strategy returns r1 first, then None (signals "no more readers")
+    svc.get_host_info_by_strategy = MagicMock(side_effect=[r1, None])
+
+    attempts = []
+
+    async def _open(target, _driver_dialect):
+        attempts.append(target.host)
+        if target is r1:
+            raise OSError("r1 down")
+        return MagicMock()
+
+    plugin._open_connection = _open  # type: ignore[method-assign]
+
+    asyncio.run(plugin._do_failover(driver_dialect=dd))
+
+    assert attempts == ["r1", "w1"]
+
+
+def test_failover_falls_back_to_initial_host_when_topology_empty():
+    """If force_refresh returns empty topology, use initial_connection_host_info."""
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin(
+        mode="strict-writer", timeout_sec=0.5)
+
+    initial = HostInfo(host="writer-initial", port=5432, role=HostRole.WRITER)
+    svc.initial_connection_host_info = initial
+    host_list_provider.force_refresh = AsyncMock(return_value=())
+
+    plugin._open_connection = AsyncMock(return_value=MagicMock())
+
+    asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
+
+    plugin._open_connection.assert_called()
+    (target, _), _ = plugin._open_connection.call_args_list[0]
+    assert target is initial
