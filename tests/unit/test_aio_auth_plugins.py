@@ -522,3 +522,29 @@ def test_iam_plugin_resolve_credentials_returns_was_cached_flag():
             plugin._resolve_credentials(host, props))
     assert was_cached1 is False
     assert was_cached2 is True
+
+
+def test_iam_plugin_uses_database_dialect_default_port_when_port_missing():
+    """When neither IAM_DEFAULT_PORT nor host_info.port is set, use the
+    database_dialect's default_port (e.g. 3306 for MySQL)."""
+    props = Properties({
+        "host": "mydb.abc.us-west-2.rds.amazonaws.com",
+        # port OMITTED
+        "user": "u",
+        "iam_region": "us-west-2",
+    })
+    svc = _svc(props)
+    # Fake a MySQL dialect for the default_port
+    fake_dialect = MagicMock()
+    fake_dialect.default_port = 3306
+    svc.database_dialect = fake_dialect
+    plugin = AsyncIamAuthPlugin(svc, props)
+
+    host = HostInfo(host="mydb.abc.us-west-2.rds.amazonaws.com")  # no port
+    with patch.object(AsyncIamAuthPlugin, "_generate_token_blocking",
+                      return_value="tok") as gen:
+        asyncio.run(plugin._resolve_credentials(host, props))
+
+    # _generate_token_blocking signature: (host, port, user, region)
+    args = gen.call_args[0]
+    assert args[1] == 3306  # port argument was 3306, not 5432

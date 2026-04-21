@@ -169,6 +169,37 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
         super().__init__(plugin_service, props)
         self._token_cache: Dict[str, Tuple[str, float]] = {}
 
+    def _default_port(self) -> int:
+        dialect = self._plugin_service.database_dialect
+        if dialect is not None:
+            return dialect.default_port
+        return 5432
+
+    def _cache_key_for(
+            self,
+            host_info: HostInfo,
+            props: Properties) -> Optional[str]:
+        """Return the IAM-token cache key for ``(host_info, props)`` or
+        ``None`` if the inputs don't contain enough info to build one.
+
+        Encapsulates host / port / region derivation so
+        ``_resolve_credentials`` and ``_invalidate_cache`` stay aligned.
+        """
+        user = WrapperProperties.USER.get(props)
+        if not user:
+            return None
+        host = IamAuthUtils.get_iam_host(props, host_info)
+        port = IamAuthUtils.get_port(props, host_info, self._default_port())
+        rds_type = RdsUtils().identify_rds_type(host)
+        region_utils = (GdbRegionUtils()
+                        if rds_type == RdsUrlType.RDS_GLOBAL_WRITER_CLUSTER
+                        else RegionUtils())
+        region = region_utils.get_region(
+            props, WrapperProperties.IAM_REGION.name, host, host_info)
+        if not region:
+            return None
+        return IamAuthUtils.get_cache_key(user, host, port, region)
+
     async def _resolve_credentials(
             self,
             host_info: HostInfo,
@@ -180,10 +211,7 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
             )
 
         host = IamAuthUtils.get_iam_host(props, host_info)
-        # Fallback port is 5432. Sync side pulls from
-        # plugin_service.database_dialect.default_port, but async Phase A
-        # may not have database_dialect set yet.
-        port = IamAuthUtils.get_port(props, host_info, 5432)
+        port = IamAuthUtils.get_port(props, host_info, self._default_port())
 
         rds_type = RdsUtils().identify_rds_type(host)
         region_utils = (GdbRegionUtils()
@@ -226,24 +254,9 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
         Called by :class:`AsyncAuthPluginBase` when cached credentials
         fail authentication (retry-on-login path).
         """
-        user = WrapperProperties.USER.get(props)
-        if not user:
-            return
-        try:
-            host = IamAuthUtils.get_iam_host(props, host_info)
-        except AwsWrapperError:
-            return
-        port = IamAuthUtils.get_port(props, host_info, 5432)
-        rds_type = RdsUtils().identify_rds_type(host)
-        region_utils = (GdbRegionUtils()
-                        if rds_type == RdsUrlType.RDS_GLOBAL_WRITER_CLUSTER
-                        else RegionUtils())
-        region = region_utils.get_region(
-            props, WrapperProperties.IAM_REGION.name, host, host_info)
-        if not region:
-            return
-        cache_key = IamAuthUtils.get_cache_key(user, host, port, region)
-        self._token_cache.pop(cache_key, None)
+        cache_key = self._cache_key_for(host_info, props)
+        if cache_key is not None:
+            self._token_cache.pop(cache_key, None)
 
     @staticmethod
     def _generate_token_blocking(
