@@ -344,3 +344,91 @@ def test_monitor_exits_loop_after_threshold_breach():
 
     done = asyncio.run(_run())
     assert done is True
+
+
+# ---- C.3 notify hooks --------------------------------------------------
+
+
+def test_notify_connection_changed_resets_monitor():
+    """Connection swap clears failure counter + unavailable flag + cancels task."""
+    from aws_advanced_python_wrapper.utils.notifications import ConnectionEvent
+
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=0, interval_ms=10, count=1000)
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+    driver_dialect.ping = AsyncMock(return_value=False)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        await asyncio.sleep(0.1)  # let some failures accumulate
+        prior = plugin._consecutive_failures
+
+        plugin.notify_connection_changed({ConnectionEvent.CONNECTION_OBJECT_CHANGED})
+        await asyncio.sleep(0.01)  # allow cancellation to propagate
+        return prior, plugin._consecutive_failures, plugin._host_unavailable, plugin._monitor_task
+
+    prior, after, unavail, task = asyncio.run(_run())
+    assert prior > 0
+    assert after == 0
+    assert unavail is False
+    # Task should be canceled / done (reset by notify)
+    assert task is None or task.done()
+
+
+def test_notify_connection_changed_clears_host_unavailable():
+    """Prior threshold breach is cleared when connection swaps."""
+    from aws_advanced_python_wrapper.utils.notifications import ConnectionEvent
+
+    plugin, svc, driver_dialect, conn = _build()
+    plugin._host_unavailable = True
+    plugin._consecutive_failures = 10
+
+    plugin.notify_connection_changed({ConnectionEvent.CONNECTION_OBJECT_CHANGED})
+    assert plugin._host_unavailable is False
+    assert plugin._consecutive_failures == 0
+
+
+def test_notify_host_list_changed_stops_monitor_on_went_down():
+    """If the monitored host's topology entry says WENT_DOWN, stop the monitor."""
+    from aws_advanced_python_wrapper.utils.notifications import HostEvent
+
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=0, interval_ms=100, count=1000)
+    host = HostInfo(host="h.example", port=5432)
+    svc._current_host_info = host
+
+    async def _start_then_notify():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        # Notify that our host went down
+        plugin.notify_host_list_changed({host.as_alias(): {HostEvent.WENT_DOWN}})
+        return plugin._monitor_stop.is_set()
+
+    stopped = asyncio.run(_start_then_notify())
+    assert stopped is True
+
+
+def test_notify_host_list_changed_ignores_unrelated_hosts():
+    """Events for a different host don't stop our monitor."""
+    from aws_advanced_python_wrapper.utils.notifications import HostEvent
+
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=0, interval_ms=100, count=1000)
+    host = HostInfo(host="h.example", port=5432)
+    svc._current_host_info = host
+
+    async def _start_then_notify():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        plugin.notify_host_list_changed({"unrelated-host:5432": {HostEvent.WENT_DOWN}})
+        return plugin._monitor_stop.is_set()
+
+    stopped = asyncio.run(_start_then_notify())
+    assert stopped is False

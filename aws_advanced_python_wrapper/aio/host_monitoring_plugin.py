@@ -30,13 +30,15 @@ Shares the sync EFM plugin's connection properties:
 from __future__ import annotations
 
 import asyncio
-from typing import (TYPE_CHECKING, Any, Awaitable, Callable, FrozenSet,
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, FrozenSet,
                     Optional, Set)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.notifications import (ConnectionEvent,
+                                                             HostEvent)
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 
 if TYPE_CHECKING:
@@ -209,6 +211,36 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         except Exception:  # noqa: BLE001 - abort is best-effort (socket may be dead)
             pass
         self._host_unavailable = True
+
+    def notify_connection_changed(
+            self, changes: Set[ConnectionEvent]) -> None:
+        """Connection swap -> reset monitor state and cancel the task.
+
+        The next execute starts a fresh monitor against the new connection.
+        Mirrors sync host_monitoring_plugin.py:155-160.
+        """
+        self._consecutive_failures = 0
+        self._host_unavailable = False
+        self._monitor_stop.set()
+        self._monitor_stop = asyncio.Event()
+        if self._monitor_task is not None:
+            self._monitor_task.cancel()
+            self._monitor_task = None
+
+    def notify_host_list_changed(
+            self, changes: Dict[str, Set[HostEvent]]) -> None:
+        """Topology change -> stop monitor if our host went down.
+
+        Mirrors sync host_monitoring_plugin.py:162-175.
+        """
+        if not self._monitored_aliases:
+            return
+        for alias, events in changes.items():
+            if alias not in self._monitored_aliases:
+                continue
+            if HostEvent.WENT_DOWN in events or HostEvent.HOST_DELETED in events:
+                self._monitor_stop.set()
+                return
 
 
 # Optional alias for consistency with sync "v2" naming.
