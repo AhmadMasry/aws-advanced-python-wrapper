@@ -323,3 +323,29 @@ def test_plugin_service_get_host_role_raises_without_connection():
 
     with pytest.raises(AwsWrapperError):
         asyncio.run(svc.get_host_role())
+
+
+def test_get_telemetry_factory_returns_no_op_by_default():
+    svc = _make_service()
+    factory = svc.get_telemetry_factory()
+    # Should be callable and return valid counter/gauge objects
+    assert factory is not None
+    counter = factory.create_counter("test.counter")
+    # Counter may be None for strict no-op impl, or an object we can .inc()
+    if counter is not None:
+        counter.inc()
+
+
+def test_get_telemetry_factory_is_memoized():
+    svc = _make_service()
+    f1 = svc.get_telemetry_factory()
+    f2 = svc.get_telemetry_factory()
+    assert f1 is f2
+
+
+def test_set_telemetry_factory_overrides_default():
+    from unittest.mock import MagicMock
+    svc = _make_service()
+    fake = MagicMock()
+    svc.set_telemetry_factory(fake)
+    assert svc.get_telemetry_factory() is fake

@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     from aws_advanced_python_wrapper.host_availability import HostAvailability
     from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
     from aws_advanced_python_wrapper.utils.properties import Properties
+    from aws_advanced_python_wrapper.utils.telemetry.telemetry import \
+        TelemetryFactory
 
 
 class AsyncPluginService(Protocol):
@@ -149,6 +151,15 @@ class AsyncPluginService(Protocol):
         """Best-effort shutdown. Idempotent. Does not raise."""
         ...
 
+    def get_telemetry_factory(self) -> TelemetryFactory:
+        """Return a TelemetryFactory for emitting counters/gauges/contexts.
+
+        Defaults to NilTelemetryFactory (no-op) when no backend is
+        wired. Plugins should call ``create_counter`` / ``create_gauge``
+        eagerly in __init__ and then ``.inc()`` / ``.set()`` at runtime.
+        """
+        ...
+
     async def get_host_role(
             self,
             connection: Optional[Any] = None,
@@ -216,6 +227,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._initial_connection_host_info: Optional[HostInfo] = None
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
+        self._telemetry_factory: Optional[TelemetryFactory] = None
 
     @property
     def current_connection(self) -> Optional[Any]:
@@ -358,6 +370,17 @@ class AsyncPluginServiceImpl(AsyncPluginService):
                 await hlp.release_resources()
             except Exception:  # noqa: BLE001
                 pass
+
+    def get_telemetry_factory(self) -> TelemetryFactory:
+        if self._telemetry_factory is None:
+            from aws_advanced_python_wrapper.utils.telemetry.null_telemetry import \
+                NullTelemetryFactory
+            self._telemetry_factory = NullTelemetryFactory()
+        return self._telemetry_factory
+
+    def set_telemetry_factory(self, factory: TelemetryFactory) -> None:
+        """Wire an external telemetry factory (e.g. from AsyncAwsWrapperConnection.connect)."""
+        self._telemetry_factory = factory
 
     async def get_host_role(
             self,
