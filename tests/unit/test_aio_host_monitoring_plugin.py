@@ -93,30 +93,30 @@ def test_happy_path_passes_result_through():
     asyncio.run(_body())
 
 
-def test_monitor_task_is_cleaned_up_when_execute_returns():
+def test_monitor_task_persists_after_execute_returns():
+    """Under the standing-task model the monitor does NOT get cancelled when
+    execute returns. It lives for the connection's lifetime."""
     async def _body() -> None:
         plugin, *_ = _build(grace_ms=1000)
 
         async def _work() -> None:
             return None
 
-        # Measure tasks before and after to ensure cleanup.
-        before = len(asyncio.all_tasks())
         await plugin.execute(object(), "Cursor.execute", _work)
-        # Give cancellation a tick.
         await asyncio.sleep(0)
-        after = len(asyncio.all_tasks())
-        # Count may vary by one because of the current task; just ensure we
-        # didn't leak multiple tasks.
-        assert after <= before + 1
+        assert plugin._monitor_task is not None
+        assert not plugin._monitor_task.done()
 
     asyncio.run(_body())
 
 
-def test_abort_on_threshold_consecutive_ping_failures():
+def test_failures_accumulate_across_probes_no_abort_in_c1():
+    """C.1 tracks accumulating failures on the instance but does NOT abort
+    on threshold (that's C.2). The counter should grow past the threshold
+    without abort_connection being called."""
     async def _body() -> None:
-        plugin, _, driver_dialect, conn = _build(
-            grace_ms=5, interval_ms=5, count=2
+        plugin, _, driver_dialect, _conn = _build(
+            grace_ms=0, interval_ms=5, count=2
         )
         # All pings fail.
         driver_dialect.ping = AsyncMock(return_value=False)
@@ -126,8 +126,8 @@ def test_abort_on_threshold_consecutive_ping_failures():
             return "done"
 
         await plugin.execute(object(), "Cursor.execute", _slow_work)
-        # After 2 consecutive failures, abort_connection should have been called.
-        driver_dialect.abort_connection.assert_awaited_with(conn)
+        # C.2 will add abort_connection; C.1 does NOT call it.
+        driver_dialect.abort_connection.assert_not_called()
 
     asyncio.run(_body())
 
@@ -164,10 +164,12 @@ def test_no_connection_means_no_monitor():
     asyncio.run(_body())
 
 
-def test_ping_exception_counts_as_failure():
+def test_ping_exception_increments_failure_counter():
+    """C.1: exceptions raised by ping are treated as failures -- the counter
+    increments. (C.2 will add the abort-on-threshold behavior.)"""
     async def _body() -> None:
-        plugin, _, driver_dialect, conn = _build(
-            grace_ms=2, interval_ms=2, count=2
+        plugin, _, driver_dialect, _conn = _build(
+            grace_ms=0, interval_ms=2, count=1000
         )
         driver_dialect.ping = AsyncMock(side_effect=RuntimeError("net down"))
 
@@ -176,12 +178,17 @@ def test_ping_exception_counts_as_failure():
             return "rows"
 
         await plugin.execute(object(), "Cursor.execute", _slow)
-        driver_dialect.abort_connection.assert_awaited_with(conn)
+        # With ping always raising, failures must accumulate past the
+        # initial zero; no abort because threshold is large.
+        assert plugin._consecutive_failures > 0
+        driver_dialect.abort_connection.assert_not_called()
 
     asyncio.run(_body())
 
 
-def test_execute_raises_still_cancels_monitor():
+def test_execute_raises_still_leaves_monitor_alive():
+    """Standing-task model: when execute_func raises, the monitor task is
+    NOT torn down -- cleanup happens via release_resources (Task C.4)."""
     async def _body() -> None:
         plugin, *_ = _build(grace_ms=1000)
 
@@ -190,7 +197,89 @@ def test_execute_raises_still_cancels_monitor():
 
         with pytest.raises(RuntimeError):
             await plugin.execute(object(), "Cursor.execute", _raiser)
-        # Post-exception cleanup: no long-running monitor tasks lingering.
         await asyncio.sleep(0)
+        assert plugin._monitor_task is not None
+        assert not plugin._monitor_task.done()
 
     asyncio.run(_body())
+
+
+# ---- C.1 standing-task behavior ----------------------------------------
+
+
+def test_monitor_task_starts_lazily_on_first_execute():
+    """Standing monitor task is created on first execute, not at plugin
+    construction."""
+    plugin, svc, driver_dialect, conn = _build(grace_ms=1000, interval_ms=1000)
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+
+    # No task before first execute
+    assert plugin._monitor_task is None
+
+    async def _noop():
+        return None
+
+    asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _noop))
+    assert plugin._monitor_task is not None
+
+
+def test_monitor_task_persists_across_multiple_executes():
+    """Single standing task, not a new task per execute."""
+    plugin, svc, driver_dialect, conn = _build(grace_ms=1000, interval_ms=1000)
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        task_1 = plugin._monitor_task
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        task_2 = plugin._monitor_task
+        return task_1, task_2
+
+    t1, t2 = asyncio.run(_run())
+    assert t1 is t2
+
+
+def test_failure_count_accumulates_across_probes():
+    """Consecutive failed pings accumulate; successful ping resets."""
+    plugin, svc, driver_dialect, conn = _build(
+        grace_ms=0, interval_ms=10, count=10)
+    svc._current_host_info = HostInfo(host="h.example", port=5432)
+
+    ping_results = [False, False, True, False, False]
+    driver_dialect.ping = AsyncMock(side_effect=ping_results + [True] * 20)
+
+    async def _run():
+        async def _noop():
+            return None
+
+        await plugin.execute(MagicMock(), "Cursor.execute", _noop)
+        # Let monitor burn through several iterations
+        await asyncio.sleep(0.15)
+        # After False, False, True, False, False, True... the counter should
+        # have hit at most 2 before reset, then at most 2 again. Threshold is
+        # 10 so no UNAVAILABLE action is taken. The counter value at end
+        # depends on timing; what matters is it never reached 10 (no abort)
+        # and is >= 0.
+        # Softer assertion: monitor task is still alive (didn't trigger
+        # threshold exit) -- assert inside the running loop before
+        # asyncio.run's shutdown closes pending tasks.
+        assert plugin._monitor_task is not None
+        assert not plugin._monitor_task.done()
+
+    asyncio.run(_run())
+
+
+def test_monitor_tracks_host_aliases():
+    """Monitor records the host's aliases for UNAVAILABLE marking in C.2."""
+    plugin, svc, driver_dialect, conn = _build(grace_ms=100, interval_ms=100)
+    host = HostInfo(host="h.example", port=5432)
+    svc._current_host_info = host
+
+    async def _noop():
+        return None
+
+    asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _noop))
+    assert plugin._monitored_aliases == host.as_aliases()

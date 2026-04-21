@@ -30,7 +30,8 @@ Shares the sync EFM plugin's connection properties:
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Set
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, FrozenSet,
+                    Optional, Set)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
@@ -48,12 +49,17 @@ if TYPE_CHECKING:
 class AsyncHostMonitoringPlugin(AsyncPlugin):
     """Async counterpart of the Host Monitoring Plugin v2.
 
-    Design: no per-host background task pool (sync EFM v2 uses one). In
-    3.0.0 the async version runs a short-lived monitor task ONLY during
-    network-bound calls. This keeps the event-loop footprint minimal and
-    sidesteps cross-task connection ownership issues. The downside is that
-    outages are detected only while the app is actively issuing queries;
-    SP-5 v2 can add a standing per-connection monitor task if required.
+    Runs a single long-lived monitor task per plugin (one plugin per
+    connection in the async wrapper). The task is started LAZILY on the
+    first :meth:`execute` call -- we can't start it in ``__init__`` because
+    the plugin is constructed before a connection exists. Once running, it
+    probes ``driver_dialect.ping(conn)`` on ``interval_ms`` cadence after
+    an initial ``grace_ms`` grace period, accumulating consecutive failures
+    across probes.
+
+    Phase C.1 only establishes the standing task + failure accumulator.
+    C.2 adds the UNAVAILABLE/abort behavior; C.3 adds notify hooks;
+    C.4 wires teardown via ``release_resources``.
     """
 
     _SUBSCRIBED: Set[str] = {
@@ -80,6 +86,15 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         count = WrapperProperties.FAILURE_DETECTION_COUNT.get(props)
         self._failure_count_threshold = int(count) if count else 3
 
+        # Standing-task state (Phase C.1). These are populated lazily on the
+        # first execute() call; tracked on the instance so C.2 tests (and
+        # release_resources in C.4) can observe/manipulate them.
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._monitor_stop: asyncio.Event = asyncio.Event()
+        self._consecutive_failures: int = 0
+        self._monitored_aliases: FrozenSet[str] = frozenset()
+        self._host_unavailable: bool = False
+
     @property
     def subscribed_methods(self) -> Set[str]:
         return set(self._SUBSCRIBED)
@@ -105,44 +120,46 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
             return await execute_func()
 
         conn = self._plugin_service.current_connection
-        if conn is None:
+        host_info = self._plugin_service.current_host_info
+        if conn is None or host_info is None:
             return await execute_func()
 
+        self._ensure_monitor_started(conn, host_info)
+        return await execute_func()
+
+    def _ensure_monitor_started(self, conn: Any, host_info: HostInfo) -> None:
+        """Start the standing monitor task if it's not already running."""
+        if self._monitor_task is not None and not self._monitor_task.done():
+            return
+        self._monitored_aliases = host_info.as_aliases()
+        self._monitor_stop = asyncio.Event()
+        self._consecutive_failures = 0
         driver_dialect = self._plugin_service.driver_dialect
-        stop_event = asyncio.Event()
-        monitor_task = asyncio.get_event_loop().create_task(
-            self._monitor(conn, driver_dialect, stop_event)
+        self._monitor_task = asyncio.get_event_loop().create_task(
+            self._monitor(conn, driver_dialect, self._monitor_stop)
         )
-        try:
-            return await execute_func()
-        finally:
-            stop_event.set()
-            monitor_task.cancel()
-            try:
-                await monitor_task
-            except (asyncio.CancelledError, Exception):
-                pass
 
     async def _monitor(
             self,
             conn: Any,
             driver_dialect: AsyncDriverDialect,
             stop_event: asyncio.Event) -> None:
-        """Ping the connection on an interval after the grace period.
+        """Standing monitor: probe on ``interval_sec`` cadence, track failures.
 
-        Aborts the connection if ``_failure_count_threshold`` consecutive
-        pings fail. Exits cleanly on ``stop_event``.
+        Grace period first, then probe forever until ``stop_event`` fires.
+        Threshold-based abort + UNAVAILABLE marking land in C.2.
         """
         try:
             # Grace period: don't probe immediately -- long-running but
             # healthy queries shouldn't trigger the monitor.
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=self._grace_sec)
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=self._grace_sec
+                )
                 return
             except asyncio.TimeoutError:
                 pass
 
-            consecutive_failures = 0
             while not stop_event.is_set():
                 try:
                     ok = await asyncio.wait_for(
@@ -152,19 +169,9 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
                     ok = False
 
                 if ok:
-                    consecutive_failures = 0
+                    self._consecutive_failures = 0
                 else:
-                    consecutive_failures += 1
-
-                if consecutive_failures >= self._failure_count_threshold:
-                    # Abort the connection so the surrounding query returns
-                    # an OperationalError; failover (if enabled) then takes
-                    # over through its own subscription.
-                    try:
-                        await driver_dialect.abort_connection(conn)
-                    except Exception:
-                        pass
-                    return
+                    self._consecutive_failures += 1
 
                 try:
                     await asyncio.wait_for(
@@ -179,8 +186,3 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
 
 # Optional alias for consistency with sync "v2" naming.
 AsyncHostMonitoringV2Plugin = AsyncHostMonitoringPlugin
-
-
-def _unused() -> Optional[int]:
-    """Prevent unused-import warnings when Optional isn't consumed."""
-    return None
