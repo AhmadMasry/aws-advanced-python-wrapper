@@ -50,6 +50,19 @@ class _RdsTokenMixin:
     def __init__(self) -> None:
         self._rds_token_cache: dict = {}
 
+    @staticmethod
+    def _rds_token_cache_key(
+            host: str,
+            port: int,
+            user: str,
+            region: Optional[str]) -> Tuple[str, int, str, Optional[str]]:
+        """Shape of the key used in ``_rds_token_cache``.
+
+        Extracted so ``_resolve_credentials`` and ``_invalidate_cache``
+        (plus any future code that touches the cache) stay aligned.
+        """
+        return (host, port, user, region)
+
     async def _sts_assume_role_with_saml(
             self,
             role_arn: str,
@@ -120,7 +133,8 @@ class _RdsTokenMixin:
             port: int,
             user: str,
             region: Optional[str]) -> Optional[str]:
-        cached = self._rds_token_cache.get((host, port, user, region))
+        cached = self._rds_token_cache.get(
+            self._rds_token_cache_key(host, port, user, region))
         if cached is None:
             return None
         token, expires_at = cached
@@ -137,7 +151,9 @@ class _RdsTokenMixin:
             region: Optional[str],
             token: str) -> None:
         expires_at = asyncio.get_event_loop().time() + self._DEFAULT_TOKEN_EXPIRATION_SEC
-        self._rds_token_cache[(host, port, user, region)] = (token, expires_at)
+        self._rds_token_cache[
+            self._rds_token_cache_key(host, port, user, region)
+        ] = (token, expires_at)
 
 
 class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
@@ -202,6 +218,31 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
         )
         self._store_rds_token(host, int(port), db_user, region, token)
         return db_user, token, False
+
+    def _invalidate_cache(
+            self,
+            host_info: HostInfo,
+            props: Properties) -> None:
+        """Drop the cached RDS IAM token for this (host, port, user,
+        region) so a subsequent ``_resolve_credentials`` call regenerates
+        it via a fresh SAML assertion + STS exchange.
+
+        Called by :class:`AsyncAuthPluginBase` when cached credentials
+        fail authentication (retry-on-login path from E.1).
+        """
+        db_user = WrapperProperties.DB_USER.get(props)
+        if not db_user:
+            return
+        host = WrapperProperties.IAM_HOST.get(props) or host_info.host
+        port = (
+            WrapperProperties.IAM_DEFAULT_PORT.get_int(props)
+            or host_info.port
+            or 5432
+        )
+        region = WrapperProperties.IAM_REGION.get(props)
+        cache_key = self._rds_token_cache_key(
+            host, int(port), db_user, region)
+        self._rds_token_cache.pop(cache_key, None)
 
     async def _fetch_saml_assertion(self, props: Properties) -> str:
         """ADFS SAML assertion via HTTP POST with IdP username/password.
@@ -326,3 +367,23 @@ class AsyncOktaAuthPlugin(AsyncFederatedAuthPlugin):
             async with session.get(sso_url, ssl=ssl_ctx) as resp:
                 body = await resp.text()
         return self._extract_saml_assertion(body)
+
+    @staticmethod
+    def _extract_saml_assertion(html: str) -> str:
+        """Okta's SAML form has additional attributes (``type``, ``id``)
+        between ``name="SAMLResponse"`` and ``value=`` -- the ADFS base
+        regex (``\\s+`` between name and value) doesn't match. Use a
+        lazier pattern that tolerates intermediate attributes. Matches
+        the sync :class:`OktaAuthPlugin` intent
+        (``okta_plugin.py:178``, which uses ``.*`` between attrs).
+        """
+        import re
+        m = re.search(
+            r'name="SAMLResponse"[^>]*?\svalue="([^"]+)"',
+            html,
+        )
+        if not m:
+            raise AwsWrapperError(
+                "Could not extract SAMLResponse from Okta SSO page"
+            )
+        return m.group(1)

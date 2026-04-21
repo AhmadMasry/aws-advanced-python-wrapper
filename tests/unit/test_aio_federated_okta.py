@@ -303,3 +303,80 @@ def test_factory_builds_federated_and_okta_plugins_from_string():
     types = {type(p).__name__ for p in plugins}
     assert "AsyncFederatedAuthPlugin" in types
     assert "AsyncOktaAuthPlugin" in types
+
+
+# ---- E.4: invalidate_cache + Okta regex parity -------------------------
+
+
+def test_federated_invalidate_cache_drops_rds_token():
+    """Seed the cache via a real _resolve_credentials run (so the key
+    matches exactly what that code path writes), then assert
+    _invalidate_cache drops it so a subsequent resolve regenerates."""
+    async def _body() -> None:
+        props = _federated_props()
+        plugin = AsyncFederatedAuthPlugin(_svc(props), props)
+
+        with patch.object(
+                AsyncFederatedAuthPlugin, "_fetch_saml_assertion",
+                new=AsyncMock(return_value=_FAKE_SAML),
+        ), patch.object(
+                AsyncFederatedAuthPlugin, "_sts_assume_role_with_saml_blocking",
+                return_value=_FAKE_CREDS,
+        ), patch.object(
+                AsyncFederatedAuthPlugin, "_generate_rds_token_blocking",
+                return_value="fresh-tok",
+        ):
+            # First resolve populates the cache.
+            await plugin._resolve_credentials(
+                HostInfo("rds.example", 5432), props)
+
+        assert len(plugin._rds_token_cache) == 1
+
+        # _invalidate_cache must compute the exact same key the resolve
+        # path wrote.
+        plugin._invalidate_cache(HostInfo("rds.example", 5432), props)
+        assert len(plugin._rds_token_cache) == 0
+
+    asyncio.run(_body())
+
+
+def test_federated_invalidate_cache_missing_db_user_is_noop():
+    """Without db_user there is no valid cache key, so the invalidator
+    must not raise (base-class retry path must stay robust)."""
+    async def _body() -> None:
+        props = _federated_props()
+        del props["db_user"]
+        plugin = AsyncFederatedAuthPlugin(_svc(props), props)
+        # No entries, no key derivable -- must be a no-op.
+        plugin._invalidate_cache(HostInfo("rds.example", 5432), props)
+
+    asyncio.run(_body())
+
+
+def test_okta_regex_matches_attributes_between_name_and_value():
+    """Okta HTML has ``type``/``id`` between ``name=SAMLResponse`` and
+    ``value=`` -- the ADFS base regex (``\\s+``) doesn't match."""
+    html = (
+        '<html><body>'
+        '<form>'
+        '<input type="hidden" name="SAMLResponse" id="saml-resp" '
+        'value="okta-saml-body-base64" />'
+        '</form>'
+        '</body></html>'
+    )
+    extracted = AsyncOktaAuthPlugin._extract_saml_assertion(html)
+    assert extracted == "okta-saml-body-base64"
+
+
+def test_adfs_regex_still_matches_simple_attributes():
+    """The ADFS regex (inherited) still works for simple name/value
+    attrs -- the Okta override doesn't affect the base class."""
+    html = '<input name="SAMLResponse" value="adfs-saml-body-base64" />'
+    extracted = AsyncFederatedAuthPlugin._extract_saml_assertion(html)
+    assert extracted == "adfs-saml-body-base64"
+
+
+def test_okta_extract_saml_raises_when_form_missing():
+    """Okta override error path."""
+    with pytest.raises(AwsWrapperError):
+        AsyncOktaAuthPlugin._extract_saml_assertion("<html>nope</html>")
