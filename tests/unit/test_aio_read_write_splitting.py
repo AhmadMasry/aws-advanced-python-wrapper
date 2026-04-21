@@ -51,6 +51,13 @@ def _build(topology: Optional[tuple] = None):
     writer_conn = MagicMock(name="writer_conn")
     svc._current_connection = writer_conn
 
+    # Default stub for get_host_info_by_strategy: preserve the old
+    # "first matching host in candidates" semantics so existing tests
+    # that don't care about the selector strategy keep working.
+    svc.get_host_info_by_strategy = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda role, strategy, candidates: (
+            next((h for h in (candidates or ()) if h.role == role), None)))
+
     hlp = MagicMock()
     hlp.refresh = AsyncMock(
         return_value=topology or (
@@ -264,3 +271,77 @@ def test_initial_connect_seeds_writer_cache():
         assert plugin._writer_conn is new_conn
 
     asyncio.run(_body())
+
+
+def test_switch_to_reader_uses_configured_strategy():
+    """RWS picks via plugin_service.get_host_info_by_strategy with the configured strategy."""
+    r1 = HostInfo(host="r1.example", port=5432, role=HostRole.READER)
+    r2 = HostInfo(host="r2.example", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="writer.example", port=5432, role=HostRole.WRITER)
+    plugin, svc, hlp, _, _ = _build(topology=(writer, r1, r2))
+
+    # Inject strategy into props
+    svc._props["reader_host_selector_strategy"] = "round_robin"
+
+    # Stub get_host_info_by_strategy
+    svc.get_host_info_by_strategy = MagicMock(return_value=r1)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())
+
+    svc.get_host_info_by_strategy.assert_called_once()
+    args = svc.get_host_info_by_strategy.call_args.args
+    # (role, strategy, candidates)
+    assert args[0] == HostRole.READER
+    assert args[1] == "round_robin"
+    # candidates exclude the writer
+    assert writer not in args[2]
+    assert r1 in args[2] and r2 in args[2]
+
+
+def test_switch_to_reader_defaults_to_random_strategy():
+    """No strategy prop -> 'random' passed to get_host_info_by_strategy."""
+    r = HostInfo(host="r.example", port=5432, role=HostRole.READER)
+    plugin, svc, hlp, _, _ = _build(topology=(
+        HostInfo(host="w.example", port=5432, role=HostRole.WRITER),
+        r,
+    ))
+    svc.get_host_info_by_strategy = MagicMock(return_value=r)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())
+
+    assert svc.get_host_info_by_strategy.call_args.args[1] == "random"
+
+
+def test_switch_to_reader_raises_when_strategy_returns_none():
+    """If the strategy can't pick a reader (empty candidates), raise."""
+    plugin, svc, hlp, _, _ = _build(topology=(
+        HostInfo(host="w", port=5432, role=HostRole.WRITER),
+    ))  # no readers
+    svc.get_host_info_by_strategy = MagicMock(return_value=None)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    with pytest.raises(ReadWriteSplittingError):
+        asyncio.run(_run())

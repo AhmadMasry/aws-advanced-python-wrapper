@@ -29,6 +29,7 @@ from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import ReadWriteSplittingError
 from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -119,14 +120,14 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
                 return
 
         topology = await self._host_list_provider.refresh(current)
-        reader = next(
-            (h for h in topology if h.role == HostRole.READER),
-            None,
-        )
+        reader_candidates = [h for h in topology if h.role == HostRole.READER]
+        strategy = (WrapperProperties.READER_HOST_SELECTOR_STRATEGY.get(self._props)
+                    or "random")
+        reader = self._plugin_service.get_host_info_by_strategy(
+            HostRole.READER, strategy, reader_candidates)
         if reader is None:
             raise ReadWriteSplittingError(
-                "No reader host available in the current topology."
-            )
+                "No reader host available in the current topology.")
         new_conn = await self._open(driver_dialect, reader)
         self._reader_conn = new_conn
         await self._plugin_service.set_current_connection(new_conn, reader)
