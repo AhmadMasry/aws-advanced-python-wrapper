@@ -97,6 +97,11 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             return await execute_func()
 
         if read_only:
+            if await driver_dialect.is_in_transaction(current):
+                raise ReadWriteSplittingError(
+                    "Cannot switch to a reader while in a transaction. "
+                    "Commit or roll back before setting the connection "
+                    "read-only.")
             await self._switch_to_reader(driver_dialect, current)
         else:
             await self._switch_to_writer(driver_dialect, current)

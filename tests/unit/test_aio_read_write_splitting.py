@@ -42,6 +42,7 @@ def _build(topology: Optional[tuple] = None):
         )
     )
     driver_dialect.is_closed = AsyncMock(return_value=False)
+    driver_dialect.is_in_transaction = AsyncMock(return_value=False)
     driver_dialect.transfer_session_state = AsyncMock()
 
     svc = AsyncPluginServiceImpl(
@@ -345,3 +346,57 @@ def test_switch_to_reader_raises_when_strategy_returns_none():
 
     with pytest.raises(ReadWriteSplittingError):
         asyncio.run(_run())
+
+
+def test_switch_to_reader_refuses_mid_transaction():
+    """Mid-txn attempt to go read-only raises ReadWriteSplittingError."""
+    plugin, svc, hlp, dd, _ = _build()
+    dd.is_in_transaction = AsyncMock(return_value=True)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    with pytest.raises(ReadWriteSplittingError):
+        asyncio.run(_run())
+
+
+def test_switch_to_writer_is_allowed_mid_transaction():
+    """Writer swap (read_only=False) doesn't check transaction state."""
+    plugin, svc, hlp, dd, _ = _build()
+    dd.is_in_transaction = AsyncMock(return_value=True)
+    # Seed reader as current so flipping back to writer is a real swap
+    writer_conn = MagicMock(name="writer")
+    plugin._writer_conn = writer_conn
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        # read_only=False -- should NOT raise even in transaction
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, False)
+
+    asyncio.run(_run())  # no exception
+
+
+def test_switch_to_reader_allowed_when_not_in_transaction():
+    """Not-in-txn case works normally (sanity)."""
+    plugin, svc, hlp, dd, _ = _build()
+    dd.is_in_transaction = AsyncMock(return_value=False)
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())  # no exception
+    assert plugin._reader_conn is not None
