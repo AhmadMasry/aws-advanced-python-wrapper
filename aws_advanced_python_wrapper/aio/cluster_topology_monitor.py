@@ -40,8 +40,8 @@ from typing import TYPE_CHECKING, Any, Optional
 from aws_advanced_python_wrapper.hostinfo import HostRole
 
 if TYPE_CHECKING:
-    from aws_advanced_python_wrapper.aio.host_list_provider import \
-        AsyncAuroraHostListProvider
+    from aws_advanced_python_wrapper.aio.host_list_provider import (
+        AsyncAuroraHostListProvider, Topology)
 
 
 class AsyncClusterTopologyMonitor:
@@ -77,7 +77,7 @@ class AsyncClusterTopologyMonitor:
         self._last_known_writer: Optional[str] = None
         self._high_refresh_until_ns: int = 0
         self._ignore_requests_until_ns: int = 0
-        self._last_topology: tuple = ()
+        self._last_topology: Topology = ()
 
     @property
     def high_refresh_rate_sec(self) -> float:
@@ -85,7 +85,7 @@ class AsyncClusterTopologyMonitor:
         return self._high_refresh_rate_sec
 
     @property
-    def last_topology(self) -> tuple:
+    def last_topology(self) -> Topology:
         """Most recently refreshed topology (empty tuple before first tick)."""
         return self._last_topology
 
@@ -175,18 +175,20 @@ class AsyncClusterTopologyMonitor:
     async def force_refresh_with_connection(
             self,
             conn: Any,
-            timeout_sec: float = 5.0) -> tuple:
+            timeout_sec: float = 5.0,
+            bypass_ignore_window: bool = False) -> Topology:
         """Probe the topology provider with the caller's ``conn``.
 
         Short-circuits to the cached ``last_topology`` when the ignore-
-        request window is active (sync parity cluster_topology_monitor.py
-        :136-141). Otherwise delegates to ``provider.force_refresh(conn)``
-        under an ``asyncio.wait_for(timeout=timeout_sec)`` gate.
+        request window is active UNLESS ``bypass_ignore_window`` is True
+        (failover recovery wants a fresh probe regardless). Otherwise
+        delegates to ``provider.force_refresh(conn)`` under an
+        ``asyncio.wait_for(timeout=timeout_sec)`` gate.
 
         Raises ``TimeoutError`` when the provider doesn't respond within
         ``timeout_sec``.
         """
-        if self.should_ignore_refresh_request():
+        if not bypass_ignore_window and self.should_ignore_refresh_request():
             return self._last_topology
         try:
             topology = await asyncio.wait_for(
