@@ -42,8 +42,7 @@ from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
     AsyncReadWriteSplittingPlugin
 from aws_advanced_python_wrapper.aio.stub_plugins import (
     AsyncAuroraInitialConnectionStrategyStubPlugin, AsyncBlueGreenStubPlugin,
-    AsyncFastestResponseStrategyStubPlugin, AsyncLimitlessStubPlugin,
-    AsyncSimpleReadWriteSplittingStubPlugin)
+    AsyncFastestResponseStrategyStubPlugin, AsyncLimitlessStubPlugin)
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
@@ -97,6 +96,16 @@ class _ReadWriteSplittingFactory:
         return AsyncReadWriteSplittingPlugin(
             plugin_service, host_list_provider, props
         )
+
+
+class _SimpleReadWriteSplittingFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        # Local import keeps module load-order cheap and avoids pulling
+        # psycopg into memory for consumers that don't use the plugin.
+        from aws_advanced_python_wrapper.aio.simple_read_write_splitting_plugin import \
+            AsyncSimpleReadWriteSplittingPlugin
+        return AsyncSimpleReadWriteSplittingPlugin(plugin_service, props)
 
 
 class _IamAuthFactory:
@@ -183,8 +192,6 @@ class _AsyncStubFactory:
         return self._stub_cls()
 
 
-_SimpleReadWriteSplittingFactory = _AsyncStubFactory(
-    AsyncSimpleReadWriteSplittingStubPlugin)
 _InitialConnectionFactory = _AsyncStubFactory(
     AsyncAuroraInitialConnectionStrategyStubPlugin)
 _LimitlessFactory = _AsyncStubFactory(AsyncLimitlessStubPlugin)
@@ -208,6 +215,7 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "host_monitoring": _HostMonitoringFactory(),
     "host_monitoring_v2": _HostMonitoringFactory(),
     "read_write_splitting": _ReadWriteSplittingFactory(),
+    "srw": _SimpleReadWriteSplittingFactory(),
     "iam": _IamAuthFactory(),
     "aws_secrets_manager": _AwsSecretsManagerFactory(),
     "federated_auth": _FederatedAuthFactory(),
@@ -222,7 +230,6 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     # Registered so users can keep sync/async `plugins="..."` config
     # strings identical. Each stub subscribes to nothing and logs a
     # WARNING on construction; full async ports land in later phases.
-    "srw": _SimpleReadWriteSplittingFactory,
     "initial_connection": _InitialConnectionFactory,
     "limitless": _LimitlessFactory,
     "bg": _BlueGreenFactory,
@@ -237,6 +244,7 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _AuroraConnectionTrackerFactory: 100,
     _StaleDnsFactory: 200,
     _ReadWriteSplittingFactory: 300,
+    _SimpleReadWriteSplittingFactory: 300,
     _FailoverFactory: 400,
     _HostMonitoringFactory: 500,
     _IamAuthFactory: 700,
@@ -246,9 +254,9 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _ConnectTimeFactory: 900,
     _ExecuteTimeFactory: 910,
     _DeveloperFactory: 1000,
-    # All stub factories share one type; a single entry covers all six
-    # Phase H.2 stubs. Weight sits above _DeveloperFactory so stubs sort
-    # last (they subscribe to nothing, so order is cosmetic).
+    # All stub factories share one type; a single entry covers every
+    # remaining Phase H.2 stub. Weight sits above _DeveloperFactory so
+    # stubs sort last (they subscribe to nothing, so order is cosmetic).
     _AsyncStubFactory: 2000,
 }
 

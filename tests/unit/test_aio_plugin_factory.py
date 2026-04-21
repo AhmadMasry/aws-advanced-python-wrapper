@@ -250,6 +250,9 @@ def test_build_async_plugins_covers_all_registered_plugins():
             "host": "h", "port": "5432",
             "plugins": ",".join(PLUGIN_FACTORIES.keys()),
             "secrets_manager_secret_id": "dummy",  # for AwsSecretsManager
+            # SRW endpoints are required at construction time.
+            "srw_read_endpoint": "reader.example.com",
+            "srw_write_endpoint": "writer.example.com",
         })
         # Use Aurora-capable hlp so failover / rws / custom_endpoint
         # don't error.

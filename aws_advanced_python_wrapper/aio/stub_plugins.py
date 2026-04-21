@@ -59,11 +59,6 @@ class _AsyncStubPlugin(AsyncPlugin):
         return set()
 
 
-class AsyncSimpleReadWriteSplittingStubPlugin(_AsyncStubPlugin):
-    """Stub for sync SimpleReadWriteSplittingPlugin ('srw')."""
-    _STUB_NAME = "srw"
-
-
 class AsyncAuroraInitialConnectionStrategyStubPlugin(_AsyncStubPlugin):
     """Stub for sync AuroraInitialConnectionStrategyPlugin ('initial_connection')."""
     _STUB_NAME = "initial_connection"
@@ -89,5 +84,4 @@ __all__ = [
     "AsyncBlueGreenStubPlugin",
     "AsyncFastestResponseStrategyStubPlugin",
     "AsyncLimitlessStubPlugin",
-    "AsyncSimpleReadWriteSplittingStubPlugin",
 ]

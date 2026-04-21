@@ -14,10 +14,10 @@
 
 """F3-B Phase H.2: stub plugins for unimplemented async codes.
 
-Verifies that the six sync plugin codes without a real async port
-register as pass-through stubs in ``PLUGIN_FACTORIES`` -- users can
-keep their ``plugins="..."`` config identical across sync/async
-wrappers without hitting 'unknown plugin' errors.
+Verifies that the sync plugin codes without a real async port register
+as pass-through stubs in ``PLUGIN_FACTORIES`` -- users can keep their
+``plugins="..."`` config identical across sync/async wrappers without
+hitting 'unknown plugin' errors.
 """
 
 from __future__ import annotations
@@ -28,11 +28,9 @@ from aws_advanced_python_wrapper.aio.plugin_factory import (
     PLUGIN_FACTORIES, resolve_plugin_factories)
 from aws_advanced_python_wrapper.aio.stub_plugins import (
     AsyncAuroraInitialConnectionStrategyStubPlugin, AsyncBlueGreenStubPlugin,
-    AsyncFastestResponseStrategyStubPlugin, AsyncLimitlessStubPlugin,
-    AsyncSimpleReadWriteSplittingStubPlugin)
+    AsyncFastestResponseStrategyStubPlugin, AsyncLimitlessStubPlugin)
 
 STUB_CODES_AND_CLASSES = [
-    ("srw", AsyncSimpleReadWriteSplittingStubPlugin),
     ("initial_connection", AsyncAuroraInitialConnectionStrategyStubPlugin),
     ("limitless", AsyncLimitlessStubPlugin),
     ("bg", AsyncBlueGreenStubPlugin),
