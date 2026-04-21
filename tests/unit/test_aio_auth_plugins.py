@@ -41,7 +41,10 @@ def _svc(props: Properties) -> AsyncPluginServiceImpl:
 def test_iam_plugin_subscription():
     props = Properties({"host": "h.example", "port": "5432", "user": "app"})
     p = AsyncIamAuthPlugin(_svc(props), props)
-    assert p.subscribed_methods == {DbApiMethod.CONNECT.method_name}
+    assert p.subscribed_methods == {
+        DbApiMethod.CONNECT.method_name,
+        DbApiMethod.FORCE_CONNECT.method_name,
+    }
 
 
 def test_iam_plugin_generates_token_and_injects_as_password():
@@ -153,7 +156,10 @@ def test_secrets_manager_subscription():
         "secrets_manager_secret_id": "my-secret",
     })
     p = AsyncAwsSecretsManagerPlugin(_svc(props), props)
-    assert p.subscribed_methods == {DbApiMethod.CONNECT.method_name}
+    assert p.subscribed_methods == {
+        DbApiMethod.CONNECT.method_name,
+        DbApiMethod.FORCE_CONNECT.method_name,
+    }
 
 
 def test_secrets_manager_fetches_and_injects_credentials():
@@ -276,3 +282,150 @@ def test_secrets_manager_caches_result():
         assert call_count[0] == 1
 
     asyncio.run(_body())
+
+
+# ---- AsyncAuthPluginBase: FORCE_CONNECT + retry-on-login (E.1) --------
+
+
+def test_base_plugin_subscribes_to_connect_and_force_connect():
+    from aws_advanced_python_wrapper.aio.auth_plugins import \
+        AsyncAuthPluginBase
+
+    class _Stub(AsyncAuthPluginBase):
+        async def _resolve_credentials(self, host_info, props):
+            return ("u", "p", False)
+
+        def _invalidate_cache(self, host_info, props):
+            pass
+
+    props = Properties({"host": "h", "port": "5432"})
+    plugin = _Stub(_svc(props), props)
+    assert DbApiMethod.CONNECT.method_name in plugin.subscribed_methods
+    assert DbApiMethod.FORCE_CONNECT.method_name in plugin.subscribed_methods
+
+
+def test_base_plugin_retries_on_login_exception_when_cached():
+    """Cached credentials + login exception -> invalidate + re-resolve + retry."""
+    from aws_advanced_python_wrapper.aio.auth_plugins import \
+        AsyncAuthPluginBase
+
+    resolve_calls = []
+    invalidate_calls = []
+
+    class _Stub(AsyncAuthPluginBase):
+        _next_was_cached = True
+
+        async def _resolve_credentials(self, host_info, props):
+            resolve_calls.append(self._next_was_cached)
+            was_cached = self._next_was_cached
+            self._next_was_cached = False  # next call returns fresh
+            return ("u", f"token-{len(resolve_calls)}", was_cached)
+
+        def _invalidate_cache(self, host_info, props):
+            invalidate_calls.append(1)
+
+    props = Properties({"host": "h", "port": "5432"})
+    svc = _svc(props)
+    svc.is_login_exception = MagicMock(return_value=True)
+    plugin = _Stub(svc, props)
+
+    attempt = [0]
+
+    async def _connect_func():
+        attempt[0] += 1
+        if attempt[0] == 1:
+            raise Exception("auth failed")
+        return MagicMock(name="conn")
+
+    host = HostInfo(host="h", port=5432)
+    result = asyncio.run(plugin.connect(
+        MagicMock(), MagicMock(), host, props, True, _connect_func))
+
+    assert result is not None
+    assert invalidate_calls == [1]
+    assert len(resolve_calls) == 2
+    assert attempt[0] == 2
+
+
+def test_base_plugin_does_not_retry_when_credentials_were_fresh():
+    """Fresh credentials + login exception -> propagate (no retry spin)."""
+    from aws_advanced_python_wrapper.aio.auth_plugins import \
+        AsyncAuthPluginBase
+
+    class _Stub(AsyncAuthPluginBase):
+        async def _resolve_credentials(self, host_info, props):
+            return ("u", "fresh-token", False)
+
+        def _invalidate_cache(self, host_info, props):
+            pass
+
+    props = Properties({"host": "h", "port": "5432"})
+    svc = _svc(props)
+    svc.is_login_exception = MagicMock(return_value=True)
+    plugin = _Stub(svc, props)
+
+    async def _connect_func():
+        raise Exception("auth failed")
+
+    host = HostInfo(host="h", port=5432)
+    with pytest.raises(Exception, match="auth failed"):
+        asyncio.run(plugin.connect(
+            MagicMock(), MagicMock(), host, props, True, _connect_func))
+
+
+def test_base_plugin_does_not_retry_on_non_login_exceptions():
+    from aws_advanced_python_wrapper.aio.auth_plugins import \
+        AsyncAuthPluginBase
+
+    class _Stub(AsyncAuthPluginBase):
+        async def _resolve_credentials(self, host_info, props):
+            return ("u", "p", True)
+
+        def _invalidate_cache(self, host_info, props):
+            pass
+
+    props = Properties({"host": "h", "port": "5432"})
+    svc = _svc(props)
+    svc.is_login_exception = MagicMock(return_value=False)
+    plugin = _Stub(svc, props)
+
+    async def _connect_func():
+        raise Exception("network boom")
+
+    host = HostInfo(host="h", port=5432)
+    with pytest.raises(Exception, match="network boom"):
+        asyncio.run(plugin.connect(
+            MagicMock(), MagicMock(), host, props, True, _connect_func))
+
+
+def test_base_plugin_force_connect_uses_same_retry_flow():
+    from aws_advanced_python_wrapper.aio.auth_plugins import \
+        AsyncAuthPluginBase
+
+    class _Stub(AsyncAuthPluginBase):
+        _cached = True
+
+        async def _resolve_credentials(self, host_info, props):
+            was = self._cached
+            self._cached = False
+            return ("u", "t", was)
+
+        def _invalidate_cache(self, host_info, props):
+            pass
+
+    props = Properties({"host": "h", "port": "5432"})
+    svc = _svc(props)
+    svc.is_login_exception = MagicMock(return_value=True)
+    plugin = _Stub(svc, props)
+
+    attempt = [0]
+
+    async def _fc():
+        attempt[0] += 1
+        if attempt[0] == 1:
+            raise Exception("auth failed")
+        return MagicMock()
+
+    asyncio.run(plugin.force_connect(
+        MagicMock(), MagicMock(), HostInfo(host="h", port=5432), props, True, _fc))
+    assert attempt[0] == 2

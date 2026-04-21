@@ -51,11 +51,15 @@ class AsyncAuthPluginBase(AsyncPlugin):
     """Common shell for async auth plugins.
 
     Subclasses override :meth:`_resolve_credentials` to return a
-    ``(user, password)`` tuple. The base class handles plugin-pipeline
-    wiring and credential injection into the connect props.
+    ``(user, password, was_cached)`` tuple. The base class handles
+    plugin-pipeline wiring, credential injection, and retry-on-login
+    when cached credentials fail authentication.
     """
 
-    _SUBSCRIBED: Set[str] = {DbApiMethod.CONNECT.method_name}
+    _SUBSCRIBED: Set[str] = {
+        DbApiMethod.CONNECT.method_name,
+        DbApiMethod.FORCE_CONNECT.method_name,
+    }
 
     def __init__(
             self,
@@ -76,18 +80,70 @@ class AsyncAuthPluginBase(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
-        user, password = await self._resolve_credentials(host_info, props)
+        return await self._connect_with_retry(host_info, props, connect_func)
+
+    async def force_connect(
+            self,
+            target_driver_func: Callable,
+            driver_dialect: AsyncDriverDialect,
+            host_info: HostInfo,
+            props: Properties,
+            is_initial_connection: bool,
+            force_connect_func: Callable[..., Awaitable[Any]]) -> Any:
+        return await self._connect_with_retry(host_info, props, force_connect_func)
+
+    async def _connect_with_retry(
+            self,
+            host_info: HostInfo,
+            props: Properties,
+            connect_func: Callable[..., Awaitable[Any]]) -> Any:
+        """Resolve creds, inject, connect; retry once if cached creds
+        cause a login failure."""
+        user, password, was_cached = await self._resolve_credentials(host_info, props)
+        self._inject_credentials(props, user, password)
+        try:
+            return await connect_func()
+        except Exception as exc:
+            if not was_cached:
+                raise
+            if not self._plugin_service.is_login_exception(error=exc):
+                raise
+            # Cached credentials failed auth -- invalidate, refetch, retry once.
+            self._invalidate_cache(host_info, props)
+            user, password, _ = await self._resolve_credentials(host_info, props)
+            self._inject_credentials(props, user, password)
+            return await connect_func()
+
+    @staticmethod
+    def _inject_credentials(
+            props: Properties,
+            user: Optional[str],
+            password: Optional[str]) -> None:
         if user is not None:
             props["user"] = user
         if password is not None:
             props["password"] = password
-        return await connect_func()
 
     async def _resolve_credentials(
             self,
             host_info: HostInfo,
-            props: Properties) -> Tuple[Optional[str], Optional[str]]:
+            props: Properties) -> Tuple[Optional[str], Optional[str], bool]:
+        """Return ``(user, password, was_cached)`` for the given host.
+
+        ``was_cached=True`` when the credentials were served from cache
+        (so a login failure should trigger invalidation + one retry).
+        """
         raise NotImplementedError
+
+    def _invalidate_cache(
+            self,
+            host_info: HostInfo,
+            props: Properties) -> None:
+        """Drop any cached credentials for this (host, props) so a
+        subsequent ``_resolve_credentials`` call generates fresh ones.
+
+        Default no-op so subclasses that don't cache can ignore.
+        """
 
 
 class AsyncIamAuthPlugin(AsyncAuthPluginBase):
@@ -111,7 +167,7 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
     async def _resolve_credentials(
             self,
             host_info: HostInfo,
-            props: Properties) -> Tuple[Optional[str], Optional[str]]:
+            props: Properties) -> Tuple[Optional[str], Optional[str], bool]:
         user = WrapperProperties.USER.get(props)
         if not user:
             raise AwsWrapperError(
@@ -135,7 +191,7 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
         if cached is not None:
             token, expires_at = cached
             if now < expires_at - self._TOKEN_REGEN_GRACE_SEC:
-                return user, token
+                return user, token, True
 
         token = await asyncio.to_thread(
             self._generate_token_blocking, host, int(port), user, region
@@ -144,7 +200,7 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
             token,
             now + self._DEFAULT_TOKEN_EXPIRATION_SEC,
         )
-        return user, token
+        return user, token, False
 
     @staticmethod
     def _generate_token_blocking(
@@ -184,7 +240,7 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
     async def _resolve_credentials(
             self,
             host_info: HostInfo,
-            props: Properties) -> Tuple[Optional[str], Optional[str]]:
+            props: Properties) -> Tuple[Optional[str], Optional[str], bool]:
         secret_id = WrapperProperties.SECRETS_MANAGER_SECRET_ID.get(props)
         if not secret_id:
             raise AwsWrapperError(
@@ -195,7 +251,8 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
         cache_key = (secret_id, region)
         cached = self._secret_cache.get(cache_key)
         if cached is not None:
-            return cached
+            user, password = cached
+            return user, password, True
 
         secret = await asyncio.to_thread(
             self._fetch_secret_blocking, secret_id, region
@@ -214,7 +271,7 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
         password = secret.get(password_key)
 
         self._secret_cache[cache_key] = (user, password)
-        return user, password
+        return user, password, False
 
     @staticmethod
     def _fetch_secret_blocking(

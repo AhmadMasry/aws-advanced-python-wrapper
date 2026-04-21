@@ -76,7 +76,10 @@ def _okta_props(**overrides: str) -> Properties:
 
 def test_federated_plugin_subscription():
     p = AsyncFederatedAuthPlugin(_svc(_federated_props()), _federated_props())
-    assert p.subscribed_methods == {DbApiMethod.CONNECT.method_name}
+    assert p.subscribed_methods == {
+        DbApiMethod.CONNECT.method_name,
+        DbApiMethod.FORCE_CONNECT.method_name,
+    }
 
 
 def test_federated_plugin_resolves_credentials_end_to_end():
@@ -222,7 +225,10 @@ def test_federated_plugin_raises_when_saml_missing_from_html():
 
 def test_okta_plugin_subscribed_is_connect_only():
     p = AsyncOktaAuthPlugin(_svc(_okta_props()), _okta_props())
-    assert p.subscribed_methods == {DbApiMethod.CONNECT.method_name}
+    assert p.subscribed_methods == {
+        DbApiMethod.CONNECT.method_name,
+        DbApiMethod.FORCE_CONNECT.method_name,
+    }
 
 
 def test_okta_plugin_inherits_rds_token_path_from_federated():

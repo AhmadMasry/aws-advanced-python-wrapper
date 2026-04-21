@@ -163,7 +163,7 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
     async def _resolve_credentials(
             self,
             host_info: HostInfo,
-            props: Properties) -> Tuple[Optional[str], Optional[str]]:
+            props: Properties) -> Tuple[Optional[str], Optional[str], bool]:
         db_user = WrapperProperties.DB_USER.get(props)
         if not db_user:
             raise AwsWrapperError(
@@ -180,7 +180,7 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
         # 1. Token cache check before expensive SAML round-trip.
         cached = await self._cached_rds_token(host, int(port), db_user, region)
         if cached is not None:
-            return db_user, cached
+            return db_user, cached, True
 
         # 2. Fetch SAML assertion from IdP.
         saml_assertion = await self._fetch_saml_assertion(props)
@@ -201,7 +201,7 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
             host, int(port), db_user, region, creds,
         )
         self._store_rds_token(host, int(port), db_user, region, token)
-        return db_user, token
+        return db_user, token, False
 
     async def _fetch_saml_assertion(self, props: Properties) -> str:
         """ADFS SAML assertion via HTTP POST with IdP username/password.
