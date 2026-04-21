@@ -123,8 +123,8 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
 
         if self._host_unavailable:
             raise AwsWrapperError(
-                f"Host is unavailable after {self._failure_count_threshold}"
-                " consecutive failed health checks.")
+                f"Host {sorted(self._monitored_aliases)} is unavailable after"
+                f" {self._failure_count_threshold} consecutive failed health checks.")
 
         conn = self._plugin_service.current_connection
         host_info = self._plugin_service.current_host_info
@@ -202,14 +202,11 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
 
         Mirrors sync host_monitoring_plugin.py:139-151.
         """
-        try:
-            self._plugin_service.set_availability(
-                self._monitored_aliases, HostAvailability.UNAVAILABLE)
-        except Exception:  # noqa: BLE001 - best-effort bookkeeping
-            pass
+        self._plugin_service.set_availability(
+            self._monitored_aliases, HostAvailability.UNAVAILABLE)
         try:
             await driver_dialect.abort_connection(conn)
-        except Exception:  # noqa: BLE001 - abort is best-effort
+        except Exception:  # noqa: BLE001 - abort is best-effort (socket may be dead)
             pass
         self._host_unavailable = True
 
