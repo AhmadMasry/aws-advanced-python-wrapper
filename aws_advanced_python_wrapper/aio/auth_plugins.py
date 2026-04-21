@@ -30,13 +30,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Optional, Set,
-                    Tuple)
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional,
+                    Set, Tuple)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.iam_utils import IamAuthUtils
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
+from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
+from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
+from aws_advanced_python_wrapper.utils.region_utils import (GdbRegionUtils,
+                                                            RegionUtils)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -162,7 +167,7 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
             plugin_service: AsyncPluginService,
             props: Properties) -> None:
         super().__init__(plugin_service, props)
-        self._token_cache: dict = {}
+        self._token_cache: Dict[str, Tuple[str, float]] = {}
 
     async def _resolve_credentials(
             self,
@@ -174,18 +179,30 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
                 "IAM auth requires a 'user' connection property"
             )
 
-        host = (
-            WrapperProperties.IAM_HOST.get(props)
-            or host_info.host
-        )
-        port = (
-            WrapperProperties.IAM_DEFAULT_PORT.get_int(props)
-            or host_info.port
-            or 5432
-        )
-        region = WrapperProperties.IAM_REGION.get(props)
+        host = IamAuthUtils.get_iam_host(props, host_info)
+        # Fallback port is 5432. Sync side pulls from
+        # plugin_service.database_dialect.default_port, but async Phase A
+        # may not have database_dialect set yet.
+        port = IamAuthUtils.get_port(props, host_info, 5432)
 
-        cache_key = (host, port, user, region)
+        rds_type = RdsUtils().identify_rds_type(host)
+        region_utils = (GdbRegionUtils()
+                        if rds_type == RdsUrlType.RDS_GLOBAL_WRITER_CLUSTER
+                        else RegionUtils())
+        region = region_utils.get_region(
+            props, WrapperProperties.IAM_REGION.name, host, host_info)
+        if not region:
+            raise AwsWrapperError(
+                f"Could not resolve AWS region from host '{host}'. "
+                "Set IAM_REGION explicitly."
+            )
+
+        cache_key = IamAuthUtils.get_cache_key(user, host, port, region)
+
+        ttl_sec = WrapperProperties.IAM_EXPIRATION.get_int(props)
+        if not ttl_sec:
+            ttl_sec = self._DEFAULT_TOKEN_EXPIRATION_SEC
+
         now = asyncio.get_event_loop().time()
         cached = self._token_cache.get(cache_key)
         if cached is not None:
@@ -196,11 +213,37 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
         token = await asyncio.to_thread(
             self._generate_token_blocking, host, int(port), user, region
         )
-        self._token_cache[cache_key] = (
-            token,
-            now + self._DEFAULT_TOKEN_EXPIRATION_SEC,
-        )
+        self._token_cache[cache_key] = (token, now + ttl_sec)
         return user, token, False
+
+    def _invalidate_cache(
+            self,
+            host_info: HostInfo,
+            props: Properties) -> None:
+        """Drop the cached IAM token for this (host, port, user, region)
+        so the next ``_resolve_credentials`` call regenerates it.
+
+        Called by :class:`AsyncAuthPluginBase` when cached credentials
+        fail authentication (retry-on-login path).
+        """
+        user = WrapperProperties.USER.get(props)
+        if not user:
+            return
+        try:
+            host = IamAuthUtils.get_iam_host(props, host_info)
+        except AwsWrapperError:
+            return
+        port = IamAuthUtils.get_port(props, host_info, 5432)
+        rds_type = RdsUtils().identify_rds_type(host)
+        region_utils = (GdbRegionUtils()
+                        if rds_type == RdsUrlType.RDS_GLOBAL_WRITER_CLUSTER
+                        else RegionUtils())
+        region = region_utils.get_region(
+            props, WrapperProperties.IAM_REGION.name, host, host_info)
+        if not region:
+            return
+        cache_key = IamAuthUtils.get_cache_key(user, host, port, region)
+        self._token_cache.pop(cache_key, None)
 
     @staticmethod
     def _generate_token_blocking(

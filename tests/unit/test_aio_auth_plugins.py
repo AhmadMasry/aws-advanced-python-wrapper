@@ -50,7 +50,7 @@ def test_iam_plugin_subscription():
 def test_iam_plugin_generates_token_and_injects_as_password():
     async def _body() -> None:
         props = Properties({
-            "host": "h.example", "port": "5432",
+            "host": "inst.abc123.us-east-1.rds.amazonaws.com", "port": "5432",
             "user": "db_user", "iam_region": "us-east-1",
         })
         plugin = AsyncIamAuthPlugin(_svc(props), props)
@@ -67,7 +67,8 @@ def test_iam_plugin_generates_token_and_injects_as_password():
             result = await plugin.connect(
                 target_driver_func=lambda: None,
                 driver_dialect=MagicMock(),
-                host_info=HostInfo(host="h.example", port=5432),
+                host_info=HostInfo(
+                    host="inst.abc123.us-east-1.rds.amazonaws.com", port=5432),
                 props=props,
                 is_initial_connection=True,
                 connect_func=_connect_func,
@@ -82,8 +83,8 @@ def test_iam_plugin_generates_token_and_injects_as_password():
 def test_iam_plugin_caches_token_within_expiration_window():
     async def _body() -> None:
         props = Properties({
-            "host": "h.example", "port": "5432",
-            "user": "db_user",
+            "host": "inst.abc123.us-east-1.rds.amazonaws.com", "port": "5432",
+            "user": "db_user", "iam_region": "us-east-1",
         })
         plugin = AsyncIamAuthPlugin(_svc(props), props)
 
@@ -105,7 +106,8 @@ def test_iam_plugin_caches_token_within_expiration_window():
             await plugin.connect(
                 target_driver_func=lambda: None,
                 driver_dialect=MagicMock(),
-                host_info=HostInfo(host="h.example", port=5432),
+                host_info=HostInfo(
+                    host="inst.abc123.us-east-1.rds.amazonaws.com", port=5432),
                 props=Properties(dict(props)),
                 is_initial_connection=True,
                 connect_func=_connect_func,
@@ -115,7 +117,8 @@ def test_iam_plugin_caches_token_within_expiration_window():
             await plugin.connect(
                 target_driver_func=lambda: None,
                 driver_dialect=MagicMock(),
-                host_info=HostInfo(host="h.example", port=5432),
+                host_info=HostInfo(
+                    host="inst.abc123.us-east-1.rds.amazonaws.com", port=5432),
                 props=second_props,
                 is_initial_connection=False,
                 connect_func=_connect_func,
@@ -128,7 +131,9 @@ def test_iam_plugin_caches_token_within_expiration_window():
 
 def test_iam_plugin_raises_when_user_is_missing():
     async def _body() -> None:
-        props = Properties({"host": "h.example", "port": "5432"})
+        props = Properties({
+            "host": "inst.abc123.us-east-1.rds.amazonaws.com", "port": "5432",
+        })
         plugin = AsyncIamAuthPlugin(_svc(props), props)
 
         async def _connect_func() -> None:
@@ -138,7 +143,8 @@ def test_iam_plugin_raises_when_user_is_missing():
             await plugin.connect(
                 target_driver_func=lambda: None,
                 driver_dialect=MagicMock(),
-                host_info=HostInfo(host="h.example", port=5432),
+                host_info=HostInfo(
+                    host="inst.abc123.us-east-1.rds.amazonaws.com", port=5432),
                 props=props,
                 is_initial_connection=True,
                 connect_func=_connect_func,
@@ -429,3 +435,90 @@ def test_base_plugin_force_connect_uses_same_retry_flow():
     asyncio.run(plugin.force_connect(
         MagicMock(), MagicMock(), HostInfo(host="h", port=5432), props, True, _fc))
     assert attempt[0] == 2
+
+
+# ---- IAM plugin: IAM_EXPIRATION + region discovery + cache invalidation (E.2) ---
+
+
+def test_iam_plugin_uses_iam_expiration_property():
+    """Token TTL honors IAM_EXPIRATION (seconds); a TTL >> grace means
+    second call hits the cache and skips token generation."""
+    props = Properties({
+        "host": "inst.abc123.us-west-2.rds.amazonaws.com",
+        "port": "5432", "user": "u",
+        "iam_expiration": "200",  # well above 60s grace window
+        "iam_region": "us-west-2",
+    })
+    plugin = AsyncIamAuthPlugin(_svc(props), props)
+    host = HostInfo(
+        host="inst.abc123.us-west-2.rds.amazonaws.com", port=5432)
+    with patch.object(AsyncIamAuthPlugin, "_generate_token_blocking",
+                      return_value="tok-1") as gen:
+        asyncio.run(plugin._resolve_credentials(host, props))
+        asyncio.run(plugin._resolve_credentials(host, props))
+    assert gen.call_count == 1
+
+
+def test_iam_plugin_auto_discovers_region_from_rds_host():
+    """Region auto-discovered from RDS hostname when IAM_REGION not set."""
+    props = Properties({
+        "host": "db.cluster-xyz123.us-west-2.rds.amazonaws.com",
+        "port": "5432", "user": "u",
+        # No iam_region
+    })
+    plugin = AsyncIamAuthPlugin(_svc(props), props)
+    host = HostInfo(
+        host="db.cluster-xyz123.us-west-2.rds.amazonaws.com", port=5432)
+    with patch.object(AsyncIamAuthPlugin, "_generate_token_blocking",
+                      return_value="tok") as gen:
+        asyncio.run(plugin._resolve_credentials(host, props))
+    # Region arg passed to _generate_token_blocking is us-west-2.
+    args = gen.call_args[0]
+    assert "us-west-2" in args
+
+
+def test_iam_plugin_raises_when_region_unresolvable():
+    """Non-RDS host and no IAM_REGION => AwsWrapperError."""
+    props = Properties({
+        "host": "custom.example.com", "port": "5432", "user": "u",
+    })
+    plugin = AsyncIamAuthPlugin(_svc(props), props)
+    host = HostInfo(host="custom.example.com", port=5432)
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(plugin._resolve_credentials(host, props))
+
+
+def test_iam_plugin_invalidate_cache_drops_entry():
+    props = Properties({
+        "host": "inst.abc123.us-west-2.rds.amazonaws.com",
+        "port": "5432", "user": "u",
+        "iam_region": "us-west-2",
+    })
+    plugin = AsyncIamAuthPlugin(_svc(props), props)
+    host = HostInfo(
+        host="inst.abc123.us-west-2.rds.amazonaws.com", port=5432)
+    with patch.object(AsyncIamAuthPlugin, "_generate_token_blocking",
+                      return_value="t"):
+        asyncio.run(plugin._resolve_credentials(host, props))
+    assert plugin._token_cache  # populated
+    plugin._invalidate_cache(host, props)
+    assert not plugin._token_cache  # dropped
+
+
+def test_iam_plugin_resolve_credentials_returns_was_cached_flag():
+    props = Properties({
+        "host": "inst.abc123.us-west-2.rds.amazonaws.com",
+        "port": "5432", "user": "u",
+        "iam_region": "us-west-2",
+    })
+    plugin = AsyncIamAuthPlugin(_svc(props), props)
+    host = HostInfo(
+        host="inst.abc123.us-west-2.rds.amazonaws.com", port=5432)
+    with patch.object(AsyncIamAuthPlugin, "_generate_token_blocking",
+                      return_value="tok"):
+        _, _, was_cached1 = asyncio.run(
+            plugin._resolve_credentials(host, props))
+        _, _, was_cached2 = asyncio.run(
+            plugin._resolve_credentials(host, props))
+    assert was_cached1 is False
+    assert was_cached2 is True
