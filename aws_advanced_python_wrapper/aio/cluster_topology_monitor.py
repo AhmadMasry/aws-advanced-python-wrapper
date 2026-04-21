@@ -177,10 +177,14 @@ class AsyncClusterTopologyMonitor:
         except asyncio.CancelledError:
             return
         finally:
-            # Cancel any in-flight probes on shutdown.
-            for t in list(self._probe_tasks.values()):
-                if not t.done():
-                    t.cancel()
+            # Cancel any in-flight probes and await their completion so
+            # _probe_and_report's finally path runs and closes any opened
+            # connections cleanly.
+            pending = [t for t in self._probe_tasks.values() if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             self._probe_tasks.clear()
 
     def _should_panic(self) -> bool:
@@ -225,14 +229,21 @@ class AsyncClusterTopologyMonitor:
             # Probe failures are expected (network, auth, etc.) -- don't
             # crash the monitor task.
             return
-        # Guard: the race-winner may have finished before us.
-        if role == HostRole.WRITER and not self._writer_found_event.is_set():
+
+        # Winner gate: the first probe to win the race claims the writer.
+        # Check both the event AND the verified-writer flag -- two probes
+        # can both pass the event check if they arrive before set() fires.
+        # The flag is the atomic consistency anchor.
+        if (role == HostRole.WRITER
+                and not self._writer_found_event.is_set()
+                and not self._is_verified_writer_connection):
             self._verified_writer_conn = conn
             self._verified_writer_host_info = host_info
             self._is_verified_writer_connection = True
             self._writer_found_event.set()
             return
-        # Loser or reader: close the conn best-effort.
+
+        # Lost the race OR role is reader: close the conn.
         if conn is not None:
             await self._close_best_effort(conn)
 

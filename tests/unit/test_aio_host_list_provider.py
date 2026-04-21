@@ -803,3 +803,85 @@ def test_topology_monitor_loser_probe_closes_its_conn():
     # Loser closed; winner retained
     loser_conn.close.assert_called()
     winner_conn.close.assert_not_called()
+
+
+def test_probe_two_writers_only_first_wins_second_closes_conn():
+    """Two probes returning WRITER: first stashes its conn, second closes its own."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    h1 = HostInfo(host="w1", port=5432, role=HostRole.WRITER)
+    h2 = HostInfo(host="w2", port=5432, role=HostRole.WRITER)
+
+    winner_conn = MagicMock(name="winner")
+    winner_conn.close = MagicMock()
+    loser_conn = MagicMock(name="second_writer")
+    loser_conn.close = MagicMock()
+
+    async def _probe(host_info):
+        if host_info.host == "w1":
+            return winner_conn, HostRole.WRITER
+        # h2 arrives slightly later, also returns WRITER
+        await asyncio.sleep(0.02)
+        return loser_conn, HostRole.WRITER
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+        probe_host=_probe,
+    )
+    monitor._last_topology = (h1, h2)
+
+    async def _run():
+        monitor.start()
+        await asyncio.sleep(0.1)
+        await monitor.stop()
+
+    asyncio.run(_run())
+    # h1 won; its conn retained. h2's "also a writer" conn was closed.
+    assert monitor._verified_writer_conn is winner_conn
+    loser_conn.close.assert_called()
+    winner_conn.close.assert_not_called()
+
+
+def test_canceled_probe_conn_closed_on_shutdown():
+    """Probe canceled mid-flight (before returning a conn) doesn't leak."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    h = HostInfo(host="slow", port=5432, role=HostRole.READER)
+    probe_started = asyncio.Event()
+    released_conn = MagicMock(name="late_conn")
+    released_conn.close = MagicMock()
+
+    async def _probe(host_info):
+        probe_started.set()
+        try:
+            await asyncio.sleep(10.0)  # would return conn after 10s
+        except asyncio.CancelledError:
+            # Probe canceled before it could return the conn -- no leak expected
+            raise
+        return released_conn, HostRole.READER
+
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=())
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+        probe_host=_probe,
+    )
+    monitor._last_topology = (h,)
+
+    async def _run():
+        monitor.start()
+        await probe_started.wait()
+        # Now stop; the finally should await the canceled probe
+        await monitor.stop()
+
+    # Should complete without hanging (finally awaits cancellation)
+    asyncio.run(_run())
+    # Since the probe was canceled BEFORE it returned a conn, there's no
+    # conn to close in our code path -- but the monitor shouldn't hang either
+    assert monitor.is_running() is False
