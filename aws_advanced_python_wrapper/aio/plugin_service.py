@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import (TYPE_CHECKING, Any, ClassVar, FrozenSet, List, Optional,
                     Protocol, Set, Tuple)
 
+from aws_advanced_python_wrapper.aio.plugin import AsyncCanReleaseResources
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
 from aws_advanced_python_wrapper.utils.messages import Messages
@@ -333,7 +334,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
                 pass
 
         hlp = self._host_list_provider
-        if hlp is not None and hasattr(hlp, "release_resources"):
+        if isinstance(hlp, AsyncCanReleaseResources):
             try:
                 await hlp.release_resources()
             except Exception:  # noqa: BLE001

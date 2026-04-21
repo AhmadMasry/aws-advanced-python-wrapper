@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -257,4 +257,16 @@ def test_release_resources_survives_errors():
 def test_release_resources_is_noop_when_no_connection_no_provider():
     svc = _make_service()
     # Should not raise with neither connection nor provider
+    asyncio.run(svc.release_resources())
+
+
+def test_release_resources_skips_provider_without_hook():
+    """A provider without async release_resources is silently skipped."""
+    driver_dialect = MagicMock(spec=AsyncDriverDialect)
+    driver_dialect.network_bound_methods = set()
+    driver_dialect.abort_connection = AsyncMock()  # Async noop
+    svc = AsyncPluginServiceImpl(Properties(), driver_dialect)
+    svc._current_connection = MagicMock()
+    svc.host_list_provider = _FakeHostListProvider()  # No release_resources method
+    # Must not raise; must not attempt to call release on a provider lacking the method
     asyncio.run(svc.release_resources())

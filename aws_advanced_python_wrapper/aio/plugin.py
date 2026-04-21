@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List,
-                    Optional, Protocol, Set, Tuple)
+                    Optional, Protocol, Set, Tuple, runtime_checkable)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -114,4 +114,16 @@ class AsyncConnectionProvider(Protocol):
             database_dialect: DatabaseDialect,
             host_info: HostInfo,
             props: Properties) -> Any:
+        ...
+
+
+@runtime_checkable
+class AsyncCanReleaseResources(Protocol):
+    """Async counterpart of :class:`CanReleaseResources`.
+
+    Providers and monitors implement this so :meth:`AsyncPluginService.release_resources`
+    can await cleanup without duck-typing via ``hasattr``.
+    """
+
+    async def release_resources(self) -> None:
         ...
