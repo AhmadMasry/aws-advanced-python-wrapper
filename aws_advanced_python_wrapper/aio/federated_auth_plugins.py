@@ -288,6 +288,7 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
         async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=timeout),
                 auth=auth,
+                trust_env=True,
         ) as session:
             async with session.get(url, ssl=ssl_ctx) as resp:
                 body = await resp.text()
@@ -348,6 +349,7 @@ class AsyncOktaAuthPlugin(AsyncFederatedAuthPlugin):
         org_base = f"https://{idp_endpoint}"
         async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=timeout),
+                trust_env=True,
         ) as session:
             # Step 1: primary authentication.
             authn_url = urljoin(org_base, self._OKTA_AUTHN_PATH)

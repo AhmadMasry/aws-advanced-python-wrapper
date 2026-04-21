@@ -382,6 +382,46 @@ def test_okta_extract_saml_raises_when_form_missing():
         AsyncOktaAuthPlugin._extract_saml_assertion("<html>nope</html>")
 
 
+def test_okta_regex_matches_real_world_html():
+    """Regex handles attribute ordering Okta actually emits."""
+    from aws_advanced_python_wrapper.aio.federated_auth_plugins import \
+        AsyncOktaAuthPlugin
+
+    # Representative Okta SSO response form:
+    html = (
+        '<form action="https://signin.aws.amazon.com/saml" method="POST">'
+        '<input type="hidden" id="samlResponse" '
+        'name="SAMLResponse" '
+        'value="PHNhbWxwOlJlc3BvbnNlLi4u"/></form>'
+    )
+    extracted = AsyncOktaAuthPlugin._extract_saml_assertion(html)
+    assert extracted == "PHNhbWxwOlJlc3BvbnNlLi4u"
+
+
+def test_federated_plugin_respects_proxy_env_via_trust_env():
+    """aiohttp ClientSession must be constructed with trust_env=True so
+    HTTP_PROXY / HTTPS_PROXY env vars are honored (sync parity via
+    requests library)."""
+    import inspect
+
+    from aws_advanced_python_wrapper.aio.federated_auth_plugins import \
+        AsyncFederatedAuthPlugin
+
+    # Read the source; trust_env=True must appear in the ClientSession call.
+    src = inspect.getsource(AsyncFederatedAuthPlugin)
+    assert "trust_env=True" in src
+
+
+def test_okta_plugin_respects_proxy_env_via_trust_env():
+    import inspect
+
+    from aws_advanced_python_wrapper.aio.federated_auth_plugins import \
+        AsyncOktaAuthPlugin
+
+    src = inspect.getsource(AsyncOktaAuthPlugin)
+    assert "trust_env=True" in src
+
+
 def test_federated_port_falls_back_to_database_dialect_default():
     """When IAM_DEFAULT_PORT is unset and host_info.port is -1, the port
     comes from database_dialect.default_port (e.g. 3306 for MySQL)."""

@@ -33,6 +33,7 @@ Each plugin is kept intentionally small; none spawn background tasks.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, List,
                     Optional, Set)
 
@@ -75,13 +76,11 @@ class AsyncConnectTimePlugin(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
-        start = asyncio.get_event_loop().time()
+        start_ns = time.perf_counter_ns()
         try:
             return await connect_func()
         finally:
-            self.total_connect_time_ns += int(
-                (asyncio.get_event_loop().time() - start) * 1_000_000_000
-            )
+            self.total_connect_time_ns += time.perf_counter_ns() - start_ns
             self.connect_count += 1
 
 
@@ -116,13 +115,11 @@ class AsyncExecuteTimePlugin(AsyncPlugin):
             execute_func: Callable[..., Awaitable[Any]],
             *args: Any,
             **kwargs: Any) -> Any:
-        start = asyncio.get_event_loop().time()
+        start_ns = time.perf_counter_ns()
         try:
             return await execute_func()
         finally:
-            self.total_execute_time_ns += int(
-                (asyncio.get_event_loop().time() - start) * 1_000_000_000
-            )
+            self.total_execute_time_ns += time.perf_counter_ns() - start_ns
             self.execute_count += 1
 
 
