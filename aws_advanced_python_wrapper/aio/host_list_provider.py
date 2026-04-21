@@ -234,3 +234,147 @@ class AsyncAuroraHostListProvider:
 
     async def stop(self) -> None:
         return None
+
+
+class AsyncMultiAzHostListProvider(AsyncAuroraHostListProvider):
+    """Async MultiAz Cluster topology provider.
+
+    Ports sync :class:`MultiAzTopologyUtils`
+    (``host_list_provider.py:630-702``). Runs a two-step query:
+    ``writer_host_query`` to identify the writer's ID, then
+    ``topology_query`` for the full host list. Row shape:
+    ``(id, host, port)``; role assigned by ``id == writer_id``.
+
+    Instantiate with explicit SQL strings. Full auto-detection from
+    :class:`DatabaseDialect` introspection is a future enhancement (sync
+    reads them from ``MultiAzClusterMysqlDialect`` /
+    ``MultiAzClusterPgDialect`` -- those dialects don't yet flow through
+    the async PluginService dialect resolution chain).
+
+    Two-step behavior matches sync:
+    1. Execute ``writer_host_query``. A non-empty row => its first column
+       is the writer's ID.
+    2. Empty row (MySQL "we're the writer" case) => fall back to
+       ``host_id_query`` for our own ID.
+    3. Execute ``topology_query`` and parse ``(id, host, port)`` rows;
+       role is ``WRITER`` iff ``id == writer_id``.
+
+    Optional ``instance_template_host`` substitutes ``?`` in the template
+    with the instance-ID extracted from the row's host via
+    :meth:`RdsUtils.get_instance_id`, matching sync
+    ``MultiAzTopologyUtils._create_multi_az_host``.
+    """
+
+    def __init__(
+            self,
+            props: Properties,
+            driver_dialect: AsyncDriverDialect,
+            writer_host_query: str,
+            topology_query: str,
+            host_id_query: str,
+            cluster_id: Optional[str] = None,
+            default_port: int = 5432,
+            instance_template_host: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            props=props,
+            driver_dialect=driver_dialect,
+            topology_query=topology_query,
+            cluster_id=cluster_id,
+            default_port=default_port,
+        )
+        self._writer_host_query = writer_host_query
+        self._host_id_query = host_id_query
+        self._instance_template_host = instance_template_host
+        # Import locally to avoid widening the module's top-level import set.
+        from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
+        self._rds_utils = RdsUtils()
+        self._writer_id: Optional[str] = None
+
+    async def _run_topology_query(self, connection: Any) -> List[tuple]:
+        """Two-step MultiAz topology query.
+
+        Step 1: ``writer_host_query``. Empty row => fall through to
+        ``host_id_query`` (we are the writer, MySQL-style).
+        Step 2: ``topology_query`` for the full host list.
+
+        We stash the identified writer ID on ``self._writer_id`` so
+        :meth:`_rows_to_topology` can assign roles. A failure at any step
+        returns ``[]`` so callers fall back to cache, matching
+        :meth:`AsyncAuroraHostListProvider._run_topology_query`.
+        """
+        try:
+            cur = connection.cursor()
+            async with cur:
+                # Step 1: writer host query. Empty row => we're the writer
+                # (MySQL), fall back to host_id_query.
+                await cur.execute(self._writer_host_query)
+                writer_row = await cur.fetchone()
+                if writer_row is not None:
+                    writer_id = str(writer_row[0])
+                else:
+                    await cur.execute(self._host_id_query)
+                    self_row = await cur.fetchone()
+                    if self_row is None:
+                        return []
+                    writer_id = str(self_row[0])
+
+                # Step 2: topology query.
+                await cur.execute(self._topology_query)
+                rows = list(await cur.fetchall())
+
+            self._writer_id = writer_id
+            return rows
+        except Exception:
+            # Mirror AsyncAuroraHostListProvider: a failed probe yields
+            # an empty topology rather than raising into the caller.
+            return []
+
+    def _rows_to_topology(self, rows: List[tuple]) -> Topology:
+        writer_id = self._writer_id
+        hosts: List[HostInfo] = []
+        for row in rows:
+            if len(row) < 3:
+                continue
+            row_id = str(row[0])
+            host = str(row[1])
+            try:
+                port = int(row[2])
+            except (TypeError, ValueError):
+                port = self._default_port
+
+            role = HostRole.WRITER if row_id == writer_id else HostRole.READER
+
+            # Optional instance-template substitution. Matches sync
+            # MultiAzTopologyUtils._create_multi_az_host.
+            if self._instance_template_host:
+                instance_name = self._rds_utils.get_instance_id(host)
+                if instance_name:
+                    substituted = self._instance_template_host.replace(
+                        "?", instance_name
+                    )
+                    if ":" in substituted:
+                        host_part, _, port_part = substituted.partition(":")
+                        host = host_part
+                        if port_part.isdigit():
+                            port = int(port_part)
+                    else:
+                        host = substituted
+
+            host_info = HostInfo(
+                host=host,
+                port=port,
+                role=role,
+                host_id=row_id,
+            )
+            host_info.add_alias(host)
+            hosts.append(host_info)
+
+        # Validate: must have exactly one writer (sync MultiAz clears
+        # everything if no writer is found).
+        writers = [h for h in hosts if h.role == HostRole.WRITER]
+        if not writers:
+            return ()
+        # Writer first, readers after -- matches AsyncAuroraHostListProvider.
+        hosts.sort(key=lambda h: 0 if h.role == HostRole.WRITER else 1)
+        return tuple(hosts)
