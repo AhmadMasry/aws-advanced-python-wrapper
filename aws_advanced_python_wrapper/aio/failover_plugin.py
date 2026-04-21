@@ -189,14 +189,14 @@ class AsyncFailoverPlugin(AsyncPlugin):
                 new_conn = await self._open_connection(target, driver_dialect)
             except Exception as e:
                 self._plugin_service.set_availability(
-                    frozenset({target.as_alias()}), HostAvailability.UNAVAILABLE)
+                    target.as_aliases(), HostAvailability.UNAVAILABLE)
                 last_error = e
                 await asyncio.sleep(1.0)
                 continue
 
             if new_conn is not None:
                 self._plugin_service.set_availability(
-                    frozenset({target.as_alias()}), HostAvailability.AVAILABLE)
+                    target.as_aliases(), HostAvailability.AVAILABLE)
                 await self._plugin_service.set_current_connection(new_conn, target)
                 return
 

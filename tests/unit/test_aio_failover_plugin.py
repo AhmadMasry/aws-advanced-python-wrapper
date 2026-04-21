@@ -397,7 +397,7 @@ def test_failover_marks_connected_host_available():
     asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
 
     svc.set_availability.assert_any_call(
-        frozenset({writer.as_alias()}), HostAvailability.AVAILABLE)
+        writer.as_aliases(), HostAvailability.AVAILABLE)
 
 
 def test_failover_marks_failed_host_unavailable():
@@ -415,4 +415,4 @@ def test_failover_marks_failed_host_unavailable():
         asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
 
     svc.set_availability.assert_any_call(
-        frozenset({writer.as_alias()}), HostAvailability.UNAVAILABLE)
+        writer.as_aliases(), HostAvailability.UNAVAILABLE)
