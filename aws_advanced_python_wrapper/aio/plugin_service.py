@@ -138,6 +138,10 @@ class AsyncPluginService(Protocol):
             connection: Optional[Any] = None) -> None:
         ...
 
+    async def release_resources(self) -> None:
+        """Best-effort shutdown. Idempotent. Does not raise."""
+        ...
+
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         ...
 
@@ -311,6 +315,29 @@ class AsyncPluginServiceImpl(AsyncPluginService):
                 Messages.get("AsyncPluginService.HostListProviderNotSet"))
         conn = connection if connection is not None else self._current_connection
         self._all_hosts = await self._host_list_provider.force_refresh(conn)
+
+    async def release_resources(self) -> None:
+        """Best-effort shutdown. Idempotent. Does not raise.
+
+        Aborts the current connection via ``driver_dialect.abort_connection``
+        and, if the host list provider exposes ``release_resources``, awaits
+        that too. Exceptions are swallowed so one bad cleanup step doesn't
+        block others. Plugins can register their own async shutdown via
+        :func:`aws_advanced_python_wrapper.aio.cleanup.register_shutdown_hook`.
+        """
+        conn = self._current_connection
+        if conn is not None:
+            try:
+                await self._driver_dialect.abort_connection(conn)
+            except Exception:  # noqa: BLE001 - intentional best-effort teardown
+                pass
+
+        hlp = self._host_list_provider
+        if hlp is not None and hasattr(hlp, "release_resources"):
+            try:
+                await hlp.release_resources()
+            except Exception:  # noqa: BLE001
+                pass
 
     @property
     def network_bound_methods(self) -> Set[str]:

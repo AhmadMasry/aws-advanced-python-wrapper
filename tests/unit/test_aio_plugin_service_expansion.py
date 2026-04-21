@@ -211,3 +211,50 @@ def test_initial_connection_host_info_is_settable():
     host = HostInfo(host="writer-1", port=5432, role=HostRole.WRITER)
     svc.initial_connection_host_info = host
     assert svc.initial_connection_host_info is host
+
+
+class _ReleasableHostListProvider(_FakeHostListProvider):
+    """Extends the fake with an async release_resources hook."""
+
+    def __init__(self):
+        super().__init__()
+        self.released = False
+
+    async def release_resources(self):
+        self.released = True
+
+
+def test_release_resources_closes_connection_and_provider():
+    driver_dialect = MagicMock(spec=AsyncDriverDialect)
+    driver_dialect.network_bound_methods = set()
+
+    async def _abort(conn):
+        conn.closed = True
+
+    driver_dialect.abort_connection = MagicMock(side_effect=_abort)
+    svc = AsyncPluginServiceImpl(Properties(), driver_dialect)
+    conn = MagicMock()
+    conn.closed = False
+    svc._current_connection = conn
+    hlp = _ReleasableHostListProvider()
+    svc.host_list_provider = hlp
+    asyncio.run(svc.release_resources())
+    assert hlp.released is True
+
+
+def test_release_resources_survives_errors():
+    driver_dialect = MagicMock(spec=AsyncDriverDialect)
+    driver_dialect.network_bound_methods = set()
+    driver_dialect.abort_connection = MagicMock(side_effect=RuntimeError("boom"))
+    svc = AsyncPluginServiceImpl(Properties(), driver_dialect)
+    conn = MagicMock()
+    conn.closed = False
+    svc._current_connection = conn
+    # Must not raise
+    asyncio.run(svc.release_resources())
+
+
+def test_release_resources_is_noop_when_no_connection_no_provider():
+    svc = _make_service()
+    # Should not raise with neither connection nor provider
+    asyncio.run(svc.release_resources())
