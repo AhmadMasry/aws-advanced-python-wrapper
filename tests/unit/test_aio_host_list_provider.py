@@ -448,3 +448,108 @@ def test_topology_monitor_ignore_window_expires():
 
     ignored = asyncio.run(_run())
     assert ignored is False
+
+
+# ---- G.3: force_refresh_with_connection API ------------------------------
+
+
+def test_force_refresh_with_connection_delegates_to_provider():
+    """When ignore-window is clear, probe via the caller's connection."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    topology = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),
+                HostInfo(host="r1", port=5432, role=HostRole.READER))
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=topology)
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+    )
+
+    caller_conn = MagicMock(name="caller_conn")
+
+    async def _run():
+        return await monitor.force_refresh_with_connection(caller_conn, timeout_sec=1.0)
+
+    result = asyncio.run(_run())
+    assert result == topology
+    provider.force_refresh.assert_awaited_once_with(caller_conn)
+
+
+def test_force_refresh_with_connection_respects_ignore_window():
+    """When in ignore window, returns last-known topology without probing."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    topology = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),)
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=topology)
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+    )
+
+    # Seed the ignore window + last_topology
+    import time
+    monitor._ignore_requests_until_ns = (
+        time.time_ns() + int(5.0 * 1_000_000_000))
+    monitor._last_topology = topology
+
+    async def _run():
+        return await monitor.force_refresh_with_connection(
+            MagicMock(name="conn"), timeout_sec=1.0)
+
+    result = asyncio.run(_run())
+    assert result == topology
+    # Provider NOT called -- we returned cached
+    provider.force_refresh.assert_not_awaited()
+
+
+def test_force_refresh_with_connection_raises_on_timeout():
+    """Slow provider triggers asyncio.TimeoutError -> TimeoutError."""
+    async def _slow(*args, **kwargs):
+        await asyncio.sleep(1.0)
+
+    provider = MagicMock()
+    provider.force_refresh = _slow
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+    )
+
+    async def _run():
+        await monitor.force_refresh_with_connection(
+            MagicMock(), timeout_sec=0.05)
+
+    import pytest
+    with pytest.raises(TimeoutError):
+        asyncio.run(_run())
+
+
+def test_force_refresh_with_connection_triggers_writer_change_detection():
+    """A writer change observed via this API also starts the high-freq window."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=MagicMock(),
+        connection_getter=lambda: None,
+        refresh_interval_sec=30.0,
+    )
+    # Seed a prior writer
+    monitor._last_known_writer = "old-writer:5432"
+
+    new_topology = (HostInfo(host="new-writer", port=5432, role=HostRole.WRITER),)
+    monitor._provider.force_refresh = AsyncMock(return_value=new_topology)
+
+    async def _run():
+        await monitor.force_refresh_with_connection(MagicMock(), timeout_sec=1.0)
+
+    import time as _time
+    asyncio.run(_run())
+    assert monitor._last_known_writer == "new-writer:5432"
+    assert monitor._high_refresh_until_ns > _time.time_ns()

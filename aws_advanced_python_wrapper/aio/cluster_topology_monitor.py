@@ -77,11 +77,17 @@ class AsyncClusterTopologyMonitor:
         self._last_known_writer: Optional[str] = None
         self._high_refresh_until_ns: int = 0
         self._ignore_requests_until_ns: int = 0
+        self._last_topology: tuple = ()
 
     @property
     def high_refresh_rate_sec(self) -> float:
         """Seconds between refreshes while in high-freq mode (read-only)."""
         return self._high_refresh_rate_sec
+
+    @property
+    def last_topology(self) -> tuple:
+        """Most recently refreshed topology (empty tuple before first tick)."""
+        return self._last_topology
 
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
@@ -100,6 +106,7 @@ class AsyncClusterTopologyMonitor:
                 if conn is not None:
                     try:
                         topology = await self._provider.force_refresh(conn)
+                        self._last_topology = topology
                         self._check_for_writer_change(topology)
                     except Exception:
                         # Monitor failures shouldn't crash the task;
@@ -164,6 +171,35 @@ class AsyncClusterTopologyMonitor:
         Mirrors sync cluster_topology_monitor.py:136-141.
         """
         return time.time_ns() < self._ignore_requests_until_ns
+
+    async def force_refresh_with_connection(
+            self,
+            conn: Any,
+            timeout_sec: float = 5.0) -> tuple:
+        """Probe the topology provider with the caller's ``conn``.
+
+        Short-circuits to the cached ``last_topology`` when the ignore-
+        request window is active (sync parity cluster_topology_monitor.py
+        :136-141). Otherwise delegates to ``provider.force_refresh(conn)``
+        under an ``asyncio.wait_for(timeout=timeout_sec)`` gate.
+
+        Raises ``TimeoutError`` when the provider doesn't respond within
+        ``timeout_sec``.
+        """
+        if self.should_ignore_refresh_request():
+            return self._last_topology
+        try:
+            topology = await asyncio.wait_for(
+                self._provider.force_refresh(conn),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"Topology refresh did not complete within {timeout_sec}s"
+            ) from e
+        self._last_topology = topology
+        self._check_for_writer_change(topology)
+        return topology
 
     async def stop(self) -> None:
         """Signal the task to exit and await its termination."""
