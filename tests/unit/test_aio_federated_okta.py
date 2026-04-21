@@ -30,7 +30,6 @@ from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import Properties
 
-
 _FAKE_SAML = "PHNhbWw6UmVzcG9uc2Ugeg=="  # noqa
 _FAKE_CREDS = {
     "AccessKeyId": "AKIA123",

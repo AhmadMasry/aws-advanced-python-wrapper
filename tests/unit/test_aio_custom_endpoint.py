@@ -29,7 +29,6 @@ from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import Properties
 
-
 # ---- Monitor lifecycle -------------------------------------------------
 
 
@@ -214,6 +213,7 @@ def test_plugin_spawns_monitor_for_custom_endpoint_host():
                 # Drain any scheduled shutdown hooks.
                 await aio_cleanup.release_resources_async()
                 # Monitor should be stopped after release_resources_async.
+                assert plugin.monitor is not None
                 assert plugin.monitor.is_running() is False
 
     asyncio.run(_body())
