@@ -29,11 +29,10 @@ from aws_advanced_python_wrapper.aio.plugin_factory import (
 from aws_advanced_python_wrapper.aio.stub_plugins import (
     AsyncAuroraInitialConnectionStrategyStubPlugin, AsyncBlueGreenStubPlugin,
     AsyncFastestResponseStrategyStubPlugin, AsyncLimitlessStubPlugin,
-    AsyncSimpleReadWriteSplittingStubPlugin, AsyncStaleDnsStubPlugin)
+    AsyncSimpleReadWriteSplittingStubPlugin)
 
 STUB_CODES_AND_CLASSES = [
     ("srw", AsyncSimpleReadWriteSplittingStubPlugin),
-    ("stale_dns", AsyncStaleDnsStubPlugin),
     ("initial_connection", AsyncAuroraInitialConnectionStrategyStubPlugin),
     ("limitless", AsyncLimitlessStubPlugin),
     ("bg", AsyncBlueGreenStubPlugin),

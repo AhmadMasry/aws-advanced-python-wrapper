@@ -43,7 +43,7 @@ from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
 from aws_advanced_python_wrapper.aio.stub_plugins import (
     AsyncAuroraInitialConnectionStrategyStubPlugin, AsyncBlueGreenStubPlugin,
     AsyncFastestResponseStrategyStubPlugin, AsyncLimitlessStubPlugin,
-    AsyncSimpleReadWriteSplittingStubPlugin, AsyncStaleDnsStubPlugin)
+    AsyncSimpleReadWriteSplittingStubPlugin)
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
@@ -154,6 +154,17 @@ class _CustomEndpointFactory:
         return AsyncCustomEndpointPluginActive(plugin_service, props)
 
 
+class _StaleDnsFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        # Local import keeps module load-order cheap and breaks any
+        # accidental import cycles between the factory registry and the
+        # plugin implementation.
+        from aws_advanced_python_wrapper.aio.stale_dns_plugin import \
+            AsyncStaleDnsPlugin
+        return AsyncStaleDnsPlugin(plugin_service)
+
+
 class _AsyncStubFactory:
     """Factory that instantiates a pass-through stub plugin.
 
@@ -174,7 +185,6 @@ class _AsyncStubFactory:
 
 _SimpleReadWriteSplittingFactory = _AsyncStubFactory(
     AsyncSimpleReadWriteSplittingStubPlugin)
-_StaleDnsFactory = _AsyncStubFactory(AsyncStaleDnsStubPlugin)
 _InitialConnectionFactory = _AsyncStubFactory(
     AsyncAuroraInitialConnectionStrategyStubPlugin)
 _LimitlessFactory = _AsyncStubFactory(AsyncLimitlessStubPlugin)
@@ -207,12 +217,12 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "execute_time": _ExecuteTimeFactory(),
     "dev": _DeveloperFactory(),
     "custom_endpoint": _CustomEndpointFactory(),
+    "stale_dns": _StaleDnsFactory(),
     # ---- Phase H.2 stubs: plugin codes not yet ported to async. ----
     # Registered so users can keep sync/async `plugins="..."` config
     # strings identical. Each stub subscribes to nothing and logs a
     # WARNING on construction; full async ports land in later phases.
     "srw": _SimpleReadWriteSplittingFactory,
-    "stale_dns": _StaleDnsFactory,
     "initial_connection": _InitialConnectionFactory,
     "limitless": _LimitlessFactory,
     "bg": _BlueGreenFactory,
@@ -225,6 +235,7 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
 PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _CustomEndpointFactory: 40,
     _AuroraConnectionTrackerFactory: 100,
+    _StaleDnsFactory: 200,
     _ReadWriteSplittingFactory: 300,
     _FailoverFactory: 400,
     _HostMonitoringFactory: 500,

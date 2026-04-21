@@ -64,11 +64,6 @@ class AsyncSimpleReadWriteSplittingStubPlugin(_AsyncStubPlugin):
     _STUB_NAME = "srw"
 
 
-class AsyncStaleDnsStubPlugin(_AsyncStubPlugin):
-    """Stub for sync StaleDnsPlugin ('stale_dns')."""
-    _STUB_NAME = "stale_dns"
-
-
 class AsyncAuroraInitialConnectionStrategyStubPlugin(_AsyncStubPlugin):
     """Stub for sync AuroraInitialConnectionStrategyPlugin ('initial_connection')."""
     _STUB_NAME = "initial_connection"
@@ -95,5 +90,4 @@ __all__ = [
     "AsyncFastestResponseStrategyStubPlugin",
     "AsyncLimitlessStubPlugin",
     "AsyncSimpleReadWriteSplittingStubPlugin",
-    "AsyncStaleDnsStubPlugin",
 ]
