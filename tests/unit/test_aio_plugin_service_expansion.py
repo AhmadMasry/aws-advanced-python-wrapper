@@ -30,3 +30,30 @@ def test_database_dialect_is_settable():
     dialect = MagicMock(spec=DatabaseDialect)
     svc = _make_service(database_dialect=dialect)
     assert svc.database_dialect is dialect
+
+
+def test_is_network_exception_returns_false_when_no_dialect():
+    svc = _make_service()
+    assert svc.is_network_exception(error=Exception("boom")) is False
+
+
+def test_is_network_exception_delegates_to_dialect_handler():
+    dialect = MagicMock(spec=DatabaseDialect)
+    handler = MagicMock()
+    handler.is_network_exception.return_value = True
+    dialect.exception_handler = handler
+    svc = _make_service(database_dialect=dialect)
+    err = Exception("connection reset")
+    assert svc.is_network_exception(error=err) is True
+    handler.is_network_exception.assert_called_once_with(error=err, sql_state=None)
+
+
+def test_is_login_exception_delegates_to_dialect_handler():
+    dialect = MagicMock(spec=DatabaseDialect)
+    handler = MagicMock()
+    handler.is_login_exception.return_value = True
+    dialect.exception_handler = handler
+    svc = _make_service(database_dialect=dialect)
+    err = Exception("auth failed")
+    assert svc.is_login_exception(error=err, sql_state="28000") is True
+    handler.is_login_exception.assert_called_once_with(error=err, sql_state="28000")

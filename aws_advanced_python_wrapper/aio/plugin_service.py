@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional, Protocol, Set
 
+from aws_advanced_python_wrapper.exception_handling import ExceptionManager
+
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
@@ -64,6 +66,18 @@ class AsyncPluginService(Protocol):
 
     @database_dialect.setter
     def database_dialect(self, value: Optional[DatabaseDialect]) -> None:
+        ...
+
+    def is_network_exception(
+            self,
+            error: Optional[Exception] = None,
+            sql_state: Optional[str] = None) -> bool:
+        ...
+
+    def is_login_exception(
+            self,
+            error: Optional[Exception] = None,
+            sql_state: Optional[str] = None) -> bool:
         ...
 
     @property
@@ -107,6 +121,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._props: Properties = props
         self._driver_dialect: AsyncDriverDialect = driver_dialect
         self._database_dialect: Optional[DatabaseDialect] = None
+        self._exception_manager: ExceptionManager = ExceptionManager()
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
 
@@ -133,6 +148,20 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     @database_dialect.setter
     def database_dialect(self, value: Optional[DatabaseDialect]) -> None:
         self._database_dialect = value
+
+    def is_network_exception(
+            self,
+            error: Optional[Exception] = None,
+            sql_state: Optional[str] = None) -> bool:
+        return self._exception_manager.is_network_exception(
+            self._database_dialect, error=error, sql_state=sql_state)
+
+    def is_login_exception(
+            self,
+            error: Optional[Exception] = None,
+            sql_state: Optional[str] = None) -> bool:
+        return self._exception_manager.is_login_exception(
+            self._database_dialect, error=error, sql_state=sql_state)
 
     @property
     def network_bound_methods(self) -> Set[str]:
