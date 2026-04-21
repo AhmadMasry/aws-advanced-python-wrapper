@@ -41,10 +41,9 @@ class AsyncDefaultPlugin(AsyncPlugin):
 
     # Reuse sync's 4-entry HostSelector dict so both sync and async share
     # the same RoundRobinHostSelector rotation state and selector registry.
-    # Accesses a leading-underscore attr on DriverConnectionProvider -- a
-    # public classmethod on sync side would be cleaner but is out of scope
-    # for Phase A. Tracked as a follow-up.
-    _SELECTORS = DriverConnectionProvider._accepted_strategies
+    # Uses the public classmethod on DriverConnectionProvider (added in
+    # phase A follow-up) to avoid coupling to the private attr.
+    _SELECTORS = DriverConnectionProvider.accepted_strategies()
 
     @property
     def subscribed_methods(self) -> Set[str]:
