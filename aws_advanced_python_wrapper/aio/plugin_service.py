@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, Set
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
+    from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
 
@@ -54,6 +55,15 @@ class AsyncPluginService(Protocol):
 
     @property
     def driver_dialect(self) -> AsyncDriverDialect:
+        ...
+
+    @property
+    def database_dialect(self) -> Optional[DatabaseDialect]:
+        """The resolved :class:`DatabaseDialect`, or ``None`` before connect."""
+        ...
+
+    @database_dialect.setter
+    def database_dialect(self, value: Optional[DatabaseDialect]) -> None:
         ...
 
     @property
@@ -96,6 +106,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
             host_info: Optional[HostInfo] = None) -> None:
         self._props: Properties = props
         self._driver_dialect: AsyncDriverDialect = driver_dialect
+        self._database_dialect: Optional[DatabaseDialect] = None
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
 
@@ -114,6 +125,14 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     @property
     def driver_dialect(self) -> AsyncDriverDialect:
         return self._driver_dialect
+
+    @property
+    def database_dialect(self) -> Optional[DatabaseDialect]:
+        return self._database_dialect
+
+    @database_dialect.setter
+    def database_dialect(self, value: Optional[DatabaseDialect]) -> None:
+        self._database_dialect = value
 
     @property
     def network_bound_methods(self) -> Set[str]:
