@@ -30,9 +30,9 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
-from aws_advanced_python_wrapper.errors import (AwsWrapperError,
-                                                FailoverFailedError,
-                                                FailoverSuccessError)
+from aws_advanced_python_wrapper.errors import (
+    AwsWrapperError, FailoverFailedError, FailoverSuccessError,
+    TransactionResolutionUnknownError)
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.failover_mode import (FailoverMode,
@@ -113,11 +113,7 @@ class AsyncFailoverPlugin(AsyncPlugin):
             if not self._should_failover(exc):
                 raise
             await self._do_failover(driver_dialect=self._plugin_service.driver_dialect)
-            # Signal the caller that the connection was replaced and the
-            # unit of work must be retried.
-            raise FailoverSuccessError(
-                "Connection was replaced as part of failover; please retry the transaction."
-            ) from exc
+            await self._raise_failover_success_or_txn_unknown(exc)
 
     def _should_failover(self, exc: Exception) -> bool:
         """Decide whether ``exc`` indicates a failover-worthy error.
@@ -135,6 +131,31 @@ class AsyncFailoverPlugin(AsyncPlugin):
             return True
         return (self._mode == FailoverMode.STRICT_WRITER
                 and self._plugin_service.is_read_only_connection_exception(error=exc))
+
+    async def _raise_failover_success_or_txn_unknown(
+            self, original_exc: Exception) -> None:
+        """Signal successful failover with the right exception type.
+
+        Mirrors sync v2 _throw_failover_success_exception at
+        failover_v2_plugin.py:312-321. If the caller was mid-transaction,
+        their transaction's fate is unknown -- raise
+        TransactionResolutionUnknownError so they don't blindly retry.
+        Otherwise raise FailoverSuccessError so they can retry cleanly.
+        """
+        in_txn = False
+        current = self._plugin_service.current_connection
+        if current is not None:
+            try:
+                in_txn = await self._plugin_service.driver_dialect.is_in_transaction(current)
+            except Exception:  # noqa: BLE001 - probe is best-effort
+                in_txn = False
+        if in_txn:
+            raise TransactionResolutionUnknownError(
+                "Failover succeeded mid-transaction; transaction state is unknown."
+            ) from original_exc
+        raise FailoverSuccessError(
+            "Connection was replaced as part of failover; please retry the transaction."
+        ) from original_exc
 
     async def _do_failover(self, driver_dialect: AsyncDriverDialect) -> None:
         """Orchestrate the failover: probe topology, pick target, reconnect."""

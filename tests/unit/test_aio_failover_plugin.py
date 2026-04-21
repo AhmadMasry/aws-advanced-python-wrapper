@@ -25,8 +25,9 @@ import pytest
 from aws_advanced_python_wrapper.aio.failover_plugin import AsyncFailoverPlugin
 from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
-from aws_advanced_python_wrapper.errors import (FailoverFailedError,
-                                                FailoverSuccessError)
+from aws_advanced_python_wrapper.errors import (
+    FailoverFailedError, FailoverSuccessError,
+    TransactionResolutionUnknownError)
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.utils.failover_mode import FailoverMode
 from aws_advanced_python_wrapper.utils.properties import Properties
@@ -299,3 +300,79 @@ def test_should_not_failover_on_self_raised_signals():
 
     assert plugin._should_failover(FailoverSuccessError("noop")) is False
     assert plugin._should_failover(FailoverFailedError("noop")) is False
+
+
+# ---- B.2: mid-transaction TransactionResolutionUnknownError ------------
+
+
+def test_failover_raises_transaction_unknown_when_mid_transaction():
+    """Mid-txn failover -> TransactionResolutionUnknownError."""
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    # Seed current connection so the probe has something to call against
+    svc._current_connection = MagicMock(name="old_conn")
+    driver_dialect.is_in_transaction = AsyncMock(return_value=True)
+
+    # Stub _do_failover: assume it swaps the connection successfully.
+    plugin._do_failover = AsyncMock()  # type: ignore[method-assign]
+
+    async def _raising():
+        raise Exception("network failure")
+
+    with pytest.raises(TransactionResolutionUnknownError):
+        asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _raising))
+
+
+def test_failover_raises_failover_success_when_not_in_transaction():
+    """Outside a txn -> FailoverSuccessError (caller can retry cleanly)."""
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    svc._current_connection = MagicMock(name="old_conn")
+    driver_dialect.is_in_transaction = AsyncMock(return_value=False)
+
+    plugin._do_failover = AsyncMock()  # type: ignore[method-assign]
+
+    async def _raising():
+        raise Exception("network failure")
+
+    with pytest.raises(FailoverSuccessError):
+        asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _raising))
+
+
+def test_failover_txn_probe_errors_treated_as_not_in_txn():
+    """If is_in_transaction probe itself fails, fall back to FailoverSuccessError
+    (best-effort probing; don't promote a probe failure to TransactionResolutionUnknown)."""
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    svc._current_connection = MagicMock(name="old_conn")
+    driver_dialect.is_in_transaction = AsyncMock(side_effect=RuntimeError("probe broke"))
+
+    plugin._do_failover = AsyncMock()  # type: ignore[method-assign]
+
+    async def _raising():
+        raise Exception("network failure")
+
+    with pytest.raises(FailoverSuccessError):
+        asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _raising))
+
+
+def test_failover_no_current_connection_treated_as_not_in_txn():
+    """No current connection (edge case) -> FailoverSuccessError, not TxnUnknown."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    # No current_connection seeded.
+    plugin._do_failover = AsyncMock()  # type: ignore[method-assign]
+
+    async def _raising():
+        raise Exception("network failure")
+
+    with pytest.raises(FailoverSuccessError):
+        asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _raising))
