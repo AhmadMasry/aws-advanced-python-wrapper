@@ -430,13 +430,6 @@ def test_failover_marks_failed_host_unavailable():
 def test_reader_failover_uses_configured_strategy():
     """Reader failover picks via plugin_service.get_host_info_by_strategy
     with the configured strategy name."""
-    props_extra = {"failover_mode": "strict-reader",  # noqa: F841
-                   "failover_reader_host_selector_strategy": "round_robin"}
-    plugin, svc, host_list_provider, driver_dialect = _build_plugin(  # noqa: F841
-        mode="strict-reader")
-    # Inject the strategy prop into the plugin's internal props dict.
-    # _build_plugin doesn't take an arbitrary kwarg; instead construct the
-    # plugin with our own props.
     props = Properties({
         "host": "cluster.example.com",
         "port": "5432",
