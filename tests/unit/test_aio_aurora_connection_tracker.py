@@ -194,3 +194,20 @@ def test_tracker_remove_drops_connection_from_set():
     assert conn in tracker._tracked_for(host.as_aliases())
     tracker.remove(host, conn)
     assert conn not in tracker._tracked_for(host.as_aliases())
+
+
+def test_tracker_state_is_shared_across_instances():
+    """Class-level _tracked means two plugins/trackers see the same connections."""
+    tracker_a = AsyncOpenedConnectionTracker()
+    tracker_b = AsyncOpenedConnectionTracker()
+    host = HostInfo(host="shared-w", port=5432, role=HostRole.WRITER)
+    conn = MagicMock(name="shared_conn")
+    conn.close = MagicMock()
+
+    tracker_a.track(host, conn)
+    # tracker_b should see it too
+    assert conn in tracker_b._tracked_for(host.as_aliases())
+
+    # And invalidating via tracker_b closes it
+    asyncio.run(tracker_b.invalidate_all(host))
+    conn.close.assert_called()

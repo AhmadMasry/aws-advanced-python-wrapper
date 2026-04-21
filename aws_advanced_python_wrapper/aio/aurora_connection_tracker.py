@@ -15,26 +15,32 @@
 """Async Aurora connection tracker + invalidate-on-failover plugin.
 
 Port of sync ``aurora_connection_tracker_plugin.py``. Tracks every
-connection opened through the plugin pipeline in a per-instance
-:class:`AsyncOpenedConnectionTracker` keyed by host alias set. On
-writer change (detected via ``AsyncPluginService.all_hosts`` or a
-raised :class:`FailoverError`), closes every tracked connection to
-the old writer so pooled consumers don't reuse a stale
+connection opened through the plugin pipeline in a class-level
+:class:`AsyncOpenedConnectionTracker` registry keyed by host alias
+set. On writer change (detected via ``AsyncPluginService.all_hosts``
+or a raised :class:`FailoverError`), closes every tracked connection
+to the old writer so pooled consumers don't reuse a stale
 demoted-writer socket.
 
 Simpler than the sync implementation:
 
-* Instance-level state (no class-level sharing across plugin instances).
 * ``WeakSet`` auto-GC -- no prune daemon thread.
 * :func:`asyncio.create_task` for fire-and-forget invalidation -- no
   background ``Thread``.
+
+Unlike earlier iterations of this module, the tracked-connections
+dict lives on the class (mirroring sync's ``ClassVar[Dict[str,
+WeakSet]]`` at ``aurora_connection_tracker_plugin.py:47``) so that
+multiple pooled plugin instances share one registry and a single
+``invalidate_all`` call closes every peer connection to the same
+host.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, FrozenSet,
-                    Optional, Set)
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict,
+                    FrozenSet, Optional, Set)
 from weakref import WeakSet
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
@@ -52,26 +58,35 @@ if TYPE_CHECKING:
 
 
 class AsyncOpenedConnectionTracker:
-    """Per-instance alias-keyed registry of open connections.
+    """Alias-keyed registry of open connections, shared across plugin instances.
 
-    Simpler than sync's class-level ``OpenedConnectionTracker``:
+    Class-level ``_tracked`` mirrors sync ``OpenedConnectionTracker`` at
+    ``aurora_connection_tracker_plugin.py:47`` so multiple pooled
+    :class:`AsyncAuroraConnectionTrackerPlugin` instances can coordinate:
+    one plugin's :meth:`invalidate_all` closes every peer connection to
+    the same host.
 
-    * instance-level so multiple plugin instances don't share state,
+    Still simpler than sync:
+
     * :class:`WeakSet` for auto-GC of dead references (no prune daemon),
     * :meth:`invalidate_all` awaits ``conn.close()`` (async or sync) directly.
     """
 
+    _tracked: ClassVar[Dict[FrozenSet[str], WeakSet[Any]]] = {}
+
     def __init__(self) -> None:
-        self._tracked: Dict[FrozenSet[str], WeakSet[Any]] = {}
+        # Instance-level nothing -- all state lives on the class dict.
+        pass
 
     def track(self, host_info: HostInfo, conn: Any) -> None:
         aliases = host_info.as_aliases()
-        conn_set = self._tracked.setdefault(aliases, WeakSet())
+        conn_set = AsyncOpenedConnectionTracker._tracked.setdefault(
+            aliases, WeakSet())
         conn_set.add(conn)
 
     def remove(self, host_info: HostInfo, conn: Any) -> None:
         aliases = host_info.as_aliases()
-        conn_set = self._tracked.get(aliases)
+        conn_set = AsyncOpenedConnectionTracker._tracked.get(aliases)
         if conn_set is not None:
             conn_set.discard(conn)
 
@@ -82,7 +97,7 @@ class AsyncOpenedConnectionTracker:
         broken connection doesn't block closing the rest.
         """
         aliases = host_info.as_aliases()
-        conn_set = self._tracked.get(aliases)
+        conn_set = AsyncOpenedConnectionTracker._tracked.get(aliases)
         if conn_set is None:
             return
         snapshot = list(conn_set)
@@ -97,13 +112,13 @@ class AsyncOpenedConnectionTracker:
             except Exception:  # noqa: BLE001 - close is best-effort
                 pass
         try:
-            del self._tracked[aliases]
+            del AsyncOpenedConnectionTracker._tracked[aliases]
         except KeyError:
             pass
 
     def _tracked_for(self, aliases: FrozenSet[str]) -> WeakSet[Any]:
         """Test-only accessor; returns the tracked ``WeakSet`` or an empty one."""
-        return self._tracked.get(aliases, WeakSet())
+        return AsyncOpenedConnectionTracker._tracked.get(aliases, WeakSet())
 
 
 class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
@@ -202,8 +217,7 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
         return a.host == b.host and a.port == b.port
 
     def _spawn_invalidation(self, old_writer: HostInfo) -> None:
-        task = asyncio.get_event_loop().create_task(
-            self._tracker.invalidate_all(old_writer))
+        task = asyncio.create_task(self._tracker.invalidate_all(old_writer))
         self._pending_invalidations.add(task)
         task.add_done_callback(self._pending_invalidations.discard)
 

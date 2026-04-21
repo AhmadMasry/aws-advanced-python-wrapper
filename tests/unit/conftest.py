@@ -12,6 +12,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from aws_advanced_python_wrapper.aio.aurora_connection_tracker import \
+    AsyncOpenedConnectionTracker
 from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
 from aws_advanced_python_wrapper.connection_provider import \
@@ -29,6 +31,7 @@ def pytest_runtest_setup(item):
     PluginServiceImpl._host_availability_expiring_cache.clear()
     AsyncPluginServiceImpl._host_availability_expiring_cache.clear()
     DatabaseDialectManager._known_endpoint_dialects.clear()
+    AsyncOpenedConnectionTracker._tracked.clear()
 
     ConnectionProviderManager.reset_provider()
     DatabaseDialectManager.reset_custom_dialect()
