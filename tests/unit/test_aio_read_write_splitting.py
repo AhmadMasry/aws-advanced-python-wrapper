@@ -348,8 +348,8 @@ def test_switch_to_reader_raises_when_strategy_returns_none():
         asyncio.run(_run())
 
 
-def test_switch_to_reader_refuses_mid_transaction():
-    """Mid-txn attempt to go read-only raises ReadWriteSplittingError."""
+def test_switch_to_reader_silently_no_ops_mid_transaction():
+    """Mid-txn reader-swap request is silently skipped (sync parity:243-249)."""
     plugin, svc, hlp, dd, _ = _build()
     dd.is_in_transaction = AsyncMock(return_value=True)
 
@@ -357,19 +357,20 @@ def test_switch_to_reader_refuses_mid_transaction():
         async def _set_ro():
             return None
 
+        # Must NOT raise; must NOT swap
         await plugin.execute(
             MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
             _set_ro, True)
 
-    with pytest.raises(ReadWriteSplittingError):
-        asyncio.run(_run())
+    asyncio.run(_run())
+    assert plugin._reader_conn is None  # no swap happened
 
 
-def test_switch_to_writer_is_allowed_mid_transaction():
-    """Writer swap (read_only=False) doesn't check transaction state."""
+def test_switch_to_writer_refuses_mid_transaction():
+    """Mid-txn writer swap raises ReadWriteSplittingError (sync parity:261-265)."""
     plugin, svc, hlp, dd, _ = _build()
     dd.is_in_transaction = AsyncMock(return_value=True)
-    # Seed reader as current so flipping back to writer is a real swap
+    # Seed a different conn so a real writer swap would be attempted
     writer_conn = MagicMock(name="writer")
     plugin._writer_conn = writer_conn
 
@@ -377,12 +378,13 @@ def test_switch_to_writer_is_allowed_mid_transaction():
         async def _set_ro():
             return None
 
-        # read_only=False -- should NOT raise even in transaction
+        # read_only=False + in_txn -> raise
         await plugin.execute(
             MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
             _set_ro, False)
 
-    asyncio.run(_run())  # no exception
+    with pytest.raises(ReadWriteSplittingError):
+        asyncio.run(_run())
 
 
 def test_switch_to_reader_allowed_when_not_in_transaction():

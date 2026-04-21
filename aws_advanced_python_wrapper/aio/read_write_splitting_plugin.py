@@ -97,13 +97,21 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             return await execute_func()
 
         if read_only:
+            # Sync parity (read_write_splitting_plugin.py:243-249): mid-txn
+            # reader swap silently no-ops; caller's set_read_only(True) still
+            # proceeds on the writer connection. The swap happens only when
+            # safe.
+            if not await driver_dialect.is_in_transaction(current):
+                await self._switch_to_reader(driver_dialect, current)
+        else:
+            # Sync parity (read_write_splitting_plugin.py:261-265): mid-txn
+            # writer swap raises -- the transaction's fate is undefined if we
+            # swap connections underneath it.
             if await driver_dialect.is_in_transaction(current):
                 raise ReadWriteSplittingError(
-                    "Cannot switch to a reader while in a transaction. "
+                    "Cannot switch back to the writer while in a transaction. "
                     "Commit or roll back before setting the connection "
-                    "read-only.")
-            await self._switch_to_reader(driver_dialect, current)
-        else:
+                    "read-write.")
             await self._switch_to_writer(driver_dialect, current)
         return await execute_func()
 
