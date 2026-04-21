@@ -22,14 +22,17 @@ service, status storage) lands in later SPs that need it.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Protocol, Set
+from typing import (TYPE_CHECKING, Any, ClassVar, FrozenSet, Optional,
+                    Protocol, Set)
 
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
+from aws_advanced_python_wrapper.utils.storage.cache_map import CacheMap
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
+    from aws_advanced_python_wrapper.host_availability import HostAvailability
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
 
@@ -80,6 +83,15 @@ class AsyncPluginService(Protocol):
             sql_state: Optional[str] = None) -> bool:
         ...
 
+    def set_availability(
+            self,
+            host_aliases: FrozenSet[str],
+            availability: HostAvailability) -> None:
+        ...
+
+    def get_availability(self, host_url: str) -> Optional[HostAvailability]:
+        ...
+
     @property
     def network_bound_methods(self) -> Set[str]:
         ...
@@ -112,6 +124,9 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     Those land as dedicated sub-projects. The shell is enough for toy plugins
     and for SP-2's ``AsyncAwsWrapperConnection`` to drive initial connect.
     """
+
+    _host_availability_expiring_cache: ClassVar[CacheMap[str, HostAvailability]] = CacheMap()
+    _HOST_AVAILABILITY_EXPIRATION_NANO: ClassVar[int] = 5 * 60 * 1_000_000_000  # 5 min
 
     def __init__(
             self,
@@ -162,6 +177,20 @@ class AsyncPluginServiceImpl(AsyncPluginService):
             sql_state: Optional[str] = None) -> bool:
         return self._exception_manager.is_login_exception(
             self._database_dialect, error=error, sql_state=sql_state)
+
+    def set_availability(
+            self,
+            host_aliases: FrozenSet[str],
+            availability: HostAvailability) -> None:
+        for alias in host_aliases:
+            AsyncPluginServiceImpl._host_availability_expiring_cache.put(
+                alias,
+                availability,
+                AsyncPluginServiceImpl._HOST_AVAILABILITY_EXPIRATION_NANO,
+            )
+
+    def get_availability(self, host_url: str) -> Optional[HostAvailability]:
+        return AsyncPluginServiceImpl._host_availability_expiring_cache.get(host_url)
 
     @property
     def network_bound_methods(self) -> Set[str]:

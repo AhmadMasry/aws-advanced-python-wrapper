@@ -9,6 +9,7 @@ from aws_advanced_python_wrapper.aio.driver_dialect.base import \
 from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
 from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
+from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -57,3 +58,22 @@ def test_is_login_exception_delegates_to_dialect_handler():
     err = Exception("auth failed")
     assert svc.is_login_exception(error=err, sql_state="28000") is True
     handler.is_login_exception.assert_called_once_with(error=err, sql_state="28000")
+
+
+def test_get_availability_returns_none_when_unset():
+    svc = _make_service()
+    assert svc.get_availability("host-1.cluster.example") is None
+
+
+def test_set_then_get_availability():
+    svc = _make_service()
+    svc.set_availability(frozenset({"host-1.cluster.example"}), HostAvailability.UNAVAILABLE)
+    assert svc.get_availability("host-1.cluster.example") == HostAvailability.UNAVAILABLE
+
+
+def test_set_availability_covers_all_aliases():
+    svc = _make_service()
+    aliases = frozenset({"h1.example", "h1-alias.example"})
+    svc.set_availability(aliases, HostAvailability.UNAVAILABLE)
+    for alias in aliases:
+        assert svc.get_availability(alias) == HostAvailability.UNAVAILABLE
