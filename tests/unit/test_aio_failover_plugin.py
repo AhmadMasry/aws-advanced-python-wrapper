@@ -267,9 +267,10 @@ def test_should_failover_uses_plugin_service_is_network_exception():
     plugin, svc, *_ = _build_plugin()
     svc.is_network_exception = MagicMock(return_value=True)
     svc.is_read_only_connection_exception = MagicMock(return_value=False)
+    exc = Exception("arbitrary")
 
-    assert plugin._should_failover(Exception("arbitrary")) is True
-    svc.is_network_exception.assert_called_once()
+    assert plugin._should_failover(exc) is True
+    svc.is_network_exception.assert_called_once_with(error=exc)
 
 
 def test_should_failover_returns_false_when_dialect_classifies_not_network():

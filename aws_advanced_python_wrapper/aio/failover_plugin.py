@@ -27,7 +27,8 @@ Shares the sync failover plugin's connection properties
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, NoReturn,
+                    Optional, Set)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import (
@@ -134,7 +135,7 @@ class AsyncFailoverPlugin(AsyncPlugin):
                 and self._plugin_service.is_read_only_connection_exception(error=exc))
 
     async def _raise_failover_success_or_txn_unknown(
-            self, original_exc: Exception) -> None:
+            self, original_exc: Exception) -> NoReturn:
         """Signal successful failover with the right exception type.
 
         Mirrors sync v2 _throw_failover_success_exception at

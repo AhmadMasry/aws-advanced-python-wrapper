@@ -223,7 +223,7 @@ def test_federated_plugin_raises_when_saml_missing_from_html():
 # ---- Okta plugin -------------------------------------------------------
 
 
-def test_okta_plugin_subscribed_is_connect_only():
+def test_okta_plugin_subscribes_to_connect_and_force_connect():
     p = AsyncOktaAuthPlugin(_svc(_okta_props()), _okta_props())
     assert p.subscribed_methods == {
         DbApiMethod.CONNECT.method_name,

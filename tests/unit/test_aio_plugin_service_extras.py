@@ -1,4 +1,3 @@
-# tests/unit/test_aio_plugin_service_expansion.py
 from __future__ import annotations
 
 import asyncio
