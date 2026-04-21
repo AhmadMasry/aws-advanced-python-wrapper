@@ -22,7 +22,7 @@ service, status storage) lands in later SPs that need it.
 
 from __future__ import annotations
 
-from typing import (TYPE_CHECKING, Any, ClassVar, FrozenSet, Optional,
+from typing import (TYPE_CHECKING, Any, ClassVar, FrozenSet, List, Optional,
                     Protocol, Set)
 
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
@@ -31,9 +31,11 @@ from aws_advanced_python_wrapper.utils.storage.cache_map import CacheMap
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
+    from aws_advanced_python_wrapper.aio.plugin_manager import \
+        AsyncPluginManager
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
     from aws_advanced_python_wrapper.host_availability import HostAvailability
-    from aws_advanced_python_wrapper.hostinfo import HostInfo
+    from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -93,6 +95,24 @@ class AsyncPluginService(Protocol):
         ...
 
     @property
+    def plugin_manager(self) -> Optional[AsyncPluginManager]:
+        ...
+
+    @plugin_manager.setter
+    def plugin_manager(self, value: AsyncPluginManager) -> None:
+        ...
+
+    def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
+        ...
+
+    def get_host_info_by_strategy(
+            self,
+            role: HostRole,
+            strategy: str,
+            host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        ...
+
+    @property
     def network_bound_methods(self) -> Set[str]:
         ...
 
@@ -137,6 +157,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._driver_dialect: AsyncDriverDialect = driver_dialect
         self._database_dialect: Optional[DatabaseDialect] = None
         self._exception_manager: ExceptionManager = ExceptionManager()
+        self._plugin_manager: Optional[AsyncPluginManager] = None
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
 
@@ -191,6 +212,28 @@ class AsyncPluginServiceImpl(AsyncPluginService):
 
     def get_availability(self, host_url: str) -> Optional[HostAvailability]:
         return AsyncPluginServiceImpl._host_availability_expiring_cache.get(host_url)
+
+    @property
+    def plugin_manager(self) -> Optional[AsyncPluginManager]:
+        return self._plugin_manager
+
+    @plugin_manager.setter
+    def plugin_manager(self, value: AsyncPluginManager) -> None:
+        self._plugin_manager = value
+
+    def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
+        if self._plugin_manager is None:
+            return False
+        return self._plugin_manager.accepts_strategy(role, strategy)
+
+    def get_host_info_by_strategy(
+            self,
+            role: HostRole,
+            strategy: str,
+            host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        if self._plugin_manager is None:
+            return None
+        return self._plugin_manager.get_host_info_by_strategy(role, strategy, host_list)
 
     @property
     def network_bound_methods(self) -> Set[str]:

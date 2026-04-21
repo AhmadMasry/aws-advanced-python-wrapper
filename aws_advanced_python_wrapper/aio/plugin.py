@@ -22,8 +22,8 @@ on one class.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, Protocol,
-                    Set, Tuple)
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List,
+                    Optional, Protocol, Set, Tuple)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -76,6 +76,18 @@ class AsyncPlugin(ABC):
 
     def notify_host_list_changed(self, changes: Dict[str, Set[HostEvent]]) -> None:
         return
+
+    def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
+        """Default: this plugin does not support any strategy."""
+        return False
+
+    def get_host_info_by_strategy(
+            self,
+            role: HostRole,
+            strategy: str,
+            host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        """Default: this plugin does not participate in strategy-based selection."""
+        return None
 
 
 class AsyncConnectionProvider(Protocol):

@@ -4,12 +4,15 @@ from __future__ import annotations
 from typing import Optional
 from unittest.mock import MagicMock
 
+from aws_advanced_python_wrapper.aio.default_plugin import AsyncDefaultPlugin
 from aws_advanced_python_wrapper.aio.driver_dialect.base import \
     AsyncDriverDialect
+from aws_advanced_python_wrapper.aio.plugin_manager import AsyncPluginManager
 from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
 from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
 from aws_advanced_python_wrapper.host_availability import HostAvailability
+from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -77,3 +80,36 @@ def test_set_availability_covers_all_aliases():
     svc.set_availability(aliases, HostAvailability.UNAVAILABLE)
     for alias in aliases:
         assert svc.get_availability(alias) == HostAvailability.UNAVAILABLE
+
+
+def test_default_plugin_accepts_random_strategy():
+    plugin = AsyncDefaultPlugin()
+    assert plugin.accepts_strategy(HostRole.READER, "random") is True
+
+
+def test_default_plugin_rejects_unknown_strategy():
+    plugin = AsyncDefaultPlugin()
+    assert plugin.accepts_strategy(HostRole.READER, "bogus_strategy") is False
+
+
+def test_default_plugin_get_host_info_by_strategy_returns_matching_role():
+    plugin = AsyncDefaultPlugin()
+    reader = HostInfo(host="reader-1", port=5432, role=HostRole.READER)
+    writer = HostInfo(host="writer-1", port=5432, role=HostRole.WRITER)
+    chosen = plugin.get_host_info_by_strategy(
+        HostRole.READER, "random", [reader, writer]
+    )
+    assert chosen is reader
+
+
+def test_plugin_service_delegates_strategy_through_manager():
+    driver_dialect = MagicMock(spec=AsyncDriverDialect)
+    driver_dialect.network_bound_methods = set()
+    svc = AsyncPluginServiceImpl(Properties(), driver_dialect)
+    # NOTE: 3-arg signature (svc, props, plugins). AsyncPluginManager auto-appends AsyncDefaultPlugin.
+    manager = AsyncPluginManager(svc, Properties(), [])
+    svc.plugin_manager = manager
+    assert svc.accepts_strategy(HostRole.READER, "random") is True
+    reader = HostInfo(host="reader-1", port=5432, role=HostRole.READER)
+    got = svc.get_host_info_by_strategy(HostRole.READER, "random", [reader])
+    assert got is reader

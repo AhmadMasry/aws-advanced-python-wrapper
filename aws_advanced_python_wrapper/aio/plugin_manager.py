@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
     from aws_advanced_python_wrapper.aio.plugin_service import \
         AsyncPluginService
-    from aws_advanced_python_wrapper.hostinfo import HostInfo
+    from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -127,6 +127,23 @@ class AsyncPluginManager:
             plugin_to_skip=None,
             terminal_call=target_driver_func,
         )
+
+    def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
+        for plugin in self._plugins:
+            if plugin.accepts_strategy(role, strategy):
+                return True
+        return False
+
+    def get_host_info_by_strategy(
+            self,
+            role: HostRole,
+            strategy: str,
+            host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        for plugin in self._plugins:
+            host = plugin.get_host_info_by_strategy(role, strategy, host_list)
+            if host is not None:
+                return host
+        return None
 
     # ------------------------------------------------------------------
     # Pipeline mechanics

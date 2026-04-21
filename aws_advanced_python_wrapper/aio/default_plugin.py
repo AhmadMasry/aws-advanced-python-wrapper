@@ -21,9 +21,12 @@ driver func.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Set
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
+from aws_advanced_python_wrapper.connection_provider import \
+    DriverConnectionProvider
+from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 
 if TYPE_CHECKING:
@@ -35,6 +38,8 @@ if TYPE_CHECKING:
 
 class AsyncDefaultPlugin(AsyncPlugin):
     """Terminal plugin. Always last in the pipeline; drives the raw driver call."""
+
+    _SELECTORS = DriverConnectionProvider._accepted_strategies  # reuse sync's 4-selector dict
 
     @property
     def subscribed_methods(self) -> Set[str]:
@@ -71,3 +76,18 @@ class AsyncDefaultPlugin(AsyncPlugin):
             *args: Any,
             **kwargs: Any) -> Any:
         return await execute_func()
+
+    def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
+        if role == HostRole.UNKNOWN:
+            return False
+        return strategy in self._SELECTORS
+
+    def get_host_info_by_strategy(
+            self,
+            role: HostRole,
+            strategy: str,
+            host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        selector = self._SELECTORS.get(strategy)
+        if selector is None or host_list is None:
+            return None
+        return selector.get_host(tuple(host_list), role)
