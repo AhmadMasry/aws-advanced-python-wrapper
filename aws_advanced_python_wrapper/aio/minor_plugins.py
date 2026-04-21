@@ -20,8 +20,10 @@ Async counterparts for the sync "minor plugins":
 * :class:`AsyncExecuteTimePlugin` -- records time spent in execute()
 * :class:`AsyncDeveloperPlugin` -- optionally injects an exception into
   the pipeline on the next call; used for testing.
-* :class:`AsyncAuroraConnectionTrackerPlugin` -- records the current
-  writer instance id so failover knows who we were connected to.
+* :class:`AsyncAuroraConnectionTrackerPlugin` -- real tracker + writer-change
+  invalidation. Lives in its own module
+  (:mod:`aws_advanced_python_wrapper.aio.aurora_connection_tracker`); re-exported
+  here so existing imports keep working.
 * :class:`AsyncCustomEndpointPlugin` -- pass-through stub; full custom
   endpoint monitoring lands in its own SP.
 
@@ -33,14 +35,16 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
 
+# Re-export: moved to its own module in Phase D.1. Keeping the import path stable
+# so downstream users and the plugin factory don't care where the class lives.
+from aws_advanced_python_wrapper.aio.aurora_connection_tracker import \
+    AsyncAuroraConnectionTrackerPlugin  # noqa: F401
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
-    from aws_advanced_python_wrapper.aio.plugin_service import \
-        AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
 
@@ -152,44 +156,6 @@ class AsyncDeveloperPlugin(AsyncPlugin):
             self._next_exception = None
             raise exc
         return await execute_func()
-
-
-class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
-    """Record the id of the writer we were last connected to.
-
-    Lets failover know who the previous writer was so it can avoid
-    reconnecting to the same instance.
-    """
-
-    _SUBSCRIBED: Set[str] = {DbApiMethod.CONNECT.method_name}
-
-    def __init__(self, plugin_service: AsyncPluginService) -> None:
-        self._plugin_service = plugin_service
-        self._last_known_writer_host: Optional[str] = None
-
-    @property
-    def last_known_writer_host(self) -> Optional[str]:
-        return self._last_known_writer_host
-
-    @property
-    def subscribed_methods(self) -> Set[str]:
-        return set(self._SUBSCRIBED)
-
-    async def connect(
-            self,
-            target_driver_func: Callable,
-            driver_dialect: AsyncDriverDialect,
-            host_info: HostInfo,
-            props: Properties,
-            is_initial_connection: bool,
-            connect_func: Callable[..., Awaitable[Any]]) -> Any:
-        conn = await connect_func()
-        # The plugin service's current_host_info reflects which host we just
-        # connected to; stash it for future failover attempts.
-        current = self._plugin_service.current_host_info
-        if current is not None:
-            self._last_known_writer_host = current.host
-        return conn
 
 
 class AsyncCustomEndpointPlugin(AsyncPlugin):

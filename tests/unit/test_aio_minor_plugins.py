@@ -22,10 +22,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from aws_advanced_python_wrapper.aio.minor_plugins import (
-    AsyncAuroraConnectionTrackerPlugin, AsyncConnectTimePlugin,
-    AsyncCustomEndpointPlugin, AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
-from aws_advanced_python_wrapper.aio.plugin_service import \
-    AsyncPluginServiceImpl
+    AsyncConnectTimePlugin, AsyncCustomEndpointPlugin, AsyncDeveloperPlugin,
+    AsyncExecuteTimePlugin)
 from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import Properties
@@ -121,36 +119,6 @@ def test_developer_plugin_pass_through_when_no_injection():
         assert await p.execute(object(), "Cursor.execute", _work) == 42
 
     asyncio.run(_body())
-
-
-def test_aurora_connection_tracker_records_writer_host_on_connect():
-    async def _body() -> None:
-        svc = AsyncPluginServiceImpl(
-            Properties({"host": "writer.example", "port": "5432"}),
-            MagicMock(),
-            HostInfo(host="writer.example", port=5432),
-        )
-        p = AsyncAuroraConnectionTrackerPlugin(svc)
-
-        async def _connect() -> object:
-            return MagicMock()
-
-        await p.connect(
-            target_driver_func=lambda: None,
-            driver_dialect=MagicMock(),
-            host_info=HostInfo(host="writer.example", port=5432),
-            props=Properties({}),
-            is_initial_connection=True,
-            connect_func=_connect,
-        )
-        assert p.last_known_writer_host == "writer.example"
-
-    asyncio.run(_body())
-
-
-def test_aurora_connection_tracker_subscription_is_connect_only():
-    p = AsyncAuroraConnectionTrackerPlugin(MagicMock())
-    assert p.subscribed_methods == {DbApiMethod.CONNECT.method_name}
 
 
 def test_custom_endpoint_plugin_is_stub():

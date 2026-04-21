@@ -25,6 +25,8 @@ from __future__ import annotations
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List,
                     Optional, Protocol, Type)
 
+from aws_advanced_python_wrapper.aio.aurora_connection_tracker import \
+    AsyncAuroraConnectionTrackerPlugin
 from aws_advanced_python_wrapper.aio.auth_plugins import (
     AsyncAwsSecretsManagerPlugin, AsyncIamAuthPlugin)
 from aws_advanced_python_wrapper.aio.custom_endpoint_monitor import \
@@ -35,8 +37,7 @@ from aws_advanced_python_wrapper.aio.federated_auth_plugins import (
 from aws_advanced_python_wrapper.aio.host_monitoring_plugin import \
     AsyncHostMonitoringPlugin
 from aws_advanced_python_wrapper.aio.minor_plugins import (
-    AsyncAuroraConnectionTrackerPlugin, AsyncConnectTimePlugin,
-    AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
+    AsyncConnectTimePlugin, AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
 from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
     AsyncReadWriteSplittingPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
