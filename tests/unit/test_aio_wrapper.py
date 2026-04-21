@@ -410,3 +410,198 @@ def test_connect_populates_plugin_service_slots():
     assert svc.plugin_manager is not None
     assert svc.initial_connection_host_info is not None
     assert svc.initial_connection_host_info.host == "localhost"
+
+
+# ---- Phase I.1: Cursor PEP 249 surface ---------------------------------
+
+
+def _make_wrapper_and_cursor() -> tuple:
+    """Build a wrapper connection + cursor backed by mocks, returning
+    ``(wrapper, cursor, mock_target_cursor)`` so tests can assert the
+    mock was called."""
+    raw_conn = _make_mock_async_conn()
+    target_cur = _make_mock_async_cursor()
+    raw_conn.cursor = MagicMock(return_value=target_cur)
+
+    async def _body() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+        )
+
+    wrapper = asyncio.run(_body())
+    cur = wrapper.cursor()
+    return wrapper, cur, target_cur
+
+
+def test_cursor_lastrowid_passthrough():
+    _, cur, target_cur = _make_wrapper_and_cursor()
+    target_cur.lastrowid = 42
+    assert cur.lastrowid == 42
+
+
+def test_cursor_scroll_sync_target_calls_through():
+    _, cur, target_cur = _make_wrapper_and_cursor()
+    # Sync scroll returns None (not a coroutine). The wrapper should still
+    # await the pipeline and return the sync value.
+    target_cur.scroll = MagicMock(return_value=None)
+
+    async def _body() -> Any:
+        return await cur.scroll(5, "relative")
+
+    result = asyncio.run(_body())
+    assert result is None
+    target_cur.scroll.assert_called_once_with(5, "relative")
+
+
+def test_cursor_scroll_async_target_awaits_coroutine():
+    _, cur, target_cur = _make_wrapper_and_cursor()
+    # Target's scroll is async -- wrapper must await the coroutine it
+    # returns rather than treating it as the final value.
+    target_cur.scroll = AsyncMock(return_value="scrolled")
+
+    async def _body() -> Any:
+        return await cur.scroll(3, "absolute")
+
+    result = asyncio.run(_body())
+    assert result == "scrolled"
+    target_cur.scroll.assert_awaited_once_with(3, "absolute")
+
+
+def test_cursor_callproc_calls_through():
+    _, cur, target_cur = _make_wrapper_and_cursor()
+    target_cur.callproc = MagicMock(return_value=(1, 2))
+
+    async def _body() -> Any:
+        return await cur.callproc("sp", (1, 2))
+
+    result = asyncio.run(_body())
+    assert result == (1, 2)
+    target_cur.callproc.assert_called_once_with("sp", (1, 2))
+
+
+def test_cursor_nextset_calls_through():
+    _, cur, target_cur = _make_wrapper_and_cursor()
+    target_cur.nextset = MagicMock(return_value=True)
+
+    async def _body() -> Any:
+        return await cur.nextset()
+
+    result = asyncio.run(_body())
+    assert result is True
+    target_cur.nextset.assert_called_once_with()
+
+
+def test_cursor_setinputsizes_is_sync_passthrough():
+    _, cur, target_cur = _make_wrapper_and_cursor()
+    target_cur.setinputsizes = MagicMock()
+    # Sync method -- no await, just direct call on the wrapper.
+    cur.setinputsizes([10, 20, 30])
+    target_cur.setinputsizes.assert_called_once_with([10, 20, 30])
+
+
+def test_cursor_setoutputsize_is_sync_passthrough():
+    _, cur, target_cur = _make_wrapper_and_cursor()
+    target_cur.setoutputsize = MagicMock()
+    cur.setoutputsize(100, 0)
+    target_cur.setoutputsize.assert_called_once_with(100, 0)
+
+
+# ---- Phase I.2: Connection autocommit + isolation_level -----------------
+
+
+def test_connection_autocommit_property_reads_from_driver_dialect():
+    """The autocommit getter should delegate to
+    ``plugin_service.driver_dialect.get_autocommit``, passing the raw
+    target connection."""
+    raw_conn = _make_mock_async_conn()
+
+    async def _body() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+        )
+
+    wrapper = asyncio.run(_body())
+    # Swap in a mock dialect whose get_autocommit returns a sentinel so
+    # we can assert both the delegation and the argument.
+    fake_dialect = MagicMock()
+    fake_dialect.get_autocommit = MagicMock(return_value="sentinel")
+    wrapper._plugin_service._driver_dialect = fake_dialect
+    assert wrapper.autocommit == "sentinel"
+    fake_dialect.get_autocommit.assert_called_once_with(raw_conn)
+
+
+def test_connection_set_autocommit_awaits_driver_dialect():
+    raw_conn = _make_mock_async_conn()
+
+    async def _body() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+        )
+
+    wrapper = asyncio.run(_body())
+    fake_dialect = MagicMock()
+    fake_dialect.set_autocommit = AsyncMock()
+    wrapper._plugin_service._driver_dialect = fake_dialect
+
+    async def _set() -> None:
+        await wrapper.set_autocommit(True)
+
+    asyncio.run(_set())
+    fake_dialect.set_autocommit.assert_awaited_once_with(raw_conn, True)
+
+
+def test_connection_isolation_level_roundtrip():
+    """``isolation_level`` getter reads the target's attribute; setter
+    delegates to the target's ``set_isolation_level`` if present, else
+    falls back to attribute assignment."""
+    raw_conn = _make_mock_async_conn()
+    raw_conn.isolation_level = "READ COMMITTED"
+
+    async def _body() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+        )
+
+    wrapper = asyncio.run(_body())
+    assert wrapper.isolation_level == "READ COMMITTED"
+
+    # Case 1: target exposes async set_isolation_level -- must be awaited.
+    raw_conn.set_isolation_level = AsyncMock()
+
+    async def _set_async() -> None:
+        await wrapper.set_isolation_level("SERIALIZABLE")
+
+    asyncio.run(_set_async())
+    raw_conn.set_isolation_level.assert_awaited_once_with("SERIALIZABLE")
+
+    # Case 2: target has no set_isolation_level -- wrapper falls back to
+    # attribute assignment.
+    raw_conn2 = _make_mock_async_conn()
+    # MagicMock auto-creates attrs, so we need a spec'd mock that raises
+    # AttributeError for set_isolation_level to force the fallback path.
+    raw_conn2 = MagicMock(spec=["close", "commit", "rollback", "cursor",
+                                "autocommit", "isolation_level"])
+    raw_conn2.close = AsyncMock()
+    raw_conn2.commit = AsyncMock()
+    raw_conn2.rollback = AsyncMock()
+    raw_conn2.autocommit = True
+    raw_conn2.isolation_level = None
+    raw_conn2.cursor = MagicMock(return_value=_make_mock_async_cursor())
+
+    async def _body2() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn2),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+        )
+
+    wrapper2 = asyncio.run(_body2())
+
+    async def _set_fallback() -> None:
+        await wrapper2.set_isolation_level("REPEATABLE READ")
+
+    asyncio.run(_set_fallback())
+    assert raw_conn2.isolation_level == "REPEATABLE READ"

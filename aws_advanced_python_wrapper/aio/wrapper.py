@@ -22,6 +22,7 @@ intercept it.
 
 from __future__ import annotations
 
+import asyncio
 from typing import (TYPE_CHECKING, Any, Callable, List, Optional, Sequence,
                     Type, Union)
 
@@ -127,6 +128,10 @@ class AsyncAwsWrapperCursor:
     def arraysize(self, value: int) -> None:
         self._target_cursor.arraysize = value
 
+    @property
+    def lastrowid(self) -> Any:
+        return self._target_cursor.lastrowid
+
     async def execute(
             self,
             query: Any,
@@ -190,6 +195,64 @@ class AsyncAwsWrapperCursor:
             self, DbApiMethod.CURSOR_CLOSE, _call,
         )
 
+    async def scroll(self, value: int, mode: str = "relative") -> Any:
+        """Advance/rewind the cursor (PEP 249 optional extension).
+
+        Sync drivers expose ``scroll`` as sync; async drivers may make it
+        a coroutine. We probe the return value and await only when needed
+        so the same wrapper method works for both shapes.
+        """
+        async def _call() -> Any:
+            result = self._target_cursor.scroll(value, mode)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        return await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_SCROLL, _call, value, mode,
+        )
+
+    async def callproc(self, procname: str, args: Any = ()) -> Any:
+        """Call a stored procedure (PEP 249 optional extension).
+
+        Like :meth:`scroll`, probes the target's return value and awaits
+        only if the driver made ``callproc`` async.
+        """
+        async def _call() -> Any:
+            result = self._target_cursor.callproc(procname, args)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        return await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_CALLPROC, _call, procname, args,
+        )
+
+    async def nextset(self) -> Optional[bool]:
+        """Advance to the next result set (PEP 249).
+
+        Probes the target's return value and awaits only if async.
+        """
+        async def _call() -> Any:
+            result = self._target_cursor.nextset()
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        return await self._conn._plugin_manager.execute(
+            self, DbApiMethod.CURSOR_NEXTSET, _call,
+        )
+
+    def setinputsizes(self, sizes: Any) -> None:
+        """PEP 249 input-size hint. Pass-through to target cursor (sync,
+        no network I/O worth intercepting)."""
+        self._target_cursor.setinputsizes(sizes)
+
+    def setoutputsize(self, size: int, column: Optional[int] = None) -> None:
+        """PEP 249 output-size hint. Pass-through to target cursor (sync,
+        no network I/O worth intercepting)."""
+        self._target_cursor.setoutputsize(size, column)
+
     async def __aenter__(self) -> AsyncAwsWrapperCursor:
         return self
 
@@ -227,6 +290,61 @@ class AsyncAwsWrapperConnection:
     def target_connection(self) -> Any:
         """The underlying driver async connection."""
         return self._target_conn
+
+    @property
+    def autocommit(self) -> Any:
+        """Current autocommit setting, read from the driver dialect.
+
+        This is the getter half of an async-aware autocommit API. The
+        setter is spelled :meth:`set_autocommit` (a coroutine) rather
+        than an ``@autocommit.setter`` because property setters cannot
+        be ``async``. Routing stays at the driver-dialect layer because
+        autocommit is session state -- the plugin pipeline doesn't
+        intercept it on the sync side either.
+
+        Return type is :class:`typing.Any` rather than ``bool`` because
+        :meth:`AsyncDriverDialect.get_autocommit` is itself async -- callers
+        may need to ``await`` the returned coroutine. Sync dialects (or
+        mocked dialects in tests) may return ``bool`` directly; the runtime
+        value is whatever the dialect hands back.
+        """
+        return self._plugin_service.driver_dialect.get_autocommit(self._target_conn)
+
+    async def set_autocommit(self, value: bool) -> None:
+        """Set autocommit on the underlying driver connection.
+
+        Awaited counterpart of the :attr:`autocommit` getter. See that
+        docstring for the reason this isn't an ``@autocommit.setter``.
+        """
+        await self._plugin_service.driver_dialect.set_autocommit(self._target_conn, value)
+
+    @property
+    def isolation_level(self) -> Any:
+        """Current isolation level, read directly from the driver connection.
+
+        Drivers vary in how they model isolation level (psycopg exposes
+        it as an attribute; mysql drivers typically don't). We return
+        whatever the target exposes, or ``None`` if the driver doesn't
+        surface it.
+        """
+        return getattr(self._target_conn, "isolation_level", None)
+
+    async def set_isolation_level(self, level: Any) -> None:
+        """Set isolation level on the underlying driver connection.
+
+        Drivers vary (psycopg uses an enum; mysql uses a SQL string).
+        Delegates to the raw connection's ``set_isolation_level`` if
+        present (awaiting if async), else assigns the attribute.
+        """
+        target = self._target_conn
+        setter = getattr(target, "set_isolation_level", None)
+        if setter is not None:
+            result = setter(level)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        # Fallback: attribute assignment.
+        target.isolation_level = level
 
     @staticmethod
     async def connect(
