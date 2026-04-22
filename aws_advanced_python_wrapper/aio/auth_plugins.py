@@ -169,6 +169,9 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
             props: Properties) -> None:
         super().__init__(plugin_service, props)
         self._token_cache: Dict[str, Tuple[str, float]] = {}
+        # Telemetry counter -- matches sync iam_plugin.py:62.
+        tf = self._plugin_service.get_telemetry_factory()
+        self._fetch_token_counter = tf.create_counter("iam.fetch_token.count")
 
     def _default_port(self) -> int:
         dialect = self._plugin_service.database_dialect
@@ -239,6 +242,8 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
             if now < expires_at - self._TOKEN_REGEN_GRACE_SEC:
                 return user, token, True
 
+        if self._fetch_token_counter is not None:
+            self._fetch_token_counter.inc()
         token = await asyncio.to_thread(
             self._generate_token_blocking, host, int(port), user, region
         )
@@ -312,6 +317,10 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
         self._secret_cache: Dict[
             Tuple[str, Optional[str]],
             Tuple[Optional[str], Optional[str], float]] = {}
+        # Telemetry counter -- matches sync aws_secrets_manager_plugin.py:89.
+        tf = self._plugin_service.get_telemetry_factory()
+        self._fetch_secret_counter = tf.create_counter(
+            "secrets_manager.fetch_credentials.count")
 
     async def _resolve_credentials(
             self,
@@ -345,6 +354,8 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
             if now < expires_at:
                 return user, password, True
 
+        if self._fetch_secret_counter is not None:
+            self._fetch_secret_counter.inc()
         secret = await asyncio.to_thread(
             self._fetch_secret_blocking, secret_id, region, endpoint
         )

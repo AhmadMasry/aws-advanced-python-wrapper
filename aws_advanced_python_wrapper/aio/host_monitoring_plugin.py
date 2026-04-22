@@ -100,6 +100,13 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         self._monitored_aliases: FrozenSet[str] = frozenset()
         self._host_unavailable: bool = False
 
+        # Telemetry counter -- matches sync host_monitoring_plugin.py:592
+        # (emitted when the monitor aborts a connection after the failure
+        # threshold is reached).
+        tf = self._plugin_service.get_telemetry_factory()
+        self._aborted_connections_counter = tf.create_counter(
+            "efm.aborted_connections.count")
+
         register_shutdown_hook(self._shutdown)
 
     @property
@@ -214,6 +221,8 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         except Exception:  # noqa: BLE001 - abort is best-effort (socket may be dead)
             pass
         self._host_unavailable = True
+        if self._aborted_connections_counter is not None:
+            self._aborted_connections_counter.inc()
 
     def notify_connection_changed(
             self, changes: Set[ConnectionEvent]) -> None:

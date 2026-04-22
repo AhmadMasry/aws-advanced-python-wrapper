@@ -455,3 +455,46 @@ def test_federated_port_falls_back_to_database_dialect_default():
     from aws_advanced_python_wrapper.utils.iam_utils import IamAuthUtils
     port = IamAuthUtils.get_port(props, host, plugin._default_port())
     assert port == 3306
+
+
+# ---- Telemetry counters ------------------------------------------------
+
+
+def test_federated_plugin_emits_fetch_token_counter_on_fresh_token():
+    """federated.fetch_token.count increments when we generate a new RDS
+    IAM token (cache miss). Cache hits skip the counter."""
+    props = _federated_props()
+
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+
+    svc = AsyncPluginServiceImpl(
+        props, MagicMock(), HostInfo("rds.example", 5432))
+    svc.set_telemetry_factory(fake_tf)
+    plugin = AsyncFederatedAuthPlugin(svc, props)
+
+    with patch.object(
+            AsyncFederatedAuthPlugin, "_fetch_saml_assertion",
+            new=AsyncMock(return_value=_FAKE_SAML),
+    ), patch.object(
+            AsyncFederatedAuthPlugin, "_sts_assume_role_with_saml_blocking",
+            return_value=_FAKE_CREDS,
+    ), patch.object(
+            AsyncFederatedAuthPlugin, "_generate_rds_token_blocking",
+            return_value="iam-token-xyz",
+    ):
+        # First call: cache miss -> counter inc.
+        asyncio.run(plugin._resolve_credentials(
+            HostInfo("rds.example", 5432), props))
+        assert fake_counters["federated.fetch_token.count"].inc.call_count == 1
+        # Second call: cache hit -> counter unchanged.
+        asyncio.run(plugin._resolve_credentials(
+            HostInfo("rds.example", 5432), props))
+        assert fake_counters["federated.fetch_token.count"].inc.call_count == 1

@@ -183,6 +183,13 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
         self._current_writer: Optional[HostInfo] = None
         self._pending_invalidations: Set[asyncio.Task] = set()
 
+        # Telemetry counter -- the sync tracker plugin doesn't emit this,
+        # but writer-change detection is a hot path in pooled async apps
+        # so we track it here for parity with the broader counter story.
+        tf = self._plugin_service.get_telemetry_factory()
+        self._writer_changes_counter = tf.create_counter(
+            "aurora_connection_tracker.writer_changes.count")
+
         register_shutdown_hook(self._shutdown)
 
     @property
@@ -237,6 +244,8 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
             return
         old_writer = self._current_writer
         self._current_writer = writer
+        if self._writer_changes_counter is not None:
+            self._writer_changes_counter.inc()
         self._spawn_invalidation(old_writer)
 
     def _current_writer_from_hosts(self) -> Optional[HostInfo]:

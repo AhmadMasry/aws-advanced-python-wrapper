@@ -664,3 +664,80 @@ def test_secrets_plugin_resolve_credentials_returns_was_cached_flag():
         _, _, was2 = asyncio.run(plugin._resolve_credentials(host, props))
     assert was1 is False
     assert was2 is True
+
+
+# ---- Telemetry counters ------------------------------------------------
+
+
+def _svc_with_counters(props: Properties):
+    """Build an AsyncPluginServiceImpl with a MagicMock telemetry factory.
+
+    Returns (svc, counters) where counters is a dict of name -> MagicMock.
+    """
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+
+    svc = AsyncPluginServiceImpl(props, MagicMock(), HostInfo(host="h", port=5432))
+    svc.set_telemetry_factory(fake_tf)
+    return svc, fake_counters
+
+
+def test_iam_plugin_emits_fetch_token_counter_on_fresh_token():
+    props = Properties({
+        "host": "inst.abc123.us-east-1.rds.amazonaws.com", "port": "5432",
+        "user": "db_user", "iam_region": "us-east-1",
+    })
+    svc, counters = _svc_with_counters(props)
+    plugin = AsyncIamAuthPlugin(svc, props)
+
+    with patch.object(AsyncIamAuthPlugin, "_generate_token_blocking",
+                      return_value="iam-token-abc"):
+        asyncio.run(plugin._resolve_credentials(
+            HostInfo(host="inst.abc123.us-east-1.rds.amazonaws.com", port=5432),
+            props,
+        ))
+
+    assert counters["iam.fetch_token.count"].inc.called
+
+
+def test_iam_plugin_does_not_emit_counter_on_cache_hit():
+    props = Properties({
+        "host": "inst.abc123.us-east-1.rds.amazonaws.com", "port": "5432",
+        "user": "db_user", "iam_region": "us-east-1",
+    })
+    svc, counters = _svc_with_counters(props)
+    plugin = AsyncIamAuthPlugin(svc, props)
+    host = HostInfo(host="inst.abc123.us-east-1.rds.amazonaws.com", port=5432)
+
+    with patch.object(AsyncIamAuthPlugin, "_generate_token_blocking",
+                      return_value="iam-token-abc"):
+        asyncio.run(plugin._resolve_credentials(host, props))
+        # First call generated -> counter should be 1.
+        assert counters["iam.fetch_token.count"].inc.call_count == 1
+        asyncio.run(plugin._resolve_credentials(host, props))
+        # Second call hits cache -> counter should still be 1.
+        assert counters["iam.fetch_token.count"].inc.call_count == 1
+
+
+def test_secrets_plugin_emits_fetch_credentials_counter_on_fresh_secret():
+    props = Properties({
+        "host": "h", "port": "5432",
+        "secrets_manager_secret_id": "my-secret",
+        "secrets_manager_region": "us-east-1",
+    })
+    svc, counters = _svc_with_counters(props)
+    plugin = AsyncAwsSecretsManagerPlugin(svc, props)
+
+    with patch.object(AsyncAwsSecretsManagerPlugin, "_fetch_secret_blocking",
+                      return_value={"username": "u", "password": "p"}):
+        asyncio.run(plugin._resolve_credentials(
+            HostInfo(host="h", port=5432), props))
+
+    assert counters["secrets_manager.fetch_credentials.count"].inc.called

@@ -478,3 +478,43 @@ def test_shutdown_hook_clears_monitor_task():
 
     asyncio.run(_run())
     assert plugin._monitor_task is None
+
+
+# ---- Telemetry counters ------------------------------------------------
+
+
+def test_mark_host_unavailable_emits_aborted_connections_counter():
+    """When the monitor aborts a connection the efm counter ticks."""
+    props = Properties({
+        "host": "h.example", "port": "5432",
+        "failure_detection_enabled": "true",
+        "failure_detection_time_ms": "10",
+        "failure_detection_interval_ms": "10",
+        "failure_detection_count": "2",
+    })
+    driver_dialect = MagicMock()
+    driver_dialect.ping = AsyncMock(return_value=False)
+    driver_dialect.abort_connection = AsyncMock()
+
+    svc = AsyncPluginServiceImpl(
+        props, driver_dialect, HostInfo(host="h.example", port=5432))
+    svc._current_connection = MagicMock(name="conn")
+
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+    svc.set_telemetry_factory(fake_tf)
+
+    plugin = AsyncHostMonitoringPlugin(svc, props)
+    # Drive _mark_host_unavailable directly -- avoids racing the monitor
+    # loop in-test.
+    asyncio.run(plugin._mark_host_unavailable(
+        MagicMock(name="conn"), driver_dialect))
+
+    assert fake_counters["efm.aborted_connections.count"].inc.called

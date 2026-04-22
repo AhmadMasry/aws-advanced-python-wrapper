@@ -79,6 +79,24 @@ class AsyncFailoverPlugin(AsyncPlugin):
         self._failover_timeout_sec = float(timeout) if timeout is not None else 300.0
         self._mode = self._determine_mode(props)
 
+        # Telemetry counters -- match sync failover_plugin.py:103-113.
+        # NullTelemetryFactory returns a no-op counter object, but real
+        # factories may return None, so every .inc() guards with an
+        # ``is not None`` check (mirrors sync conventions).
+        tf = self._plugin_service.get_telemetry_factory()
+        self._failover_writer_triggered = tf.create_counter(
+            "writer_failover.triggered.count")
+        self._failover_writer_completed = tf.create_counter(
+            "writer_failover.completed.success.count")
+        self._failover_writer_failed = tf.create_counter(
+            "writer_failover.completed.failed.count")
+        self._failover_reader_triggered = tf.create_counter(
+            "reader_failover.triggered.count")
+        self._failover_reader_completed = tf.create_counter(
+            "reader_failover.completed.success.count")
+        self._failover_reader_failed = tf.create_counter(
+            "reader_failover.completed.failed.count")
+
     @staticmethod
     def _determine_mode(props: Properties) -> FailoverMode:
         mode = get_failover_mode(props)
@@ -191,6 +209,8 @@ class AsyncFailoverPlugin(AsyncPlugin):
             driver_dialect: AsyncDriverDialect,
             deadline: float,
             last_error: Optional[BaseException]) -> None:
+        if self._failover_reader_triggered is not None:
+            self._failover_reader_triggered.inc()
         reader_candidates = [h for h in topology if h.role == HostRole.READER]
         original_writer = next(
             (h for h in topology if h.role == HostRole.WRITER), None)
@@ -222,6 +242,8 @@ class AsyncFailoverPlugin(AsyncPlugin):
                 self._plugin_service.set_availability(
                     candidate.as_aliases(), HostAvailability.AVAILABLE)
                 await self._plugin_service.set_current_connection(new_conn, candidate)
+                if self._failover_reader_completed is not None:
+                    self._failover_reader_completed.inc()
                 return
 
             # Readers exhausted for this pass. Try original writer if mode allows.
@@ -239,10 +261,14 @@ class AsyncFailoverPlugin(AsyncPlugin):
                         original_writer.as_aliases(), HostAvailability.AVAILABLE)
                     await self._plugin_service.set_current_connection(
                         new_conn, original_writer)
+                    if self._failover_reader_completed is not None:
+                        self._failover_reader_completed.inc()
                     return
 
             await asyncio.sleep(1.0)
 
+        if self._failover_reader_failed is not None:
+            self._failover_reader_failed.inc()
         raise FailoverFailedError(
             "Failover could not establish a new reader within "
             f"{self._failover_timeout_sec}s"
@@ -254,6 +280,8 @@ class AsyncFailoverPlugin(AsyncPlugin):
             driver_dialect: AsyncDriverDialect,
             deadline: float,
             last_error: Optional[BaseException]) -> None:
+        if self._failover_writer_triggered is not None:
+            self._failover_writer_triggered.inc()
         while asyncio.get_event_loop().time() < deadline:
             writer = next(
                 (h for h in topology if h.role == HostRole.WRITER), None)
@@ -268,6 +296,8 @@ class AsyncFailoverPlugin(AsyncPlugin):
                     self._plugin_service.set_availability(
                         writer.as_aliases(), HostAvailability.AVAILABLE)
                     await self._plugin_service.set_current_connection(new_conn, writer)
+                    if self._failover_writer_completed is not None:
+                        self._failover_writer_completed.inc()
                     return
 
             await asyncio.sleep(1.0)
@@ -277,6 +307,8 @@ class AsyncFailoverPlugin(AsyncPlugin):
             except Exception as e:  # noqa: BLE001
                 last_error = e
 
+        if self._failover_writer_failed is not None:
+            self._failover_writer_failed.inc()
         raise FailoverFailedError(
             "Failover could not establish a new writer within "
             f"{self._failover_timeout_sec}s"

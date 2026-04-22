@@ -176,6 +176,13 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
     def __init__(self, plugin_service: Any, props: Properties) -> None:
         AsyncAuthPluginBase.__init__(self, plugin_service, props)
         _RdsTokenMixin.__init__(self)
+        # Telemetry counter -- matches sync federated_plugin.py:69.
+        # AsyncOktaAuthPlugin subclasses this plugin, so the counter is
+        # shared (sync okta_plugin.py uses a distinct "okta.fetch_token.count"
+        # but that's a future enhancement -- for async we keep it single).
+        tf = self._plugin_service.get_telemetry_factory()
+        self._fetch_token_counter = tf.create_counter(
+            "federated.fetch_token.count")
 
     def _default_port(self) -> int:
         """Dialect-aware default port fallback.
@@ -206,6 +213,13 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
         cached = await self._cached_rds_token(host, int(port), db_user, region)
         if cached is not None:
             return db_user, cached, True
+
+        # Cache miss: we'll generate a fresh RDS IAM token below. Emit the
+        # counter here so it covers both the federated and Okta flows
+        # (AsyncOktaAuthPlugin overrides _fetch_saml_assertion but reuses
+        # this resolve path).
+        if self._fetch_token_counter is not None:
+            self._fetch_token_counter.inc()
 
         # 2. Fetch SAML assertion from IdP.
         saml_assertion = await self._fetch_saml_assertion(props)

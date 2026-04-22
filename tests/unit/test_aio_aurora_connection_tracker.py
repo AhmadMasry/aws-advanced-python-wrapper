@@ -397,3 +397,54 @@ def test_tracker_fallback_to_host_port_for_non_rds_host():
     """Non-RDS hostnames use host:port as the canonical key (no RDS alias found)."""
     host = HostInfo(host="custom.example.com", port=5432)
     assert AsyncOpenedConnectionTracker._canonical_key(host) == "custom.example.com:5432"
+
+
+# ---- Telemetry counters ------------------------------------------------
+
+
+def test_writer_change_emits_writer_changes_counter():
+    """When _update_writer_from_topology detects a new writer, the
+    aurora_connection_tracker.writer_changes.count counter increments.
+
+    The writer change also kicks off a fire-and-forget invalidation task
+    (asyncio.create_task), so the test body runs inside an event loop.
+    """
+    props = Properties({"host": "cluster.example.com", "port": "5432"})
+    driver_dialect = MagicMock()
+    svc = AsyncPluginServiceImpl(props, driver_dialect)
+
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+    svc.set_telemetry_factory(fake_tf)
+
+    tracker = AsyncOpenedConnectionTracker()
+    plugin = AsyncAuroraConnectionTrackerPlugin(svc, tracker=tracker)
+
+    old_writer = HostInfo(host="old-w", port=5432, role=HostRole.WRITER)
+    new_writer = HostInfo(host="new-w", port=5432, role=HostRole.WRITER)
+
+    async def _body() -> None:
+        # Seed first writer -- should NOT tick the counter (first observation).
+        svc._all_hosts = (old_writer,)
+        plugin._update_writer_from_topology()
+        assert not fake_counters[
+            "aurora_connection_tracker.writer_changes.count"
+        ].inc.called
+
+        # Second observation with different writer -> counter inc.
+        svc._all_hosts = (new_writer,)
+        plugin._update_writer_from_topology()
+        assert fake_counters[
+            "aurora_connection_tracker.writer_changes.count"
+        ].inc.called
+        # Drain the invalidation task spawned by _update_writer_from_topology.
+        await asyncio.sleep(0)
+
+    asyncio.run(_body())

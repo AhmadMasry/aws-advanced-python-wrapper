@@ -562,3 +562,100 @@ def test_failover_falls_back_to_initial_host_when_topology_empty():
     plugin._open_connection.assert_called()
     (target, _), _ = plugin._open_connection.call_args_list[0]
     assert target is initial
+
+
+# ---- Telemetry counters ------------------------------------------------
+
+
+def _build_plugin_with_counters(mode: str = "strict_writer"):
+    """Same wiring as _build_plugin but with a MagicMock telemetry factory.
+
+    Returns (plugin, svc, host_list_provider, driver_dialect, counters) where
+    ``counters`` is a dict of counter-name -> MagicMock (so tests can assert
+    .inc.called on the one they care about).
+    """
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+
+    props_dict = {
+        "host": "cluster.example.com",
+        "port": "5432",
+        "enable_failover": "true",
+        "failover_timeout_sec": "0.5",
+    }
+    if mode:
+        props_dict["failover_mode"] = mode
+    props = Properties(props_dict)
+
+    driver_dialect = MagicMock()
+    driver_dialect.connect = AsyncMock(return_value=MagicMock(name="new_conn"))
+    driver_dialect.transfer_session_state = AsyncMock()
+
+    svc = AsyncPluginServiceImpl(props, driver_dialect)
+    svc.set_telemetry_factory(fake_tf)
+
+    host_list_provider = MagicMock()
+    host_list_provider.force_refresh = AsyncMock(return_value=(
+        HostInfo(host="writer.example.com", port=5432, role=HostRole.WRITER),
+        HostInfo(host="reader.example.com", port=5432, role=HostRole.READER),
+    ))
+
+    plugin = AsyncFailoverPlugin(
+        plugin_service=svc,
+        host_list_provider=host_list_provider,
+        props=props,
+    )
+    return plugin, svc, host_list_provider, driver_dialect, fake_counters
+
+
+def test_failover_emits_writer_triggered_counter_on_writer_path():
+    plugin, svc, _, driver_dialect, counters = _build_plugin_with_counters(
+        mode="strict_writer")
+    # Force a successful writer reconnect.
+    plugin._open_connection = AsyncMock(  # type: ignore[method-assign]
+        return_value=MagicMock(name="new_conn"))
+
+    asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
+
+    # Writer path must have been taken.
+    assert counters["writer_failover.triggered.count"].inc.called
+    assert counters["writer_failover.completed.success.count"].inc.called
+    # Reader path was NOT taken.
+    assert not counters["reader_failover.triggered.count"].inc.called
+
+
+def test_failover_emits_reader_triggered_counter_on_reader_path():
+    plugin, svc, hlp, driver_dialect, counters = _build_plugin_with_counters(
+        mode="strict_reader")
+    reader_host = HostInfo(
+        host="reader.example.com", port=5432, role=HostRole.READER)
+    svc.get_host_info_by_strategy = MagicMock(return_value=reader_host)
+    plugin._open_connection = AsyncMock(  # type: ignore[method-assign]
+        return_value=MagicMock(name="new_conn"))
+
+    asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
+
+    assert counters["reader_failover.triggered.count"].inc.called
+    assert counters["reader_failover.completed.success.count"].inc.called
+    assert not counters["writer_failover.triggered.count"].inc.called
+
+
+def test_failover_emits_writer_failed_counter_on_exhausted_deadline():
+    plugin, svc, hlp, driver_dialect, counters = _build_plugin_with_counters(
+        mode="strict_writer")
+    # Make every open fail so we hit the FailoverFailedError path.
+    plugin._open_connection = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OSError("refused"))
+
+    with pytest.raises(FailoverFailedError):
+        asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
+    assert counters["writer_failover.triggered.count"].inc.called
+    assert counters["writer_failover.completed.failed.count"].inc.called
+    assert not counters["writer_failover.completed.success.count"].inc.called
