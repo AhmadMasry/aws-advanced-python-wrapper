@@ -885,3 +885,53 @@ def test_canceled_probe_conn_closed_on_shutdown():
     # Since the probe was canceled BEFORE it returned a conn, there's no
     # conn to close in our code path -- but the monitor shouldn't hang either
     assert monitor.is_running() is False
+
+
+# ---- build_probe_host helper -------------------------------------------
+
+
+def test_build_probe_host_opens_via_plugin_service_connect():
+    """The helper routes through plugin_service.connect and calls get_host_role."""
+    from aws_advanced_python_wrapper.aio.cluster_topology_monitor import \
+        build_probe_host
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+    from aws_advanced_python_wrapper.hostinfo import HostRole as _Role
+
+    svc = MagicMock()
+    probe_conn = MagicMock(name="probe")
+    svc.connect = AsyncMock(return_value=probe_conn)
+    svc.get_host_role = AsyncMock(return_value=_Role.WRITER)
+
+    probe = build_probe_host(svc, Properties({"host": "cluster", "port": "5432"}))
+    host = HostInfo(host="instance-1", port=5432)
+
+    async def _run():
+        return await probe(host)
+
+    conn, role = asyncio.run(_run())
+    assert conn is probe_conn
+    assert role == _Role.WRITER
+
+    # plugin_service.connect called with the per-host props.
+    svc.connect.assert_awaited_once()
+    call_args = svc.connect.await_args
+    assert call_args.args[0] is host
+    # Second arg is the per-host props copy
+    per_host_props = call_args.args[1]
+    assert per_host_props["host"] == "instance-1"
+    assert per_host_props["port"] == "5432"
+
+
+def test_build_probe_host_propagates_connect_errors():
+    """Connection errors propagate (caller/monitor handles them)."""
+    from aws_advanced_python_wrapper.aio.cluster_topology_monitor import \
+        build_probe_host
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    svc = MagicMock()
+    svc.connect = AsyncMock(side_effect=OSError("no route to host"))
+    svc.get_host_role = AsyncMock()
+
+    probe = build_probe_host(svc, Properties({"host": "h"}))
+    with pytest.raises(OSError):
+        asyncio.run(probe(HostInfo(host="h", port=5432)))

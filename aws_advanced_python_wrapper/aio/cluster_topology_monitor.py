@@ -52,7 +52,10 @@ from aws_advanced_python_wrapper.hostinfo import HostRole
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.host_list_provider import (
         AsyncAuroraHostListProvider, Topology)
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo
+    from aws_advanced_python_wrapper.utils.properties import Properties
 
 
 class AsyncClusterTopologyMonitor:
@@ -352,3 +355,30 @@ class AsyncClusterTopologyMonitor:
             except (asyncio.CancelledError, Exception):
                 pass
         self._task = None
+
+
+def build_probe_host(
+        plugin_service: AsyncPluginService,
+        props: Properties) -> Callable[[HostInfo], Awaitable[Tuple[Any, HostRole]]]:
+    """Build a probe callable that opens a conn through the plugin pipeline
+    and classifies its role via DialectUtils.
+
+    Used by AsyncClusterTopologyMonitor's panic mode to search for a new
+    writer when the primary monitoring connection dies. The returned
+    coroutine function: (host_info) -> (conn, role). Raises on failure.
+    """
+    # Import here (runtime) -- at module-top these are TYPE_CHECKING-only.
+    from aws_advanced_python_wrapper.utils.properties import \
+        Properties as PropertiesRuntime
+
+    async def _probe(host_info: HostInfo) -> Tuple[Any, HostRole]:
+        # Open through the plugin pipeline so auth plugins re-apply.
+        probe_props = PropertiesRuntime(dict(props))
+        probe_props["host"] = host_info.host
+        if host_info.is_port_specified():
+            probe_props["port"] = str(host_info.port)
+        conn = await plugin_service.connect(host_info, probe_props)
+        role = await plugin_service.get_host_role(conn)
+        return conn, role
+
+    return _probe
