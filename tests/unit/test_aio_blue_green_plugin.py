@@ -132,8 +132,8 @@ def test_connect_dispatches_to_first_matching_routing():
         bg_id="default",
         phase=BlueGreenPhase.IN_PROGRESS,
         connect_routings=[
-            # First never matches -> skipped.
-            SubstituteConnectRouting(),
+            # First has a specific host_matcher that won't hit -> skipped.
+            SubstituteConnectRouting(host_matcher="some-other-host"),
             # Second matches (empty matcher = match everything).
             RejectConnectRouting(),
         ],
@@ -149,7 +149,7 @@ def test_connect_dispatches_to_first_matching_routing():
             driver_dialect=MagicMock(),
             host_info=host_info,
             props=Properties(),
-            is_initial_connection=True,
+            is_initial_connection=False,
             connect_func=connect_func))
 
 
@@ -166,13 +166,13 @@ def test_execute_passes_through_when_no_status():
     execute_func.assert_awaited_once()
 
 
-def test_substitute_connect_routing_raises_not_implemented():
-    routing = SubstituteConnectRouting()
-    # is_match must be False (never participates) until ported.
-    assert routing.is_match(HostInfo("h1"), BlueGreenRole.SOURCE) is False
-    # apply explicitly surfaces the deferral.
-    with pytest.raises(NotImplementedError, match="async port deferred"):
-        _run(routing.apply())
+def test_substitute_connect_routing_matches_and_falls_through_without_pair():
+    """SubstituteConnectRouting with matching host_matcher matches, and
+    when no corresponding_hosts entry exists, falls through to the
+    original connect_func (port now functional, no longer raises)."""
+    routing = SubstituteConnectRouting(host_matcher="h1")
+    assert routing.is_match(HostInfo("h1"), BlueGreenRole.SOURCE) is True
+    assert routing.is_match(HostInfo("other"), BlueGreenRole.SOURCE) is False
 
 
 def test_factory_produces_async_blue_green_plugin():
