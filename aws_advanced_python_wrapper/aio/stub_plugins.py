@@ -14,13 +14,13 @@
 
 """Pass-through stubs for plugins not yet ported to async.
 
-Registered in :mod:`aws_advanced_python_wrapper.aio.plugin_factory` so
-users can include these codes in ``plugins="..."`` config strings
-without tripping unknown-plugin errors. Each stub logs a single warning
-on construction to surface the gap at runtime; no pipeline hooks fire.
+Currently empty: every plugin code that previously stood in as a stub
+has a real async port. Kept as an importable module for backwards
+compatibility with downstream code; may be removed in a later cleanup.
 
-Actual async ports land as separate phases when consumers exercise
-these features against the async wrapper.
+Historical context: phase H.2 introduced ``AsyncBlueGreenStubPlugin``
+as the only stub; it was replaced by :class:`AsyncBlueGreenPlugin`
+(skeleton port) in a later commit.
 """
 
 from __future__ import annotations
@@ -36,9 +36,11 @@ logger = Logger(__name__)
 class _AsyncStubPlugin(AsyncPlugin):
     """Shared base for async plugin stubs.
 
-    Subclasses set :attr:`_STUB_NAME` to the plugin code they stand in
-    for. Construction logs a WARNING; the plugin subscribes to no
-    pipeline methods, so the plugin manager skips it for every call.
+    Retained so a future unimplemented plugin code can register a
+    pass-through stub without re-deriving the scaffolding. Subclasses
+    set :attr:`_STUB_NAME` to the plugin code they stand in for.
+    Construction logs a WARNING; the plugin subscribes to no pipeline
+    methods, so the plugin manager skips it for every call.
     """
 
     _STUB_NAME: str = "unknown"
@@ -59,11 +61,4 @@ class _AsyncStubPlugin(AsyncPlugin):
         return set()
 
 
-class AsyncBlueGreenStubPlugin(_AsyncStubPlugin):
-    """Stub for sync BlueGreenPlugin ('bg')."""
-    _STUB_NAME = "bg"
-
-
-__all__ = [
-    "AsyncBlueGreenStubPlugin",
-]
+__all__: list = []

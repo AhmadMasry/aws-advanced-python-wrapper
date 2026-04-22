@@ -12,55 +12,20 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""F3-B Phase H.2: stub plugins for unimplemented async codes.
+"""Async-plugin stub registry: currently empty.
 
-Verifies that the sync plugin codes without a real async port register
-as pass-through stubs in ``PLUGIN_FACTORIES`` -- users can keep their
-``plugins="..."`` config identical across sync/async wrappers without
-hitting 'unknown plugin' errors.
+Every plugin code that previously registered as a pass-through stub has
+been replaced by a real async port (most recently ``bg`` ->
+:class:`AsyncBlueGreenPlugin`). This file kept as a regression guard:
+if a new stub is introduced, extend :data:`STUB_CODES_AND_CLASSES` and
+the existing pattern resumes working.
 """
 
 from __future__ import annotations
 
-import logging
-
-from aws_advanced_python_wrapper.aio.plugin_factory import (
-    PLUGIN_FACTORIES, resolve_plugin_factories)
-from aws_advanced_python_wrapper.aio.stub_plugins import \
-    AsyncBlueGreenStubPlugin
-
-STUB_CODES_AND_CLASSES = [
-    ("bg", AsyncBlueGreenStubPlugin),
-]
+from aws_advanced_python_wrapper.aio.stub_plugins import _AsyncStubPlugin
 
 
-def test_all_stub_codes_registered_in_plugin_factories():
-    for code, _ in STUB_CODES_AND_CLASSES:
-        assert code in PLUGIN_FACTORIES, (
-            f"Expected plugin code '{code}' to be registered")
-
-
-def test_each_stub_subscribes_to_nothing():
-    """Stubs must not intercept any pipeline method."""
-    for _, cls in STUB_CODES_AND_CLASSES:
-        plugin = cls()
-        assert plugin.subscribed_methods == set(), (
-            f"{cls.__name__} must not subscribe to any method")
-
-
-def test_stubs_log_warning_on_construction(caplog):
-    caplog.set_level(logging.WARNING)
-    for code, cls in STUB_CODES_AND_CLASSES:
-        caplog.clear()
-        cls()
-        messages = [r.getMessage() for r in caplog.records
-                    if r.levelno >= logging.WARNING]
-        assert any(code in m for m in messages), (
-            f"Expected warning for stub '{code}', got: {messages}")
-
-
-def test_resolve_plugin_factories_returns_stub_factory_for_each_code():
-    """resolve_plugin_factories round-trips the stub codes."""
-    for code, _ in STUB_CODES_AND_CLASSES:
-        factories = resolve_plugin_factories([code])
-        assert len(factories) == 1
+def test_stub_scaffolding_exists():
+    """Keep the stub base class importable for future use."""
+    assert _AsyncStubPlugin is not None

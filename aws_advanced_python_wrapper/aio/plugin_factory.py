@@ -40,8 +40,6 @@ from aws_advanced_python_wrapper.aio.minor_plugins import (
     AsyncConnectTimePlugin, AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
 from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
     AsyncReadWriteSplittingPlugin
-from aws_advanced_python_wrapper.aio.stub_plugins import \
-    AsyncBlueGreenStubPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
@@ -220,7 +218,15 @@ class _AsyncStubFactory:
         return self._stub_cls()
 
 
-_BlueGreenFactory = _AsyncStubFactory(AsyncBlueGreenStubPlugin)
+class _BlueGreenFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        # Local import keeps module load-order cheap and avoids pulling
+        # the BG data model into memory for consumers that don't use
+        # the plugin.
+        from aws_advanced_python_wrapper.aio.blue_green_plugin import \
+            AsyncBlueGreenPlugin
+        return AsyncBlueGreenPlugin(plugin_service, props)
 
 
 # ---- Registry ----------------------------------------------------------
@@ -252,11 +258,7 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "initial_connection": _InitialConnectionFactory(),
     "fastest_response_strategy": _FastestResponseFactory(),
     "limitless": _LimitlessFactory(),
-    # ---- Phase H.2 stubs: plugin codes not yet ported to async. ----
-    # Registered so users can keep sync/async `plugins="..."` config
-    # strings identical. Each stub subscribes to nothing and logs a
-    # WARNING on construction; full async ports land in later phases.
-    "bg": _BlueGreenFactory,
+    "bg": _BlueGreenFactory(),
 }
 
 
@@ -280,6 +282,9 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _ExecuteTimeFactory: 910,
     _LimitlessFactory: 950,
     _DeveloperFactory: 1000,
+    # Blue/Green sorts late so routing dispatch sees already-bound host
+    # info from earlier plugins. Matches sync weight.
+    _BlueGreenFactory: 550,
     # All stub factories share one type; a single entry covers every
     # remaining Phase H.2 stub. Weight sits above _DeveloperFactory so
     # stubs sort last (they subscribe to nothing, so order is cosmetic).
