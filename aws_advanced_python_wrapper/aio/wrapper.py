@@ -57,23 +57,59 @@ _TOPOLOGY_REQUIRING_PLUGINS = frozenset({
 
 def _build_host_list_provider(
         props: Properties,
-        driver_dialect: AsyncDriverDialect) -> AsyncHostListProvider:
-    """Pick an async host list provider based on the plugin list.
+        driver_dialect: AsyncDriverDialect,
+        database_dialect: Any = None) -> AsyncHostListProvider:
+    """Pick an async host list provider based on plugins + DB dialect.
 
-    If `plugins` property references any topology-requiring plugin,
-    return an :class:`AsyncAuroraHostListProvider`. Otherwise a
-    :class:`AsyncStaticHostListProvider` is sufficient (and cheaper --
-    no topology queries).
+    Selection order, matching sync database_dialect.py:
+      * ``plugins`` references no topology-requiring plugin -> static.
+      * database_dialect is a MultiAz dialect -> MultiAz provider.
+      * database_dialect is a GlobalAurora dialect -> GlobalAurora provider.
+      * Otherwise -> Aurora provider (the default topology path).
+
+    ``database_dialect`` is passed optionally because early-phase callers
+    (tests, legacy paths) may not have resolved the dialect yet; the
+    function falls back to a plain Aurora provider in that case.
     """
     from aws_advanced_python_wrapper.aio.host_list_provider import (
-        AsyncAuroraHostListProvider, AsyncStaticHostListProvider)
+        AsyncAuroraHostListProvider, AsyncGlobalAuroraHostListProvider,
+        AsyncMultiAzHostListProvider, AsyncStaticHostListProvider)
     from aws_advanced_python_wrapper.aio.plugin_factory import \
         parse_plugins_property
 
     codes = parse_plugins_property(props) or []
-    if any(c.strip() in _TOPOLOGY_REQUIRING_PLUGINS for c in codes):
-        return AsyncAuroraHostListProvider(props, driver_dialect)
-    return AsyncStaticHostListProvider(props)
+    if not any(c.strip() in _TOPOLOGY_REQUIRING_PLUGINS for c in codes):
+        return AsyncStaticHostListProvider(props)
+
+    # Topology-aware path. Pick the provider matching the dialect.
+    if database_dialect is not None:
+        dialect_name = type(database_dialect).__name__
+        if "MultiAz" in dialect_name:
+            # Pull MultiAz queries off the dialect class. Sync exposes
+            # them as class-level constants; fall back to no provider
+            # if they're missing so callers degrade gracefully.
+            writer_q = getattr(
+                database_dialect, "_WRITER_HOST_QUERY", None)
+            topology_q = getattr(
+                database_dialect, "_TOPOLOGY_QUERY", None)
+            host_id_q = getattr(
+                database_dialect, "_HOST_ID_QUERY",
+                getattr(database_dialect, "host_id_query", None))
+            if writer_q and topology_q and host_id_q:
+                return AsyncMultiAzHostListProvider(
+                    props, driver_dialect,
+                    writer_host_query=writer_q,
+                    topology_query=topology_q,
+                    host_id_query=host_id_q,
+                )
+        if "GlobalAurora" in dialect_name:
+            topology_q = getattr(
+                database_dialect, "topology_query", None)
+            if topology_q:
+                return AsyncGlobalAuroraHostListProvider(
+                    props, driver_dialect, topology_query=topology_q)
+
+    return AsyncAuroraHostListProvider(props, driver_dialect)
 
 
 def _resolve_database_dialect(
@@ -396,11 +432,16 @@ class AsyncAwsWrapperConnection:
         port = int(port_raw) if port_raw is not None else -1
         host_info = HostInfo(host=host, port=port)
 
+        # Resolve the database dialect first so the host-list-provider
+        # selection can pick a MultiAz/GlobalAurora variant when the
+        # dialect class indicates it (matches sync's behavior).
+        database_dialect = _resolve_database_dialect(driver_dialect, props)
+
         # Host-list-provider selection: if `plugins=...` references any
-        # topology-requiring plugin (failover, rws), build an Aurora
-        # provider; otherwise static is enough. Resolved before the
-        # plugin service so it can be wired in as a slot below.
-        host_list_provider = _build_host_list_provider(props, driver_dialect)
+        # topology-requiring plugin (failover, rws), build a topology
+        # provider matching the dialect; otherwise static is enough.
+        host_list_provider = _build_host_list_provider(
+            props, driver_dialect, database_dialect)
 
         plugin_service = AsyncPluginServiceImpl(
             props=props,
@@ -410,7 +451,7 @@ class AsyncAwsWrapperConnection:
         # Phase A wiring: populate plugin service slots so plugins that
         # reach for them in their own ``connect`` hook (e.g., failover
         # checking ``is_network_exception``) have them available.
-        plugin_service.database_dialect = _resolve_database_dialect(driver_dialect, props)
+        plugin_service.database_dialect = database_dialect
         plugin_service.host_list_provider = host_list_provider
         plugin_service.initial_connection_host_info = host_info
 
