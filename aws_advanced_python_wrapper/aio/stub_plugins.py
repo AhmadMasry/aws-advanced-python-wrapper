@@ -59,11 +59,6 @@ class _AsyncStubPlugin(AsyncPlugin):
         return set()
 
 
-class AsyncLimitlessStubPlugin(_AsyncStubPlugin):
-    """Stub for sync LimitlessPlugin ('limitless')."""
-    _STUB_NAME = "limitless"
-
-
 class AsyncBlueGreenStubPlugin(_AsyncStubPlugin):
     """Stub for sync BlueGreenPlugin ('bg')."""
     _STUB_NAME = "bg"
@@ -71,5 +66,4 @@ class AsyncBlueGreenStubPlugin(_AsyncStubPlugin):
 
 __all__ = [
     "AsyncBlueGreenStubPlugin",
-    "AsyncLimitlessStubPlugin",
 ]

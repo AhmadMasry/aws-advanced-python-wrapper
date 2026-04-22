@@ -40,8 +40,8 @@ from aws_advanced_python_wrapper.aio.minor_plugins import (
     AsyncConnectTimePlugin, AsyncDeveloperPlugin, AsyncExecuteTimePlugin)
 from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
     AsyncReadWriteSplittingPlugin
-from aws_advanced_python_wrapper.aio.stub_plugins import (
-    AsyncBlueGreenStubPlugin, AsyncLimitlessStubPlugin)
+from aws_advanced_python_wrapper.aio.stub_plugins import \
+    AsyncBlueGreenStubPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
@@ -192,6 +192,16 @@ class _FastestResponseFactory:
         return AsyncFastestResponseStrategyPlugin(plugin_service, props)
 
 
+class _LimitlessFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        # Local import keeps module load-order cheap -- users who don't
+        # opt into Limitless never import the router-discovery path.
+        from aws_advanced_python_wrapper.aio.limitless_plugin import \
+            AsyncLimitlessPlugin
+        return AsyncLimitlessPlugin(plugin_service, props)
+
+
 class _AsyncStubFactory:
     """Factory that instantiates a pass-through stub plugin.
 
@@ -210,7 +220,6 @@ class _AsyncStubFactory:
         return self._stub_cls()
 
 
-_LimitlessFactory = _AsyncStubFactory(AsyncLimitlessStubPlugin)
 _BlueGreenFactory = _AsyncStubFactory(AsyncBlueGreenStubPlugin)
 
 
@@ -242,11 +251,11 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "stale_dns": _StaleDnsFactory(),
     "initial_connection": _InitialConnectionFactory(),
     "fastest_response_strategy": _FastestResponseFactory(),
+    "limitless": _LimitlessFactory(),
     # ---- Phase H.2 stubs: plugin codes not yet ported to async. ----
     # Registered so users can keep sync/async `plugins="..."` config
     # strings identical. Each stub subscribes to nothing and logs a
     # WARNING on construction; full async ports land in later phases.
-    "limitless": _LimitlessFactory,
     "bg": _BlueGreenFactory,
 }
 
@@ -269,6 +278,7 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _FastestResponseFactory: 600,
     _ConnectTimeFactory: 900,
     _ExecuteTimeFactory: 910,
+    _LimitlessFactory: 950,
     _DeveloperFactory: 1000,
     # All stub factories share one type; a single entry covers every
     # remaining Phase H.2 stub. Weight sits above _DeveloperFactory so

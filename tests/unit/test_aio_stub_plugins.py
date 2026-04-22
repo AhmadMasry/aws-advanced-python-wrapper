@@ -26,11 +26,10 @@ import logging
 
 from aws_advanced_python_wrapper.aio.plugin_factory import (
     PLUGIN_FACTORIES, resolve_plugin_factories)
-from aws_advanced_python_wrapper.aio.stub_plugins import (
-    AsyncBlueGreenStubPlugin, AsyncLimitlessStubPlugin)
+from aws_advanced_python_wrapper.aio.stub_plugins import \
+    AsyncBlueGreenStubPlugin
 
 STUB_CODES_AND_CLASSES = [
-    ("limitless", AsyncLimitlessStubPlugin),
     ("bg", AsyncBlueGreenStubPlugin),
 ]
 
