@@ -58,16 +58,20 @@ def _build_plugin_service(
     """Build a mock AsyncPluginService covering the APIs the plugin touches."""
     svc = MagicMock()
 
-    # driver_dialect: connect returns a fresh per-host MagicMock.
+    # driver_dialect: still exposed for close/abort. The plugin no
+    # longer opens connections via driver_dialect.connect -- those now
+    # route through plugin_service.connect (pipeline).
     dd = MagicMock()
-
-    def _connect_factory(host_info, props, fn):
-        return MagicMock(name=f"conn-to-{host_info.host}")
-
-    dd.connect = AsyncMock(side_effect=_connect_factory)
     dd.is_closed = AsyncMock(return_value=False)
     dd.abort_connection = AsyncMock()
     svc.driver_dialect = dd
+
+    # plugin_service.connect now stands in for the old pipeline-bypass
+    # driver_dialect.connect call. Returns a fresh per-host conn.
+    def _connect_factory(host_info, props, plugin_to_skip=None):
+        return MagicMock(name=f"conn-to-{host_info.host}")
+
+    svc.connect = AsyncMock(side_effect=_connect_factory)
 
     # database_dialect.default_port used by _create_host_info.
     db_dialect = MagicMock()
@@ -181,7 +185,7 @@ def test_verify_retries_when_role_mismatches_and_times_out():
                 _noop, True,  # request reader
             )
         # Multiple connect attempts made before giving up.
-        assert dd.connect.await_count >= 2
+        assert svc.connect.await_count >= 2
         # Each wrong-role connection was aborted.
         assert dd.abort_connection.await_count >= 2
 
@@ -204,7 +208,7 @@ def test_verify_returns_immediately_when_role_matches():
             _noop, True,
         )
 
-        assert dd.connect.await_count == 1
+        assert svc.connect.await_count == 1
         dd.abort_connection.assert_not_awaited()
         assert plugin._reader_conn is not None
 
@@ -248,7 +252,7 @@ def test_cached_connection_reused_when_toggling_back():
         )
         first_writer = plugin._writer_conn
 
-        dd.connect.reset_mock()
+        svc.connect.reset_mock()
 
         # 3rd flip: back to reader; expect cached reader reused (no connect).
         await plugin.execute(
@@ -256,7 +260,7 @@ def test_cached_connection_reused_when_toggling_back():
             DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
             _noop, True,
         )
-        dd.connect.assert_not_awaited()
+        svc.connect.assert_not_awaited()
         assert plugin._reader_conn is first_reader
 
         # 4th flip: back to writer; expect cached writer reused too.
@@ -265,7 +269,7 @@ def test_cached_connection_reused_when_toggling_back():
             DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
             _noop, False,
         )
-        dd.connect.assert_not_awaited()
+        svc.connect.assert_not_awaited()
         assert plugin._writer_conn is first_writer
 
     asyncio.run(_body())

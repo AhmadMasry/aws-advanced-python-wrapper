@@ -23,11 +23,10 @@ Async-specific adaptations:
 
 * The verification retry loop uses :func:`asyncio.sleep` instead of the
   sync plugin's blocking ``time.sleep``.
-* Fresh endpoint connections are opened via ``driver_dialect.connect``,
-  not through the full plugin pipeline. Caller plugins (IAM auth, etc.)
-  will NOT re-apply to these connections. Matches the pattern in
-  :mod:`aws_advanced_python_wrapper.aio.stale_dns_plugin` and is tracked
-  as a Phase H deferred limitation.
+* Fresh endpoint connections are opened via
+  :meth:`AsyncPluginService.connect`, routing them through the full
+  plugin pipeline so auth plugins (IAM, Secrets, Federated, Okta) and
+  connection tracker re-apply on the new connections.
 """
 
 from __future__ import annotations
@@ -239,22 +238,19 @@ class AsyncSimpleReadWriteSplittingPlugin(AsyncPlugin):
             self,
             driver_dialect: AsyncDriverDialect,
             host_info: HostInfo) -> Any:
-        """Open a new connection via the driver dialect.
+        """Open a new connection through the plugin pipeline.
 
-        Bypasses the plugin pipeline; caller plugins (IAM auth etc.) will
-        not re-apply to this connection. Tracked as a Phase H deferred
-        limitation; matches :class:`AsyncStaleDnsPlugin`'s pattern.
+        Routes through :meth:`AsyncPluginService.connect` (skipping this
+        plugin to avoid recursion), so caller plugins (IAM auth, Secrets,
+        Federated, Okta, connection tracker) re-apply on the fresh
+        connection just like a user-driven connect.
         """
-        # Local import avoids pulling psycopg at module load time for
-        # consumers using a different async driver.
-        import psycopg  # type: ignore
-
         new_props = Properties(dict(self._props))
         new_props["host"] = host_info.host
         if host_info.is_port_specified():
             new_props["port"] = str(host_info.port)
-        return await driver_dialect.connect(
-            host_info, new_props, psycopg.AsyncConnection.connect)
+        return await self._plugin_service.connect(
+            host_info, new_props, plugin_to_skip=self)
 
     @staticmethod
     async def _close_best_effort(

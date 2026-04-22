@@ -22,9 +22,10 @@ retries via the topology's instance endpoints.
 Async adaptations:
 
 * Retry loop uses :func:`asyncio.sleep`.
-* Instance connection uses ``driver_dialect.connect`` (pipeline bypass;
-  plugin chain doesn't re-apply on the new connection). Tracked as
-  Phase H deferred limitation.
+* Instance connection goes through :meth:`AsyncPluginService.connect`,
+  so auth plugins (IAM, Secrets, Federated, Okta) and connection
+  tracker re-apply on the new connection just like a user-driven
+  connect.
 * ``identify_connection`` approximated via :meth:`get_host_role` plus a
   topology scan (async ``PluginService`` doesn't yet expose
   ``identify_connection``).
@@ -307,10 +308,11 @@ class AsyncAuroraInitialConnectionStrategyPlugin(AsyncPlugin):
         new_props["host"] = host_info.host
         if host_info.is_port_specified():
             new_props["port"] = str(host_info.port)
-        # NOTE: pipeline-bypass. Auth plugins won't re-apply. Phase H
-        # deferred limitation.
-        return await driver_dialect.connect(
-            host_info, new_props, target_driver_func)
+        # Routes through the plugin pipeline (skipping this plugin to
+        # avoid recursion) so auth plugins (IAM, Secrets, Federated,
+        # Okta) re-apply on the new instance connection.
+        return await self._plugin_service.connect(
+            host_info, new_props, plugin_to_skip=self)
 
     @staticmethod
     async def _close_best_effort(

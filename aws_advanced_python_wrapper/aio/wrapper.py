@@ -432,6 +432,7 @@ class AsyncAwsWrapperConnection:
             plugins=plugins,
         )
         plugin_service.plugin_manager = plugin_manager
+        plugin_service.set_target_driver_func(target_func)
 
         target_conn = await plugin_manager.connect(
             target_driver_func=target_func,

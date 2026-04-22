@@ -23,11 +23,9 @@ Async-specific adaptations:
 * ``socket.gethostbyname`` is wrapped in :func:`asyncio.to_thread` so the
   blocking DNS lookup doesn't stall the event loop.
 * The fresh-writer connection is opened via
-  ``driver_dialect.connect`` rather than ``plugin_service.connect``
-  (which isn't part of the async plugin-service API yet). This bypasses
-  the plugin pipeline, so caller plugins like IAM auth will NOT
-  re-apply on the new connection -- documented limitation, tracked for
-  when ``AsyncPluginService.connect`` lands in a later phase.
+  :meth:`AsyncPluginService.connect`, so caller plugins (IAM auth,
+  Secrets, Federated, Okta, connection tracker) re-apply on the new
+  connection just as they would on a user-driven connect.
 """
 
 from __future__ import annotations
@@ -166,14 +164,14 @@ class AsyncStaleDnsPlugin(AsyncPlugin):
                     f"{self._writer_host_info.get_host_and_port()} "
                     "is not in the allowed topology.")
 
-            # Open a fresh connection to the actual writer. Bypasses
-            # the plugin pipeline -- caller plugins (IAM auth etc.)
-            # won't re-apply. Async parity limitation; see module
-            # docstring.
+            # Open a fresh connection to the actual writer through the
+            # plugin pipeline (skipping ourselves to avoid recursion),
+            # so auth plugins (IAM, Secrets, Federated, Okta) and
+            # connection tracker re-apply on the new connection.
             writer_props = self._props_with_host(
                 props, self._writer_host_info)
-            writer_conn = await driver_dialect.connect(
-                self._writer_host_info, writer_props, target_driver_func)
+            writer_conn = await self._plugin_service.connect(
+                self._writer_host_info, writer_props, plugin_to_skip=self)
             if is_initial_connection:
                 self._plugin_service.initial_connection_host_info = \
                     self._writer_host_info

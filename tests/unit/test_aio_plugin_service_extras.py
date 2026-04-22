@@ -349,3 +349,36 @@ def test_set_telemetry_factory_overrides_default():
     fake = MagicMock()
     svc.set_telemetry_factory(fake)
     assert svc.get_telemetry_factory() is fake
+
+
+def test_plugin_service_connect_requires_plugin_manager():
+    svc = _make_service()
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(svc.connect(
+            HostInfo(host="h", port=5432), Properties()))
+
+
+def test_plugin_service_connect_requires_target_driver_func():
+    svc = _make_service()
+    svc.plugin_manager = MagicMock()
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(svc.connect(
+            HostInfo(host="h", port=5432), Properties()))
+
+
+def test_plugin_service_connect_delegates_to_plugin_manager():
+    svc = _make_service()
+    manager = MagicMock()
+    manager.connect = AsyncMock(return_value=MagicMock(name="conn"))
+    svc.plugin_manager = manager
+    svc.set_target_driver_func(lambda: None)
+
+    host = HostInfo(host="h", port=5432)
+    props = Properties()
+    asyncio.run(svc.connect(host, props))
+
+    manager.connect.assert_awaited_once()
+    call = manager.connect.await_args
+    assert call.kwargs["host_info"] is host
+    assert call.kwargs["props"] is props
+    assert call.kwargs["is_initial_connection"] is False

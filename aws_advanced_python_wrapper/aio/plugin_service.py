@@ -22,8 +22,8 @@ service, status storage) lands in later SPs that need it.
 
 from __future__ import annotations
 
-from typing import (TYPE_CHECKING, Any, ClassVar, FrozenSet, List, Optional,
-                    Protocol, Set, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, FrozenSet, List,
+                    Optional, Protocol, Set, Tuple)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncCanReleaseResources
 from aws_advanced_python_wrapper.errors import AwsWrapperError
@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         AsyncDriverDialect
     from aws_advanced_python_wrapper.aio.host_list_provider import \
         AsyncHostListProvider
+    from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
     from aws_advanced_python_wrapper.aio.plugin_manager import \
         AsyncPluginManager
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
@@ -166,6 +167,24 @@ class AsyncPluginService(Protocol):
             timeout_sec: float = 5.0) -> HostRole:
         ...
 
+    async def connect(
+            self,
+            host_info: HostInfo,
+            props: Properties,
+            plugin_to_skip: Optional[AsyncPlugin] = None) -> Any:
+        """Open a connection to ``host_info`` through the plugin pipeline.
+
+        Lets plugins (StaleDns, SimpleRWS, etc.) open fresh connections
+        through the full plugin chain so auth plugins (IAM, Secrets,
+        Federated, Okta) re-apply on the new connection. Mirrors sync
+        plugin_service.py:605-614.
+
+        ``plugin_to_skip`` is excluded from the pipeline for this call
+        (prevents recursion when the caller is itself a plugin driving
+        the new connection).
+        """
+        ...
+
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         ...
 
@@ -228,6 +247,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
         self._telemetry_factory: Optional[TelemetryFactory] = None
+        self._target_driver_func: Optional[Callable] = None
 
     @property
     def current_connection(self) -> Optional[Any]:
@@ -408,6 +428,39 @@ class AsyncPluginServiceImpl(AsyncPluginService):
             self._database_dialect.is_reader_query,
             timeout_sec=timeout_sec,
         )
+
+    async def connect(
+            self,
+            host_info: HostInfo,
+            props: Properties,
+            plugin_to_skip: Optional[AsyncPlugin] = None) -> Any:
+        if self._plugin_manager is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.connect requires a plugin_manager; "
+                "it is populated by AsyncAwsWrapperConnection.connect.")
+        # The plugin manager needs a target driver func. We need to reach
+        # it from the same place AsyncAwsWrapperConnection does -- the
+        # driver dialect's connect signature differs per driver, so we
+        # require the target_func to have been stashed somewhere accessible.
+        # For Phase I: require the caller to have recorded a target_func
+        # on the plugin service via set_target_driver_func.
+        if self._target_driver_func is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.connect requires target_driver_func "
+                "to be set; AsyncAwsWrapperConnection.connect normally "
+                "wires this.")
+        return await self._plugin_manager.connect(
+            target_driver_func=self._target_driver_func,
+            driver_dialect=self._driver_dialect,
+            host_info=host_info,
+            props=props,
+            is_initial_connection=False,
+            plugin_to_skip=plugin_to_skip,
+        )
+
+    def set_target_driver_func(self, func: Callable) -> None:
+        """Wired by AsyncAwsWrapperConnection.connect at connect time."""
+        self._target_driver_func = func
 
     @property
     def network_bound_methods(self) -> Set[str]:

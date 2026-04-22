@@ -98,6 +98,13 @@ def _build(
         return_value=strategy_pick)
     svc.is_login_exception = MagicMock(return_value=False)  # type: ignore[method-assign]
     svc.set_availability = MagicMock()  # type: ignore[method-assign]
+    # _open_direct routes fresh instance connects through the plugin
+    # pipeline via ``plugin_service.connect``. Replace it with the same
+    # AsyncMock the old pipeline-bypass tests used for
+    # ``driver_dialect.connect``, so existing test configuration
+    # (return_value / side_effect on driver_dialect.connect) carries
+    # over unchanged.
+    svc.connect = driver_dialect.connect  # type: ignore[method-assign]
 
     plugin = AsyncAuroraInitialConnectionStrategyPlugin(svc)
     return plugin, svc, driver_dialect

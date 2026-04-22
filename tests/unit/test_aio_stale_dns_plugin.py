@@ -73,6 +73,11 @@ def _build(
     svc.get_host_role = AsyncMock(return_value=role)  # type: ignore[method-assign]
     svc.refresh_host_list = AsyncMock()  # type: ignore[method-assign]
     svc.force_refresh_host_list = AsyncMock()  # type: ignore[method-assign]
+    # The fresh-writer connection is opened via ``plugin_service.connect``
+    # which routes through the full plugin pipeline. Patch the bound
+    # method so tests can assert without wiring a real plugin manager.
+    svc.connect = AsyncMock(  # type: ignore[method-assign]
+        return_value=MagicMock(name="writer_conn"))
 
     plugin = AsyncStaleDnsPlugin(svc)
     return plugin, svc, driver_dialect
@@ -172,8 +177,8 @@ def test_writer_role_matching_dns_returns_original_conn():
         result = asyncio.run(_run())
 
     assert result is conn
-    # No fresh writer connection opened.
-    driver_dialect.connect.assert_not_awaited()
+    # No fresh writer connection opened through the pipeline.
+    svc.connect.assert_not_awaited()
     # Writer role -> plain refresh (not force).
     svc.refresh_host_list.assert_awaited_once()
     svc.force_refresh_host_list.assert_not_awaited()
@@ -207,9 +212,10 @@ def test_reader_role_force_refreshes_and_swaps_to_writer():
 
         result = asyncio.run(_run())
 
-    # New connection came from driver_dialect.connect, not connect_func.
-    driver_dialect.connect.assert_awaited_once()
-    assert result is driver_dialect.connect.return_value
+    # New connection came from plugin_service.connect (pipeline), not
+    # connect_func.
+    svc.connect.assert_awaited_once()
+    assert result is svc.connect.return_value
     # Reader role -> force-refresh, not plain refresh.
     svc.force_refresh_host_list.assert_awaited_once()
     svc.refresh_host_list.assert_not_awaited()
@@ -251,8 +257,8 @@ def test_mismatched_dns_triggers_swap_even_when_role_is_writer():
 
         result = asyncio.run(_run())
 
-    driver_dialect.connect.assert_awaited_once()
-    assert result is driver_dialect.connect.return_value
+    svc.connect.assert_awaited_once()
+    assert result is svc.connect.return_value
     driver_dialect.abort_connection.assert_awaited_once_with(stale_conn)
     # is_initial_connection=False -> initial_connection_host_info stays None.
     assert svc.initial_connection_host_info is None

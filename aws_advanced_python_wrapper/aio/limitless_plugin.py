@@ -30,11 +30,10 @@ Minimal vs sync:
 * Router selection uses ``weighted_random`` (matches sync's primary
   path through ``LimitlessRouterService.establish_connection``).
 * No ``LIMITLESS_QUERY_TIMEOUT`` enforcement, no telemetry.
-* The router connection is opened directly via
-  :meth:`AsyncDriverDialect.connect`, bypassing the plugin pipeline.
-  Caller plugins (IAM auth etc.) will NOT re-apply on the router conn
-  -- documented limitation shared with other async connect-swapping
-  plugins (see :mod:`stale_dns_plugin`).
+* The router connection is opened via
+  :meth:`AsyncPluginService.connect` (skipping this plugin to avoid
+  recursion), so caller plugins (IAM, Secrets, Federated, Okta,
+  connection tracker) re-apply on the router connection.
 
 A full port with the background monitor can land later if a consumer
 needs it; Task 1-B's ``AsyncCustomEndpointMonitor`` is a ready
@@ -137,13 +136,14 @@ class AsyncLimitlessPlugin(AsyncPlugin):
         logger.debug(
             "LimitlessRouterService.SelectedHost", picked.host)
 
-        # Open a connection to the picked router. Bypasses the pipeline
-        # to avoid recursion back through this plugin; caller plugins
-        # (IAM etc.) do NOT re-apply. Documented async limitation.
+        # Open a connection to the picked router through the plugin
+        # pipeline, skipping ourselves to avoid recursion. Caller
+        # plugins (IAM, Secrets, Federated, Okta, connection tracker)
+        # re-apply on the router connection.
         router_props = self._props_with_host(props, picked)
         try:
-            router_conn = await driver_dialect.connect(
-                picked, router_props, target_driver_func)
+            router_conn = await self._plugin_service.connect(
+                picked, router_props, plugin_to_skip=self)
         except Exception:  # noqa: BLE001
             logger.debug(
                 "LimitlessRouterService.FailedToConnectToHost", picked.host)

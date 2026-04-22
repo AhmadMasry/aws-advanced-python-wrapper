@@ -101,6 +101,12 @@ def _build(
     driver_dialect.connect = AsyncMock()
     driver_dialect.abort_connection = AsyncMock()
 
+    # Router connections now route through plugin_service.connect (pipeline).
+    # Alias it onto driver_dialect.connect so tests that configure
+    # driver_dialect.connect.return_value carry over; individual tests
+    # may override plugin_service.connect directly for finer control.
+    plugin_service.connect = driver_dialect.connect
+
     plugin = AsyncLimitlessPlugin(plugin_service, Properties({}))
     return plugin, plugin_service, driver_dialect, initial_conn
 
@@ -174,7 +180,7 @@ def test_connect_opens_router_connection_when_strategy_picks_one():
             rows=rows, strategy_returns=picked)
 
         router_conn = MagicMock(name="router_conn")
-        driver_dialect.connect = AsyncMock(return_value=router_conn)
+        plugin_service.connect = AsyncMock(return_value=router_conn)
 
         connect_func = await _connect_func_factory(initial_conn)
 
@@ -196,8 +202,9 @@ def test_connect_opens_router_connection_when_strategy_picks_one():
         assert args[1] == "weighted_random"
         # Two routers parsed from rows.
         assert len(args[2]) == 2
-        # Router conn was opened, initial conn was aborted.
-        driver_dialect.connect.assert_awaited_once()
+        # Router conn was opened through the pipeline; initial conn
+        # was aborted.
+        plugin_service.connect.assert_awaited_once()
         driver_dialect.abort_connection.assert_awaited_once_with(
             initial_conn)
 
@@ -248,7 +255,7 @@ def test_second_connect_within_ttl_reuses_cached_router_list():
         # First connect: query fires, cache gets populated.
         router_conn1 = MagicMock(name="router_conn1")
         router_conn2 = MagicMock(name="router_conn2")
-        driver_dialect.connect = AsyncMock(
+        plugin_service.connect = AsyncMock(
             side_effect=[router_conn1, router_conn2])
 
         connect_func1 = await _connect_func_factory(initial_conn)
