@@ -525,3 +525,117 @@ def test_factory_registers_active_plugin_post_task_1b():
     # The active class -- has `connect` that actually does work.
     assert isinstance(plugins[0], AsyncCustomEndpointPlugin)
     assert plugins[0].subscribed_methods == {DbApiMethod.CONNECT.method_name}
+
+
+# ---- Telemetry counters ------------------------------------------------
+
+
+def test_plugin_emits_wait_for_info_counter_when_actually_waiting():
+    """custom_endpoint.wait_for_info.count increments when the plugin
+    actually awaits wait_for_info. Disabling the wait (via
+    wait_for_custom_endpoint_info=false) must leave the counter untouched."""
+    async def _body() -> None:
+        aio_cleanup.clear_shutdown_hooks()
+        props = Properties({
+            "host": "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+            "cluster_id": "c",
+            "wait_for_custom_endpoint_info_timeout_ms": "50",
+        })
+
+        fake_counters: dict = {}
+
+        def _create_counter(name):
+            c = MagicMock(name=f"counter:{name}")
+            fake_counters[name] = c
+            return c
+
+        fake_tf = MagicMock()
+        fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+
+        svc = AsyncPluginServiceImpl(props, MagicMock(), HostInfo("h", 5432))
+        svc.set_telemetry_factory(fake_tf)
+        plugin = AsyncCustomEndpointPlugin(svc, props)
+
+        with patch.object(
+            AsyncCustomEndpointMonitor,
+            "_fetch_members_blocking",
+            return_value=[],
+        ):
+            raw_conn = MagicMock()
+
+            async def _connect_func() -> object:
+                return raw_conn
+
+            try:
+                await plugin.connect(
+                    target_driver_func=lambda: None,
+                    driver_dialect=MagicMock(),
+                    host_info=HostInfo(
+                        "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+                        5432,
+                    ),
+                    props=props,
+                    is_initial_connection=True,
+                    connect_func=_connect_func,
+                )
+            finally:
+                await aio_cleanup.release_resources_async()
+
+        assert fake_counters["custom_endpoint.wait_for_info.count"].inc.called
+
+    asyncio.run(_body())
+
+
+def test_plugin_skips_wait_for_info_counter_when_wait_disabled():
+    """Disabling the wait (wait_for_custom_endpoint_info=false) must leave
+    the counter untouched -- no inc when the await path is skipped."""
+    async def _body() -> None:
+        aio_cleanup.clear_shutdown_hooks()
+        props = Properties({
+            "host": "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+            "cluster_id": "c",
+            "wait_for_custom_endpoint_info": "false",
+        })
+
+        fake_counters: dict = {}
+
+        def _create_counter(name):
+            c = MagicMock(name=f"counter:{name}")
+            fake_counters[name] = c
+            return c
+
+        fake_tf = MagicMock()
+        fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+
+        svc = AsyncPluginServiceImpl(props, MagicMock(), HostInfo("h", 5432))
+        svc.set_telemetry_factory(fake_tf)
+        plugin = AsyncCustomEndpointPlugin(svc, props)
+
+        with patch.object(
+            AsyncCustomEndpointMonitor,
+            "_fetch_members_blocking",
+            return_value=[],
+        ):
+            raw_conn = MagicMock()
+
+            async def _connect_func() -> object:
+                return raw_conn
+
+            try:
+                await plugin.connect(
+                    target_driver_func=lambda: None,
+                    driver_dialect=MagicMock(),
+                    host_info=HostInfo(
+                        "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+                        5432,
+                    ),
+                    props=props,
+                    is_initial_connection=True,
+                    connect_func=_connect_func,
+                )
+            finally:
+                await aio_cleanup.release_resources_async()
+
+        assert fake_counters["custom_endpoint.wait_for_info.count"].inc.called is False
+
+    asyncio.run(_body())

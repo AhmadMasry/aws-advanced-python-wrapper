@@ -498,3 +498,44 @@ def test_federated_plugin_emits_fetch_token_counter_on_fresh_token():
         asyncio.run(plugin._resolve_credentials(
             HostInfo("rds.example", 5432), props))
         assert fake_counters["federated.fetch_token.count"].inc.call_count == 1
+
+
+def test_okta_plugin_emits_distinct_counter_not_federated():
+    """AsyncOktaAuthPlugin emits ``okta.fetch_token.count`` rather than
+    inheriting the federated counter name. Matches sync okta_plugin.py:65
+    (distinct metric per IdP so dashboards can split federated vs Okta)."""
+    props = _okta_props()
+
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+
+    svc = AsyncPluginServiceImpl(
+        props, MagicMock(), HostInfo("rds.example", 5432))
+    svc.set_telemetry_factory(fake_tf)
+    plugin = AsyncOktaAuthPlugin(svc, props)
+
+    with patch.object(
+            AsyncOktaAuthPlugin, "_fetch_saml_assertion",
+            new=AsyncMock(return_value=_FAKE_SAML),
+    ), patch.object(
+            AsyncFederatedAuthPlugin, "_sts_assume_role_with_saml_blocking",
+            return_value=_FAKE_CREDS,
+    ), patch.object(
+            AsyncFederatedAuthPlugin, "_generate_rds_token_blocking",
+            return_value="okta-iam-token",
+    ):
+        asyncio.run(plugin._resolve_credentials(
+            HostInfo("rds.example", 5432), props))
+
+    # Okta-specific counter created + emitted; federated counter was
+    # never created on this plugin.
+    assert "okta.fetch_token.count" in fake_counters
+    assert fake_counters["okta.fetch_token.count"].inc.call_count == 1
+    assert "federated.fetch_token.count" not in fake_counters

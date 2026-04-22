@@ -643,3 +643,113 @@ def test_is_pool_connection_helper():
         pass
     _FakeRaw.__module__ = "psycopg"
     assert AsyncReadWriteSplittingPlugin._is_pool_connection(_FakeRaw()) is False
+
+
+# ---- Telemetry counters ------------------------------------------------
+
+
+def _build_with_counters(topology=None):
+    """Same as _build() but wires a MagicMock telemetry factory onto the
+    plugin service BEFORE the plugin is constructed, so the counters the
+    plugin captures in __init__ are the mocks we can assert on.
+
+    Returns (plugin, svc, driver_dialect, counters).
+    """
+    props = Properties({"host": "cluster.example", "port": "5432"})
+
+    driver_dialect = MagicMock()
+    driver_dialect.connect = AsyncMock(
+        side_effect=lambda host_info, props, fn: MagicMock(
+            name=f"conn-to-{host_info.host}"
+        )
+    )
+    driver_dialect.is_closed = AsyncMock(return_value=False)
+    driver_dialect.is_in_transaction = AsyncMock(return_value=False)
+    driver_dialect.transfer_session_state = AsyncMock()
+
+    svc = AsyncPluginServiceImpl(
+        props, driver_dialect, HostInfo(host="writer.example", port=5432, role=HostRole.WRITER)
+    )
+    writer_conn = MagicMock(name="writer_conn")
+    svc._current_connection = writer_conn
+    svc.get_host_info_by_strategy = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda role, strategy, candidates: (
+            next((h for h in (candidates or ()) if h.role == role), None)))
+
+    # Wire fake telemetry BEFORE constructing the plugin.
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+    svc.set_telemetry_factory(fake_tf)
+
+    hlp = MagicMock()
+    hlp.refresh = AsyncMock(
+        return_value=topology or (
+            HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),
+            HostInfo(host="reader.example", port=5432, role=HostRole.READER),
+        )
+    )
+
+    plugin = AsyncReadWriteSplittingPlugin(svc, hlp, props)
+    plugin._writer_conn = writer_conn
+    plugin._writer_host_info = HostInfo(
+        host="writer.example", port=5432, role=HostRole.WRITER
+    )
+    return plugin, svc, driver_dialect, fake_counters
+
+
+def test_switch_to_reader_emits_telemetry_counter():
+    """rws.switches.to_reader.count increments on a successful reader swap."""
+    async def _body() -> None:
+        plugin, svc, dd, counters = _build_with_counters()
+
+        async def _work() -> None:
+            return None
+
+        await plugin.execute(
+            object(),
+            DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _work,
+            True,
+        )
+
+        assert counters["rws.switches.to_reader.count"].inc.called
+        assert counters["rws.switches.to_writer.count"].inc.called is False
+
+    asyncio.run(_body())
+
+
+def test_switch_to_writer_emits_telemetry_counter():
+    """rws.switches.to_writer.count increments on a successful writer swap
+    (cached-writer path triggered by flipping read_only back to False)."""
+    async def _body() -> None:
+        plugin, svc, dd, counters = _build_with_counters()
+
+        async def _work() -> None:
+            return None
+
+        # First flip to reader, then back to writer -- second flip is
+        # the writer-swap we want to observe.
+        await plugin.execute(
+            object(),
+            DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _work,
+            True,
+        )
+        counters["rws.switches.to_writer.count"].inc.reset_mock()
+        await plugin.execute(
+            object(),
+            DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _work,
+            False,
+        )
+
+        assert counters["rws.switches.to_writer.count"].inc.called
+
+    asyncio.run(_body())

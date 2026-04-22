@@ -198,6 +198,15 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
         self._plugin_service = plugin_service
         self._props = props
         self._monitor: Optional[AsyncCustomEndpointMonitor] = None
+        # Telemetry counter -- mirrors sync custom_endpoint_plugin.py:263's
+        # "customEndpoint.waitForInfo.counter". Emitted only when the
+        # plugin actually awaits ``monitor.wait_for_info(...)`` -- the
+        # early-return paths (no monitor, wait disabled) skip the inc.
+        # NullTelemetryFactory returns a no-op object; real factories may
+        # return None, so the .inc() site guards with ``is not None``.
+        tf = self._plugin_service.get_telemetry_factory()
+        self._wait_for_info_counter = tf.create_counter(
+            "custom_endpoint.wait_for_info.count")
 
     @property
     def subscribed_methods(self) -> Set[str]:
@@ -246,6 +255,8 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
                     timeout_ms = WrapperProperties.WAIT_FOR_CUSTOM_ENDPOINT_INFO_TIMEOUT_MS.get_int(props)
                     if timeout_ms is None or timeout_ms <= 0:
                         timeout_ms = 5000
+                    if self._wait_for_info_counter is not None:
+                        self._wait_for_info_counter.inc()
                     await monitor.wait_for_info(timeout_ms / 1000.0)
         return conn
 

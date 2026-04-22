@@ -138,13 +138,13 @@ class _AuroraConnectionTrackerFactory:
 class _ConnectTimeFactory:
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
-        return AsyncConnectTimePlugin()
+        return AsyncConnectTimePlugin(plugin_service)
 
 
 class _ExecuteTimeFactory:
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
-        return AsyncExecuteTimePlugin()
+        return AsyncExecuteTimePlugin(plugin_service)
 
 
 class _DeveloperFactory:

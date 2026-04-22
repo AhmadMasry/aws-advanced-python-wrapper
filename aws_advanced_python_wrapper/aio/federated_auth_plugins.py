@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl as _ssl
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple
 from urllib.parse import urljoin
 
 from aws_advanced_python_wrapper.aio.auth_plugins import AsyncAuthPluginBase
@@ -173,16 +173,21 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
       * ``http_request_connect_timeout`` (sec, default 60).
     """
 
+    # Counter name is a class-level attribute so subclasses (AsyncOkta)
+    # can override it for distinct per-IdP metrics matching sync
+    # (``federated.fetch_token.count`` vs ``okta.fetch_token.count``).
+    _FETCH_TOKEN_COUNTER_NAME: ClassVar[str] = "federated.fetch_token.count"
+
     def __init__(self, plugin_service: Any, props: Properties) -> None:
         AsyncAuthPluginBase.__init__(self, plugin_service, props)
         _RdsTokenMixin.__init__(self)
-        # Telemetry counter -- matches sync federated_plugin.py:69.
-        # AsyncOktaAuthPlugin subclasses this plugin, so the counter is
-        # shared (sync okta_plugin.py uses a distinct "okta.fetch_token.count"
-        # but that's a future enhancement -- for async we keep it single).
+        # Telemetry counter -- matches sync federated_plugin.py:69 /
+        # okta_plugin.py:65. Counter name is pulled from the class-level
+        # attribute so AsyncOkta can distinguish its IdP without any
+        # custom __init__.
         tf = self._plugin_service.get_telemetry_factory()
         self._fetch_token_counter = tf.create_counter(
-            "federated.fetch_token.count")
+            self._FETCH_TOKEN_COUNTER_NAME)
 
     def _default_port(self) -> int:
         """Dialect-aware default port fallback.
@@ -214,10 +219,12 @@ class AsyncFederatedAuthPlugin(AsyncAuthPluginBase, _RdsTokenMixin):
         if cached is not None:
             return db_user, cached, True
 
-        # Cache miss: we'll generate a fresh RDS IAM token below. Emit the
-        # counter here so it covers both the federated and Okta flows
-        # (AsyncOktaAuthPlugin overrides _fetch_saml_assertion but reuses
-        # this resolve path).
+        # Cache miss: we'll generate a fresh RDS IAM token below. Emit
+        # the counter here so it covers both the federated and Okta
+        # flows. AsyncOktaAuthPlugin overrides _fetch_saml_assertion but
+        # reuses this resolve path; it also overrides
+        # _FETCH_TOKEN_COUNTER_NAME so its emissions land on the distinct
+        # ``okta.fetch_token.count`` metric.
         if self._fetch_token_counter is not None:
             self._fetch_token_counter.inc()
 
@@ -335,6 +342,9 @@ class AsyncOktaAuthPlugin(AsyncFederatedAuthPlugin):
       * ``idp_username`` / ``idp_password`` / ``iam_role_arn`` /
         ``iam_idp_arn`` / ``iam_region``: shared with federated base.
     """
+
+    # Distinct metric per IdP -- matches sync okta_plugin.py:65.
+    _FETCH_TOKEN_COUNTER_NAME: ClassVar[str] = "okta.fetch_token.count"
 
     _OKTA_AUTHN_PATH = "/api/v1/authn"
     _OKTA_APP_SAML_PATH_TEMPLATE = "/app/amazon_aws/{app_id}/sso/saml"

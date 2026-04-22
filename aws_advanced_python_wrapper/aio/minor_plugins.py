@@ -47,6 +47,8 @@ from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
 
@@ -55,14 +57,27 @@ class AsyncConnectTimePlugin(AsyncPlugin):
     """Record wall-clock time spent in the connect phase.
 
     State is per-instance; applications can read ``total_connect_time_ns``
-    to aggregate.
+    to aggregate. ``plugin_service`` is optional so tests that never
+    exercise telemetry can keep constructing the plugin with no args;
+    production code (via the factory) always passes one.
     """
 
     _SUBSCRIBED: Set[str] = {DbApiMethod.CONNECT.method_name}
 
-    def __init__(self) -> None:
+    def __init__(
+            self,
+            plugin_service: Optional[AsyncPluginService] = None) -> None:
         self.total_connect_time_ns: int = 0
         self.connect_count: int = 0
+        self._plugin_service = plugin_service
+        # Telemetry counter -- matches sync ConnectTimePlugin intent.
+        # NullTelemetryFactory returns a no-op; real factories may return
+        # None, so every .inc() guards with ``is not None``.
+        self._connect_counter = None
+        if plugin_service is not None:
+            tf = plugin_service.get_telemetry_factory()
+            self._connect_counter = tf.create_counter(
+                "connect_time.total.count")
 
     @property
     def subscribed_methods(self) -> Set[str]:
@@ -82,12 +97,17 @@ class AsyncConnectTimePlugin(AsyncPlugin):
         finally:
             self.total_connect_time_ns += time.perf_counter_ns() - start_ns
             self.connect_count += 1
+            if self._connect_counter is not None:
+                self._connect_counter.inc()
 
 
 class AsyncExecuteTimePlugin(AsyncPlugin):
     """Record wall-clock time spent in execute().
 
     Subscribes to everything network-bound; state is per-instance.
+    ``plugin_service`` is optional so tests that never exercise telemetry
+    can keep constructing the plugin with no args; production code (via
+    the factory) always passes one.
     """
 
     _SUBSCRIBED: Set[str] = {
@@ -100,9 +120,17 @@ class AsyncExecuteTimePlugin(AsyncPlugin):
         DbApiMethod.CONNECTION_ROLLBACK.method_name,
     }
 
-    def __init__(self) -> None:
+    def __init__(
+            self,
+            plugin_service: Optional[AsyncPluginService] = None) -> None:
         self.total_execute_time_ns: int = 0
         self.execute_count: int = 0
+        self._plugin_service = plugin_service
+        self._execute_counter = None
+        if plugin_service is not None:
+            tf = plugin_service.get_telemetry_factory()
+            self._execute_counter = tf.create_counter(
+                "execute_time.total.count")
 
     @property
     def subscribed_methods(self) -> Set[str]:
@@ -121,6 +149,8 @@ class AsyncExecuteTimePlugin(AsyncPlugin):
         finally:
             self.total_execute_time_ns += time.perf_counter_ns() - start_ns
             self.execute_count += 1
+            if self._execute_counter is not None:
+                self._execute_counter.inc()
 
 
 class AsyncDeveloperPlugin(AsyncPlugin):

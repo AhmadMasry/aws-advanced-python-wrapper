@@ -63,6 +63,15 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         self._reader_conn: Optional[Any] = None
         self._reader_host_info: Optional[HostInfo] = None
 
+        # Telemetry counters -- one per successful reader/writer swap.
+        # NullTelemetryFactory returns a no-op object; real factories may
+        # return None, so every .inc() guards with ``is not None``.
+        tf = self._plugin_service.get_telemetry_factory()
+        self._switch_to_reader_counter = tf.create_counter(
+            "rws.switches.to_reader.count")
+        self._switch_to_writer_counter = tf.create_counter(
+            "rws.switches.to_writer.count")
+
     @property
     def subscribed_methods(self) -> Set[str]:
         return set(self._SUBSCRIBED)
@@ -187,6 +196,8 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             await self._plugin_service.set_current_connection(
                 self._reader_conn, self._reader_host_info)
             await self._release_pool_conn(current, driver_dialect)
+            if self._switch_to_reader_counter is not None:
+                self._switch_to_reader_counter.inc()
             return
 
         # Cache invalid -> drop and reopen
@@ -224,6 +235,8 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             self._reader_host_info = reader
             await self._plugin_service.set_current_connection(new_conn, reader)
             await self._release_pool_conn(current, driver_dialect)
+            if self._switch_to_reader_counter is not None:
+                self._switch_to_reader_counter.inc()
             return
 
         raise ReadWriteSplittingError(
@@ -246,6 +259,8 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             await self._plugin_service.set_current_connection(
                 self._writer_conn, self._writer_host_info)
             await self._release_pool_conn(current, driver_dialect)
+            if self._switch_to_writer_counter is not None:
+                self._switch_to_writer_counter.inc()
             return
 
         # Cache invalid -> drop and reopen
@@ -265,6 +280,8 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         self._writer_host_info = writer
         await self._plugin_service.set_current_connection(new_conn, writer)
         await self._release_pool_conn(current, driver_dialect)
+        if self._switch_to_writer_counter is not None:
+            self._switch_to_writer_counter.inc()
 
     async def _open(
             self,

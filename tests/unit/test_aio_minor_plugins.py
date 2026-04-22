@@ -329,3 +329,80 @@ def test_developer_plugin_state_is_class_level_shared_across_instances():
         assert await p1.execute(object(), "Cursor.execute", _work) == "ok"
 
     asyncio.run(_body())
+
+
+# --------------------------------------------------------------------------- #
+# Telemetry counters on ConnectTime / ExecuteTime plugins.
+# --------------------------------------------------------------------------- #
+
+
+def _svc_with_counters(props: Properties):
+    """Build an AsyncPluginServiceImpl with a MagicMock telemetry factory.
+
+    Returns (svc, counters) where counters is a dict of name -> MagicMock.
+    """
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginServiceImpl
+
+    fake_counters: dict = {}
+
+    def _create_counter(name):
+        c = MagicMock(name=f"counter:{name}")
+        fake_counters[name] = c
+        return c
+
+    fake_tf = MagicMock()
+    fake_tf.create_counter = MagicMock(side_effect=_create_counter)
+
+    svc = AsyncPluginServiceImpl(props, MagicMock(), HostInfo(host="h", port=5432))
+    svc.set_telemetry_factory(fake_tf)
+    return svc, fake_counters
+
+
+def test_connect_time_plugin_emits_total_count_counter():
+    """connect_time.total.count increments once per connect call."""
+    async def _body() -> None:
+        svc, counters = _svc_with_counters(Properties({"host": "h"}))
+        p = AsyncConnectTimePlugin(svc)
+
+        async def _connect() -> str:
+            return "ok"
+
+        await p.connect(
+            target_driver_func=lambda: None,
+            driver_dialect=MagicMock(),
+            host_info=HostInfo(host="h", port=5432),
+            props=Properties({}),
+            is_initial_connection=True,
+            connect_func=_connect,
+        )
+        assert counters["connect_time.total.count"].inc.call_count == 1
+
+        # Second call increments again.
+        await p.connect(
+            target_driver_func=lambda: None,
+            driver_dialect=MagicMock(),
+            host_info=HostInfo(host="h", port=5432),
+            props=Properties({}),
+            is_initial_connection=False,
+            connect_func=_connect,
+        )
+        assert counters["connect_time.total.count"].inc.call_count == 2
+
+    asyncio.run(_body())
+
+
+def test_execute_time_plugin_emits_total_count_counter():
+    """execute_time.total.count increments once per execute call."""
+    async def _body() -> None:
+        svc, counters = _svc_with_counters(Properties({"host": "h"}))
+        p = AsyncExecuteTimePlugin(svc)
+
+        async def _work() -> str:
+            return "rows"
+
+        await p.execute(object(), "Cursor.execute", _work)
+        await p.execute(object(), "Cursor.execute", _work)
+        assert counters["execute_time.total.count"].inc.call_count == 2
+
+    asyncio.run(_body())
