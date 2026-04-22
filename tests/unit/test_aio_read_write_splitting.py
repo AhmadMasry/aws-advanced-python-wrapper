@@ -630,19 +630,21 @@ def test_swap_does_not_close_non_pool_conn():
 
 
 def test_is_pool_connection_helper():
-    from aws_advanced_python_wrapper.aio.read_write_splitting_plugin import \
-        AsyncReadWriteSplittingPlugin
-    assert AsyncReadWriteSplittingPlugin._is_pool_connection(None) is False
+    """_is_pool_connection is now an instance method that consults the
+    ConnectionProviderManager first, falling back to the SA pool module
+    heuristic."""
+    plugin, *_ = _build()
+    assert plugin._is_pool_connection(None) is False
 
     class _FakePool:
         pass
     _FakePool.__module__ = "sqlalchemy.pool.impl"
-    assert AsyncReadWriteSplittingPlugin._is_pool_connection(_FakePool()) is True
+    assert plugin._is_pool_connection(_FakePool()) is True
 
     class _FakeRaw:
         pass
     _FakeRaw.__module__ = "psycopg"
-    assert AsyncReadWriteSplittingPlugin._is_pool_connection(_FakeRaw()) is False
+    assert plugin._is_pool_connection(_FakeRaw()) is False
 
 
 # ---- Telemetry counters ------------------------------------------------

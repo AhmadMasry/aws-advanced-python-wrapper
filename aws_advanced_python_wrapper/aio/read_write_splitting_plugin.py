@@ -138,18 +138,29 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
                 return True
         return False
 
-    @staticmethod
-    def _is_pool_connection(conn: Any) -> bool:
-        """Return True if ``conn`` appears to be managed by SQLAlchemy's
-        internal pool.
+    def _is_pool_connection(self, conn: Any) -> bool:
+        """Return True if ``conn`` is managed by a pool provider.
 
-        Sync uses ConnectionProviderManager to look up the provider class
-        (read_write_splitting_plugin.py:214-216). Async uses a simpler
-        heuristic: check the connection's module path. Misses custom
-        pool wrappers but covers the common SA pool case.
+        Primary check: ask the AsyncConnectionProviderManager whether
+        a user-registered pool provider accepts the current host info.
+        Falls back to the SQLAlchemy-pool module-string heuristic for
+        back-compat with deployments that hook SA's pool without
+        going through our provider manager.
         """
         if conn is None:
             return False
+        # Provider-manager check (preferred).
+        try:
+            manager = self._plugin_service.get_connection_provider_manager()
+            host_info = self._plugin_service.current_host_info
+            props = self._plugin_service.props
+            if host_info is not None:
+                provider = manager.get_connection_provider(host_info, props)
+                if provider is not manager.default_provider:
+                    return True
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+        # Back-compat heuristic for SA pool connections.
         module = getattr(type(conn), "__module__", "")
         return module.startswith("sqlalchemy.pool")
 

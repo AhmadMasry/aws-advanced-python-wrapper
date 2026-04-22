@@ -108,30 +108,65 @@ class AsyncOpenedConnectionTracker:
                 return alias
         return host_info.as_alias()
 
+    @staticmethod
+    def _all_keys(host_info: HostInfo) -> Set[str]:
+        """Return every alias worth tracking ``host_info`` under.
+
+        Sync's ``OpenedConnectionTracker`` tracks connections keyed on
+        every alias in ``host_info.as_aliases()`` so a later invalidation
+        via any alias closes the same underlying connection set. We
+        mirror that here: track under each alias plus the canonical
+        RDS-instance endpoint.
+        """
+        keys: Set[str] = set()
+        canonical = AsyncOpenedConnectionTracker._canonical_key(host_info)
+        if canonical:
+            keys.add(canonical)
+        try:
+            for alias in host_info.as_aliases():
+                if alias:
+                    keys.add(alias)
+        except Exception:  # noqa: BLE001 - as_aliases() is best-effort
+            pass
+        return keys
+
     def track(self, host_info: HostInfo, conn: Any) -> None:
-        key = self._canonical_key(host_info)
-        conn_set = AsyncOpenedConnectionTracker._tracked.setdefault(
-            key, WeakSet())
-        conn_set.add(conn)
+        for key in self._all_keys(host_info):
+            conn_set = AsyncOpenedConnectionTracker._tracked.setdefault(
+                key, WeakSet())
+            conn_set.add(conn)
 
     def remove(self, host_info: HostInfo, conn: Any) -> None:
-        key = self._canonical_key(host_info)
-        conn_set = AsyncOpenedConnectionTracker._tracked.get(key)
-        if conn_set is not None:
-            conn_set.discard(conn)
+        for key in self._all_keys(host_info):
+            conn_set = AsyncOpenedConnectionTracker._tracked.get(key)
+            if conn_set is not None:
+                conn_set.discard(conn)
 
     async def invalidate_all(self, host_info: HostInfo) -> None:
-        """Close every tracked connection to ``host_info``'s canonical key.
+        """Close every tracked connection reachable via any alias of ``host_info``.
 
         Best-effort: individual close failures are swallowed so one
-        broken connection doesn't block closing the rest.
+        broken connection doesn't block closing the rest. Fixes the
+        prior canonical-key-only semantics that could miss invalidations
+        when the caller held a non-canonical alias.
         """
-        key = self._canonical_key(host_info)
-        conn_set = AsyncOpenedConnectionTracker._tracked.get(key)
-        if conn_set is None:
-            return
-        snapshot = list(conn_set)
-        for conn in snapshot:
+        # Gather the full connection set from every alias; close each
+        # connection exactly once, then purge the alias entries.
+        seen_conns: Set[int] = set()
+        to_close: list = []
+        keys = self._all_keys(host_info)
+        for key in keys:
+            conn_set = AsyncOpenedConnectionTracker._tracked.get(key)
+            if conn_set is None:
+                continue
+            for c in list(conn_set):
+                cid = id(c)
+                if cid in seen_conns:
+                    continue
+                seen_conns.add(cid)
+                to_close.append(c)
+
+        for conn in to_close:
             try:
                 close = getattr(conn, "close", None)
                 if close is None:
@@ -141,10 +176,12 @@ class AsyncOpenedConnectionTracker:
                     await result
             except Exception:  # noqa: BLE001 - close is best-effort
                 pass
-        try:
-            del AsyncOpenedConnectionTracker._tracked[key]
-        except KeyError:
-            pass
+
+        for key in keys:
+            try:
+                del AsyncOpenedConnectionTracker._tracked[key]
+            except KeyError:
+                pass
 
     def _tracked_for(self, host_info: HostInfo) -> WeakSet[Any]:
         """Test-only accessor using the canonical key derivation."""
