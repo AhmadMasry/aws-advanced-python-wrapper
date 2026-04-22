@@ -32,6 +32,10 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
                     Set, Tuple)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
+# Reuse the sync data classes -- they're pure holders, no I/O.
+from aws_advanced_python_wrapper.custom_endpoint_plugin import (
+    CustomEndpointInfo, CustomEndpointRoleType)
+from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 
@@ -241,13 +245,12 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
                     register_shutdown_hook
                 register_shutdown_hook(monitor.stop)
 
-                # Phase J: block up to
-                # WAIT_FOR_CUSTOM_ENDPOINT_INFO_TIMEOUT_MS for the first
-                # refresh so the initial query sees the correct
-                # member-instance-ids filter. On timeout we still return
-                # the connection -- caller sees transiently-stale
-                # allowed-hosts rather than a hard failure (async plugin
-                # contract is softer than sync here).
+                # N.3: realign with sync's hard-failure contract. Block
+                # up to WAIT_FOR_CUSTOM_ENDPOINT_INFO_TIMEOUT_MS for the
+                # first refresh; on timeout, abort the connection and
+                # raise AwsWrapperError so callers don't silently see
+                # stale allowed-hosts. Matches sync custom_endpoint_plugin
+                # behavior.
                 wait_enabled = WrapperProperties.WAIT_FOR_CUSTOM_ENDPOINT_INFO.get_bool(props)
                 if wait_enabled is None:
                     wait_enabled = True
@@ -257,7 +260,23 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
                         timeout_ms = 5000
                     if self._wait_for_info_counter is not None:
                         self._wait_for_info_counter.inc()
-                    await monitor.wait_for_info(timeout_ms / 1000.0)
+                    info_ready = await monitor.wait_for_info(
+                        timeout_ms / 1000.0)
+                    if not info_ready:
+                        # Abort the half-established connection; the
+                        # monitor may still finish refresh on a later
+                        # retry but THIS connect() must fail.
+                        try:
+                            await driver_dialect.abort_connection(conn)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise AwsWrapperError(
+                            "Custom endpoint monitor did not produce "
+                            "member instance info within "
+                            f"{timeout_ms}ms. Increase "
+                            "wait_for_custom_endpoint_info_timeout_ms or "
+                            "disable wait_for_custom_endpoint_info to "
+                            "accept unfiltered connections.")
         return conn
 
     def _build_monitor(
@@ -289,4 +308,9 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
         )
 
 
-__all__ = ["AsyncCustomEndpointMonitor", "AsyncCustomEndpointPlugin"]
+__all__ = [
+    "AsyncCustomEndpointMonitor",
+    "AsyncCustomEndpointPlugin",
+    "CustomEndpointInfo",
+    "CustomEndpointRoleType",
+]

@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import asyncio
 from typing import List
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from aws_advanced_python_wrapper.aio import cleanup as aio_cleanup
 from aws_advanced_python_wrapper.aio.custom_endpoint_monitor import (
@@ -251,9 +253,12 @@ def test_plugin_skips_monitor_when_cluster_id_missing():
 def test_plugin_registers_stop_hook_with_release_resources_async():
     async def _body() -> None:
         aio_cleanup.clear_shutdown_hooks()
+        # Disable wait_for_info so the test doesn't block/raise on the
+        # N.3 timeout path -- the point here is the shutdown-hook wiring.
         props = Properties({
             "host": "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
             "cluster_id": "c",
+            "wait_for_custom_endpoint_info": "false",
         })
         plugin = AsyncCustomEndpointPlugin(_svc(props), props)
 
@@ -406,10 +411,9 @@ def test_plugin_connect_waits_for_info_and_returns_conn_on_success():
     asyncio.run(_body())
 
 
-def test_plugin_connect_returns_conn_even_on_wait_timeout():
-    """On wait_for_info timeout, connect still returns the connection.
-    First query may see empty member-instance-ids but the connection
-    itself is usable -- softer contract than sync, which raises."""
+def test_plugin_connect_raises_on_wait_timeout():
+    """On wait_for_info timeout, connect aborts the half-established
+    connection and raises AwsWrapperError (N.3 realignment with sync)."""
     async def _body() -> None:
         aio_cleanup.clear_shutdown_hooks()
         props = Properties({
@@ -431,22 +435,24 @@ def test_plugin_connect_returns_conn_even_on_wait_timeout():
             async def _connect_func() -> object:
                 return raw_conn
 
+            driver_dialect = MagicMock()
+            driver_dialect.abort_connection = AsyncMock()
+
             try:
-                conn = await plugin.connect(
-                    target_driver_func=lambda: None,
-                    driver_dialect=MagicMock(),
-                    host_info=HostInfo(
-                        "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com", 5432,
-                    ),
-                    props=props,
-                    is_initial_connection=True,
-                    connect_func=_connect_func,
-                )
-                # conn returned despite the timeout.
-                assert conn is raw_conn
-                assert plugin.monitor is not None
-                # Event still not set -- we observed the timeout path.
-                assert plugin.monitor._info_ready_event.is_set() is False
+                from aws_advanced_python_wrapper.errors import AwsWrapperError
+                with pytest.raises(AwsWrapperError):
+                    await plugin.connect(
+                        target_driver_func=lambda: None,
+                        driver_dialect=driver_dialect,
+                        host_info=HostInfo(
+                            "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com", 5432,
+                        ),
+                        props=props,
+                        is_initial_connection=True,
+                        connect_func=_connect_func,
+                    )
+                # connection was aborted as part of the raise path.
+                driver_dialect.abort_connection.assert_awaited_once_with(raw_conn)
             finally:
                 await aio_cleanup.release_resources_async()
 
@@ -567,17 +573,24 @@ def test_plugin_emits_wait_for_info_counter_when_actually_waiting():
                 return raw_conn
 
             try:
-                await plugin.connect(
-                    target_driver_func=lambda: None,
-                    driver_dialect=MagicMock(),
-                    host_info=HostInfo(
-                        "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
-                        5432,
-                    ),
-                    props=props,
-                    is_initial_connection=True,
-                    connect_func=_connect_func,
-                )
+                # Expect a raise on timeout now (N.3 realignment), but
+                # the counter still increments because the plugin
+                # entered the wait path before timing out.
+                driver_dialect = MagicMock()
+                driver_dialect.abort_connection = AsyncMock()
+                from aws_advanced_python_wrapper.errors import AwsWrapperError
+                with pytest.raises(AwsWrapperError):
+                    await plugin.connect(
+                        target_driver_func=lambda: None,
+                        driver_dialect=driver_dialect,
+                        host_info=HostInfo(
+                            "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+                            5432,
+                        ),
+                        props=props,
+                        is_initial_connection=True,
+                        connect_func=_connect_func,
+                    )
             finally:
                 await aio_cleanup.release_resources_async()
 
