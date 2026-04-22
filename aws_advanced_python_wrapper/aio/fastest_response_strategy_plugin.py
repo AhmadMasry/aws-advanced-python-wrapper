@@ -12,40 +12,32 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""Async Fastest-Response-Strategy plugin (minimal port).
+"""Async Fastest-Response-Strategy plugin with standing monitors (L.2).
 
-Measures response time on-demand via :func:`asyncio.gather` rather than
-sync's background monitor threads. Trades accuracy for a simpler async
-lifecycle (no thread/task leaks, no cleanup hook required).
+Full port of :mod:`aws_advanced_python_wrapper.fastest_response_strategy_plugin`.
+Ports:
 
-Public surface:
-
-* ``accepts_strategy(role, strategy)`` -- True only for ``"fastest_response"``.
-* ``get_host_info_by_strategy(role, strategy, host_list)`` -- returns the
-  cached winner if any; otherwise falls back to
-  :class:`RandomHostSelector` (the strategy method is sync-callable and
-  can't await a parallel probe).
-* ``measure_and_cache(role)`` -- async helper that probes every host of
-  ``role`` in parallel and caches the fastest.
-* ``notify_host_list_changed(changes)`` -- drops the cache.
-
-Intentional gaps vs the sync implementation:
-
-* No standing monitor -- measurements are on-demand.
-* No per-host telemetry gauge (Phase I scope).
-* No storage-service integration -- the cache lives on the plugin
-  instance.
-
-A future port can add standing :class:`asyncio.Task` monitors if
-consumers need the extra accuracy.
+* :class:`ResponseTimeHolder` -- shared shape with sync.
+* :class:`AsyncHostResponseTimeMonitor` -- per-host background
+  ``asyncio.Task`` that averages N ping round-trips on an interval.
+* :class:`AsyncHostResponseTimeService` -- topology-driven monitor
+  lifecycle (spawns monitors for new hosts, tears them down for
+  removed hosts).
+* :class:`AsyncFastestResponseStrategyPlugin` -- now consults the
+  service for measured response times and falls back to Random only
+  when no host has ever been measured.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple
+from dataclasses import dataclass
+from threading import Lock
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, List,
+                    Optional, Set, Tuple)
 
+from aws_advanced_python_wrapper.aio.cleanup import register_shutdown_hook
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.host_selector import RandomHostSelector
@@ -66,15 +58,280 @@ if TYPE_CHECKING:
 logger = Logger(__name__)
 
 _STRATEGY_NAME = "fastest_response"
-# Sentinel used when a probe fails / times out. Keeps the comparison
-# math integer-only (matches sync's use of MAX_VALUE).
+# Sentinel used when a probe fails / times out. Mirrors sync's MAX_VALUE.
 _MAX_RESPONSE_NS = 10 ** 18
 _DEFAULT_PROBE_TIMEOUT_SEC = 2.0
 _DEFAULT_CACHE_TTL_SEC = 30.0
+_DEFAULT_MEASURE_INTERVAL_MS = 30_000
+_NUM_OF_MEASURES = 5
+
+
+@dataclass
+class ResponseTimeHolder:
+    """Per-host response time snapshot."""
+    url: str
+    response_time_ns: int
+
+
+class AsyncHostResponseTimeCache:
+    """Class-level per-host-URL response-time cache.
+
+    Mirrors sync's storage-service-backed ``ResponseTimeHolder`` cache
+    without the full services-container machinery. Keyed by
+    ``HostInfo.url`` so sync+async plugins reading the same topology
+    converge on the same identifier.
+    """
+
+    _lock: ClassVar[Lock] = Lock()
+    _by_url: ClassVar[Dict[str, ResponseTimeHolder]] = {}
+
+    @classmethod
+    def put(cls, url: str, response_time_ns: int) -> None:
+        with cls._lock:
+            cls._by_url[url] = ResponseTimeHolder(url, response_time_ns)
+
+    @classmethod
+    def get(cls, url: str) -> int:
+        """Return the last recorded response-time ns, or ``_MAX_RESPONSE_NS``
+        if the URL has no measurement yet."""
+        with cls._lock:
+            holder = cls._by_url.get(url)
+        return holder.response_time_ns if holder is not None else _MAX_RESPONSE_NS
+
+    @classmethod
+    def remove(cls, url: str) -> None:
+        with cls._lock:
+            cls._by_url.pop(url, None)
+
+    @classmethod
+    def clear(cls) -> None:
+        with cls._lock:
+            cls._by_url.clear()
+
+
+class AsyncHostResponseTimeMonitor:
+    """Per-host background task that measures response time.
+
+    Lifecycle:
+      * :meth:`start` creates the task if not already running.
+      * :meth:`stop` signals stop + cancels the task.
+      * Monitor owns its probe connection; reopens if closed.
+
+    Measurement cadence:
+      * ``interval_ms`` between measurement rounds.
+      * Each round runs ``_NUM_OF_MEASURES`` pings and averages them.
+      * Writes the average (in ns) to :class:`AsyncHostResponseTimeCache`.
+    """
+
+    def __init__(
+            self,
+            plugin_service: AsyncPluginService,
+            host_info: HostInfo,
+            props: Properties,
+            interval_ms: int) -> None:
+        self._plugin_service = plugin_service
+        self._host_info = host_info
+        self._props = props
+        self._interval_sec = max(0.05, interval_ms / 1000.0)
+        self._probe_timeout_sec = _DEFAULT_PROBE_TIMEOUT_SEC
+        self._task: Optional[asyncio.Task[None]] = None
+        self._stop_event = asyncio.Event()
+        self._probe_conn: Optional[Any] = None
+
+    @property
+    def host_info(self) -> HostInfo:
+        return self._host_info
+
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        if self.is_running():
+            return
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        try:
+            # Initial-delay loop -- short-lived consumers / fast tests
+            # never race with a mid-flight probe.
+            await self._sleep_or_stop()
+            while not self._stop_event.is_set():
+                try:
+                    await self._measure_once()
+                except Exception:  # noqa: BLE001 - transient
+                    pass
+                await self._sleep_or_stop()
+        except asyncio.CancelledError:
+            return
+
+    async def _sleep_or_stop(self) -> None:
+        slept = 0.0
+        step = min(0.05, self._interval_sec)
+        while slept < self._interval_sec and not self._stop_event.is_set():
+            await asyncio.sleep(step)
+            slept += step
+
+    async def _measure_once(self) -> None:
+        if self._probe_conn is None:
+            self._probe_conn = await self._open_probe_connection()
+            if self._probe_conn is None:
+                # Mark host as unreachable so selectors avoid it until
+                # the next successful probe.
+                AsyncHostResponseTimeCache.put(
+                    self._host_info.url, _MAX_RESPONSE_NS)
+                return
+
+        driver_dialect = self._plugin_service.driver_dialect
+        total_ns = 0
+        count = 0
+        for _ in range(_NUM_OF_MEASURES):
+            if self._stop_event.is_set():
+                return
+            start_ns = time.perf_counter_ns()
+            try:
+                ok = await asyncio.wait_for(
+                    driver_dialect.ping(self._probe_conn),
+                    timeout=self._probe_timeout_sec,
+                )
+            except Exception:  # noqa: BLE001 - treat as miss
+                ok = False
+            if ok:
+                total_ns += time.perf_counter_ns() - start_ns
+                count += 1
+            else:
+                # Probe conn likely broken -- reset for next measurement.
+                await self._close_probe_conn()
+                break
+
+        if count > 0:
+            avg_ns = total_ns // count
+            AsyncHostResponseTimeCache.put(self._host_info.url, avg_ns)
+        else:
+            AsyncHostResponseTimeCache.put(
+                self._host_info.url, _MAX_RESPONSE_NS)
+
+    async def _open_probe_connection(self) -> Optional[Any]:
+        try:
+            return await self._plugin_service.connect(
+                self._host_info, self._props)
+        except Exception:  # noqa: BLE001 - probe open best-effort
+            return None
+
+    async def _close_probe_conn(self) -> None:
+        if self._probe_conn is None:
+            return
+        try:
+            await self._plugin_service.driver_dialect.abort_connection(
+                self._probe_conn)
+        except Exception:  # noqa: BLE001
+            pass
+        self._probe_conn = None
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._task = None
+        await self._close_probe_conn()
+
+
+class AsyncHostResponseTimeService:
+    """Topology-aware monitor-lifecycle coordinator.
+
+    Given a set of hosts, creates one :class:`AsyncHostResponseTimeMonitor`
+    per URL. On topology change, tears down monitors for removed hosts
+    and spawns monitors for added hosts. Idempotent on ``set_hosts``.
+    """
+
+    _lock: ClassVar[Lock] = Lock()
+    _monitors: ClassVar[Dict[str, AsyncHostResponseTimeMonitor]] = {}
+
+    def __init__(
+            self,
+            plugin_service: AsyncPluginService,
+            props: Properties,
+            interval_ms: int) -> None:
+        self._plugin_service = plugin_service
+        self._props = props
+        self._interval_ms = interval_ms
+        self._known_urls: Set[str] = set()
+
+    def set_hosts(self, hosts: Tuple[HostInfo, ...]) -> None:
+        # Starting/stopping monitors requires a running event loop
+        # (``asyncio.Event`` and ``create_task`` both need one). If we
+        # were called outside a loop (sync-style test path, notify fired
+        # from a non-asyncio caller), just track the new URL set and
+        # let the next in-loop call reconcile.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._known_urls = {h.url for h in hosts}
+            return
+
+        new_urls = {h.url for h in hosts}
+        new_hosts_by_url = {h.url: h for h in hosts}
+
+        to_add = new_urls - self._known_urls
+        to_remove = self._known_urls - new_urls
+
+        # Spawn monitors for newly-seen hosts.
+        for url in to_add:
+            with AsyncHostResponseTimeService._lock:
+                existing = AsyncHostResponseTimeService._monitors.get(url)
+                if existing is not None and existing.is_running():
+                    continue
+                monitor = AsyncHostResponseTimeMonitor(
+                    self._plugin_service,
+                    new_hosts_by_url[url],
+                    self._props,
+                    self._interval_ms,
+                )
+                AsyncHostResponseTimeService._monitors[url] = monitor
+            monitor.start()
+            register_shutdown_hook(monitor.stop)
+
+        # Tear down monitors for removed hosts.
+        for url in to_remove:
+            with AsyncHostResponseTimeService._lock:
+                stopped = AsyncHostResponseTimeService._monitors.get(url)
+                if stopped is not None:
+                    del AsyncHostResponseTimeService._monitors[url]
+            if stopped is not None:
+                asyncio.create_task(stopped.stop())
+
+        self._known_urls = new_urls
+
+    @staticmethod
+    def get_response_time_ns(host_info: HostInfo) -> int:
+        return AsyncHostResponseTimeCache.get(host_info.url)
+
+    @classmethod
+    async def stop_all(cls) -> None:
+        with cls._lock:
+            monitors = list(cls._monitors.values())
+            cls._monitors.clear()
+        for m in monitors:
+            await m.stop()
+
+    @classmethod
+    def _reset_for_tests(cls) -> None:
+        with cls._lock:
+            cls._monitors.clear()
 
 
 class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
-    """Async counterpart of :class:`FastestResponseStrategyPlugin` (minimal)."""
+    """Async counterpart of :class:`FastestResponseStrategyPlugin`.
+
+    Uses measured response times from :class:`AsyncHostResponseTimeService`;
+    falls back to :class:`RandomHostSelector` only when no host has ever
+    been measured successfully (cold start).
+    """
 
     _SUBSCRIBED: Set[str] = {
         "connect",
@@ -89,33 +346,29 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
             props: Properties) -> None:
         self._plugin_service = plugin_service
         self._props = props
-        self._probe_timeout_sec = _DEFAULT_PROBE_TIMEOUT_SEC
 
-        # Sync uses RESPONSE_MEASUREMENT_INTERVAL_MS (default 30s) for both
-        # the measure cadence AND the cache TTL. We don't run a standing
-        # monitor, so we reuse the same knob purely as cache TTL.
         interval_ms = WrapperProperties.RESPONSE_MEASUREMENT_INTERVAL_MS.get_int(
             props)
-        if interval_ms and interval_ms > 0:
-            self._cache_ttl_sec = interval_ms / 1000.0
-        else:
-            self._cache_ttl_sec = _DEFAULT_CACHE_TTL_SEC
+        if not interval_ms or interval_ms <= 0:
+            interval_ms = _DEFAULT_MEASURE_INTERVAL_MS
+        self._interval_ms = interval_ms
+        self._cache_ttl_sec = interval_ms / 1000.0
+
+        self._response_time_service = AsyncHostResponseTimeService(
+            plugin_service, props, interval_ms)
 
         self._random_selector = RandomHostSelector()
 
-        # Cache keyed by HostRole.name -> (winner, expires_at_loop_time_sec).
+        # Cache keyed by HostRole.name -> (winner, expires_at).
         self._cached_fastest: Dict[str, Tuple[HostInfo, float]] = {}
 
-        # Captured on the first ``connect`` interception so ``measure_and_cache``
-        # can open probe connections without importing the driver module.
-        # Preserves invariant 8a (no direct driver imports from plugin code).
         self._target_driver_func: Optional[Callable] = None
 
     @property
     def subscribed_methods(self) -> Set[str]:
         return set(self._SUBSCRIBED)
 
-    # ---- connect interception (capture target_driver_func) -------------
+    # ---- connect: refresh + seed monitors -----------------------------
 
     async def connect(
             self,
@@ -125,13 +378,20 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             connect_func: Callable[..., Any]) -> Any:
-        # Remember the target driver entry point so measure_and_cache can
-        # open probe connections through driver_dialect.connect(...) without
-        # importing psycopg / aiomysql directly.
         self._target_driver_func = target_driver_func
-        return await connect_func()
+        conn = await connect_func()
 
-    # ---- strategy API --------------------------------------------------
+        if is_initial_connection:
+            try:
+                await self._plugin_service.refresh_host_list(conn)
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+            # Seed monitors from the newly-refreshed topology.
+            self._response_time_service.set_hosts(
+                self._plugin_service.all_hosts)
+        return conn
+
+    # ---- strategy API ------------------------------------------------
 
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         return strategy == _STRATEGY_NAME
@@ -140,10 +400,7 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
             self,
             role: HostRole,
             strategy: str,
-            host_list: Optional[list] = None) -> Optional[HostInfo]:
-        # Sync behaviour: raise for any strategy we don't own. The plugin
-        # manager only routes fastest_response here, but matching the
-        # sync contract keeps direct callers honest.
+            host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
         if strategy != _STRATEGY_NAME:
             logger.error(
                 "FastestResponseStrategyPlugin.UnsupportedHostSelectorStrategy",
@@ -159,36 +416,43 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
         if not candidates:
             return None
 
+        # Cache hit?
         cached = self._cached_fastest.get(role.name)
         if cached is not None:
             winner, expires_at = cached
             if self._loop_time() < expires_at:
-                # Winner still cached; confirm it's still in topology
-                # (sync does the same: cached host must survive topology
-                # changes to remain valid).
                 for h in candidates:
-                    if (h.host == winner.host
-                            and h.port == winner.port):
+                    if (h.host == winner.host and h.port == winner.port):
                         return h
-                # Stale winner -- drop and fall through.
                 self._cached_fastest.pop(role.name, None)
 
-        # No cache; pick Random as fallback. Proper measurement is async
-        # and can't be awaited from this sync method. Callers (or a future
-        # standing-monitor enhancement) can invoke measure_and_cache()
-        # explicitly to warm the cache.
-        logger.debug("FastestResponseStrategyPlugin.RandomHostSelected")
-        return self._random_selector.get_host(
-            tuple(candidates), role, self._props)
+        # Consult the measured-response-time cache.
+        best: Optional[HostInfo] = None
+        best_ns: int = _MAX_RESPONSE_NS
+        for h in candidates:
+            rt = AsyncHostResponseTimeService.get_response_time_ns(h)
+            if rt < best_ns:
+                best = h
+                best_ns = rt
 
-    # ---- async probe ---------------------------------------------------
+        if best is None or best_ns >= _MAX_RESPONSE_NS:
+            # Cold start -- no measurement yet. Fall back to random.
+            logger.debug("FastestResponseStrategyPlugin.RandomHostSelected")
+            return self._random_selector.get_host(
+                tuple(candidates), role, self._props)
+
+        self._cached_fastest[role.name] = (
+            best, self._loop_time() + self._cache_ttl_sec)
+        return best
+
+    # ---- async probe (kept for direct callers / legacy) ---------------
 
     async def measure_and_cache(
             self, role: HostRole) -> Optional[HostInfo]:
-        """Probe every host of ``role`` in parallel; cache the winner.
+        """Probe every host of ``role`` in parallel, record response times.
 
-        Returns the fastest host or ``None`` if every probe failed /
-        timed out.
+        Preserved for direct async callers that want a synchronous
+        (awaitable) warmup before querying the strategy.
         """
         candidates = [
             h for h in self._plugin_service.all_hosts if h.role == role]
@@ -208,6 +472,8 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
                 continue
             if not isinstance(r, int) or r >= _MAX_RESPONSE_NS:
                 continue
+            # Publish each probe's result to the shared cache.
+            AsyncHostResponseTimeCache.put(host.url, r)
             if r < best_ns:
                 best = host
                 best_ns = r
@@ -221,15 +487,7 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
             self,
             host_info: HostInfo,
             driver_dialect: AsyncDriverDialect) -> int:
-        """Open a probe connection, ping, return elapsed ns.
-
-        Returns :data:`_MAX_RESPONSE_NS` on any failure (connection error,
-        timeout, ping returning False).
-        """
         if self._target_driver_func is None:
-            # Haven't seen a connect yet; we don't know how to open a
-            # fresh driver connection. Caller should warm the cache on
-            # its next run.
             return _MAX_RESPONSE_NS
 
         conn: Any = None
@@ -238,11 +496,11 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
             conn = await asyncio.wait_for(
                 driver_dialect.connect(
                     host_info, self._props, self._target_driver_func),
-                timeout=self._probe_timeout_sec,
+                timeout=_DEFAULT_PROBE_TIMEOUT_SEC,
             )
             ok = await asyncio.wait_for(
                 driver_dialect.ping(conn),
-                timeout=self._probe_timeout_sec,
+                timeout=_DEFAULT_PROBE_TIMEOUT_SEC,
             )
             if not ok:
                 return _MAX_RESPONSE_NS
@@ -259,28 +517,29 @@ class AsyncFastestResponseStrategyPlugin(AsyncPlugin):
                 except Exception:  # noqa: BLE001
                     pass
 
-    # ---- notifications -------------------------------------------------
+    # ---- notifications ------------------------------------------------
 
     def notify_host_list_changed(
             self, changes: Dict[str, Set[HostEvent]]) -> None:
-        # Topology changes may have added or removed hosts -- drop the
-        # cache to force a fresh measurement on the next strategy call.
         self._cached_fastest.clear()
+        # Refresh the monitor set to match the new topology.
+        self._response_time_service.set_hosts(
+            self._plugin_service.all_hosts)
 
-    # ---- helpers -------------------------------------------------------
+    # ---- helpers ------------------------------------------------------
 
     @staticmethod
     def _loop_time() -> float:
-        """Return the running loop's clock, or monotonic() as a fallback.
-
-        ``get_host_info_by_strategy`` may be called outside a running
-        loop (e.g., from a sync-style test path); monotonic() gives a
-        consistent monotonic clock for the cache comparison in that case.
-        """
         try:
             return asyncio.get_running_loop().time()
         except RuntimeError:
             return time.monotonic()
 
 
-__all__ = ["AsyncFastestResponseStrategyPlugin"]
+__all__ = [
+    "AsyncFastestResponseStrategyPlugin",
+    "AsyncHostResponseTimeMonitor",
+    "AsyncHostResponseTimeService",
+    "AsyncHostResponseTimeCache",
+    "ResponseTimeHolder",
+]
