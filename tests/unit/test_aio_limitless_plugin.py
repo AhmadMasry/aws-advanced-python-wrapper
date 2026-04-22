@@ -33,10 +33,27 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-from aws_advanced_python_wrapper.aio.limitless_plugin import \
-    AsyncLimitlessPlugin
+import pytest
+
+from aws_advanced_python_wrapper.aio.limitless_plugin import (
+    AsyncLimitlessPlugin, AsyncLimitlessRouterCache,
+    AsyncLimitlessRouterService)
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.utils.properties import Properties
+
+
+@pytest.fixture(autouse=True)
+def _reset_limitless_singletons():
+    """Clear the cluster-level cache + running monitors between tests."""
+    AsyncLimitlessRouterCache.clear()
+    AsyncLimitlessRouterService._reset_for_tests()
+    yield
+    try:
+        asyncio.run(AsyncLimitlessRouterService.stop_all())
+    except RuntimeError:
+        pass
+    AsyncLimitlessRouterCache.clear()
+    AsyncLimitlessRouterService._reset_for_tests()
 
 # ---- Helpers -----------------------------------------------------------
 
