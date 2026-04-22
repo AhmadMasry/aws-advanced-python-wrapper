@@ -67,6 +67,10 @@ class AsyncCustomEndpointMonitor:
         self._interval_sec = max(0.01, float(refresh_interval_sec))
         self._task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
+        # Set after the first successful non-empty member refresh. Plugins
+        # wait on this event via wait_for_info() so the initial query can
+        # see a populated allowed-hosts filter.
+        self._info_ready_event = asyncio.Event()
         self._member_instance_ids: Tuple[str, ...] = ()
         self._last_refresh_ns: int = 0
 
@@ -94,6 +98,10 @@ class AsyncCustomEndpointMonitor:
                         self._last_refresh_ns = int(
                             asyncio.get_event_loop().time() * 1_000_000_000
                         )
+                        # Unblock any plugin.connect() awaiting
+                        # wait_for_info(). Idempotent -- .set() on an
+                        # already-set event is a no-op.
+                        self._info_ready_event.set()
                 except Exception:
                     # Transient AWS failures must not kill the monitor.
                     pass
@@ -135,6 +143,23 @@ class AsyncCustomEndpointMonitor:
         for endpoint in resp.get("DBClusterEndpoints", []):
             members.extend(endpoint.get("StaticMembers") or [])
         return members
+
+    async def wait_for_info(self, timeout_sec: float) -> bool:
+        """Block up to ``timeout_sec`` seconds for the monitor's first
+        successful refresh (non-empty member_instance_ids). Returns True
+        if info arrived; False on timeout.
+
+        Uses an ``asyncio.Event`` set by the monitor task after the first
+        successful fetch. Safe to call multiple times -- once set, the
+        event stays set for the monitor's lifetime, so subsequent callers
+        return immediately.
+        """
+        try:
+            await asyncio.wait_for(
+                self._info_ready_event.wait(), timeout=timeout_sec)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -206,6 +231,22 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
                 from aws_advanced_python_wrapper.aio.cleanup import \
                     register_shutdown_hook
                 register_shutdown_hook(monitor.stop)
+
+                # Phase J: block up to
+                # WAIT_FOR_CUSTOM_ENDPOINT_INFO_TIMEOUT_MS for the first
+                # refresh so the initial query sees the correct
+                # member-instance-ids filter. On timeout we still return
+                # the connection -- caller sees transiently-stale
+                # allowed-hosts rather than a hard failure (async plugin
+                # contract is softer than sync here).
+                wait_enabled = WrapperProperties.WAIT_FOR_CUSTOM_ENDPOINT_INFO.get_bool(props)
+                if wait_enabled is None:
+                    wait_enabled = True
+                if wait_enabled:
+                    timeout_ms = WrapperProperties.WAIT_FOR_CUSTOM_ENDPOINT_INFO_TIMEOUT_MS.get_int(props)
+                    if timeout_ms is None or timeout_ms <= 0:
+                        timeout_ms = 5000
+                    await monitor.wait_for_info(timeout_ms / 1000.0)
         return conn
 
     def _build_monitor(

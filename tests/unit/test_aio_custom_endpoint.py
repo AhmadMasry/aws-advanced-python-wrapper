@@ -286,6 +286,231 @@ def test_plugin_registers_stop_hook_with_release_resources_async():
     asyncio.run(_body())
 
 
+# ---- Phase J: wait-for-info blocking semantics -------------------------
+
+
+def test_wait_for_info_returns_true_when_event_is_set():
+    async def _body() -> None:
+        monitor = AsyncCustomEndpointMonitor(
+            cluster_identifier="c",
+            custom_endpoint_identifier="e",
+            refresh_interval_sec=0.5,
+        )
+        # Pre-set the event -- wait should return immediately with True.
+        monitor._info_ready_event.set()
+        result = await monitor.wait_for_info(timeout_sec=0.5)
+        assert result is True
+
+    asyncio.run(_body())
+
+
+def test_wait_for_info_returns_false_on_timeout():
+    async def _body() -> None:
+        monitor = AsyncCustomEndpointMonitor(
+            cluster_identifier="c",
+            custom_endpoint_identifier="e",
+            refresh_interval_sec=0.5,
+        )
+        # Event never set -- short timeout should return False.
+        result = await monitor.wait_for_info(timeout_sec=0.05)
+        assert result is False
+
+    asyncio.run(_body())
+
+
+def test_monitor_sets_info_ready_event_after_first_non_empty_refresh():
+    async def _body() -> None:
+        with patch.object(
+            AsyncCustomEndpointMonitor,
+            "_fetch_members_blocking",
+            return_value=["instance-x"],
+        ):
+            monitor = AsyncCustomEndpointMonitor(
+                cluster_identifier="c",
+                custom_endpoint_identifier="e",
+                refresh_interval_sec=0.02,
+            )
+            assert monitor._info_ready_event.is_set() is False
+            monitor.start()
+            # wait_for_info should trip once the background task completes
+            # one refresh iteration.
+            got = await monitor.wait_for_info(timeout_sec=1.0)
+            assert got is True
+            assert monitor._info_ready_event.is_set() is True
+            await monitor.stop()
+
+    asyncio.run(_body())
+
+
+def test_monitor_does_not_set_info_ready_on_empty_members():
+    """Empty describe response must not trip the event -- callers are
+    supposed to block until *useful* info arrives (or time out)."""
+    async def _body() -> None:
+        with patch.object(
+            AsyncCustomEndpointMonitor,
+            "_fetch_members_blocking",
+            return_value=[],
+        ):
+            monitor = AsyncCustomEndpointMonitor(
+                cluster_identifier="c",
+                custom_endpoint_identifier="e",
+                refresh_interval_sec=0.02,
+            )
+            monitor.start()
+            await asyncio.sleep(0.1)
+            assert monitor._info_ready_event.is_set() is False
+            await monitor.stop()
+
+    asyncio.run(_body())
+
+
+def test_plugin_connect_waits_for_info_and_returns_conn_on_success():
+    async def _body() -> None:
+        aio_cleanup.clear_shutdown_hooks()
+        props = Properties({
+            "host": "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+            "cluster_id": "c",
+            "wait_for_custom_endpoint_info_timeout_ms": "2000",
+        })
+        plugin = AsyncCustomEndpointPlugin(_svc(props), props)
+
+        with patch.object(
+            AsyncCustomEndpointMonitor,
+            "_fetch_members_blocking",
+            return_value=["i-waited"],
+        ):
+            raw_conn = MagicMock()
+
+            async def _connect_func() -> object:
+                return raw_conn
+
+            try:
+                conn = await plugin.connect(
+                    target_driver_func=lambda: None,
+                    driver_dialect=MagicMock(),
+                    host_info=HostInfo(
+                        "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com", 5432,
+                    ),
+                    props=props,
+                    is_initial_connection=True,
+                    connect_func=_connect_func,
+                )
+                assert conn is raw_conn
+                # After connect returns, monitor must have populated info.
+                assert plugin.monitor is not None
+                assert plugin.member_instance_ids == ("i-waited",)
+                assert plugin.monitor._info_ready_event.is_set() is True
+            finally:
+                await aio_cleanup.release_resources_async()
+
+    asyncio.run(_body())
+
+
+def test_plugin_connect_returns_conn_even_on_wait_timeout():
+    """On wait_for_info timeout, connect still returns the connection.
+    First query may see empty member-instance-ids but the connection
+    itself is usable -- softer contract than sync, which raises."""
+    async def _body() -> None:
+        aio_cleanup.clear_shutdown_hooks()
+        props = Properties({
+            "host": "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+            "cluster_id": "c",
+            # Aggressive timeout so the test runs fast.
+            "wait_for_custom_endpoint_info_timeout_ms": "50",
+        })
+        plugin = AsyncCustomEndpointPlugin(_svc(props), props)
+
+        # Monitor returns an empty member list -- event never trips.
+        with patch.object(
+            AsyncCustomEndpointMonitor,
+            "_fetch_members_blocking",
+            return_value=[],
+        ):
+            raw_conn = MagicMock()
+
+            async def _connect_func() -> object:
+                return raw_conn
+
+            try:
+                conn = await plugin.connect(
+                    target_driver_func=lambda: None,
+                    driver_dialect=MagicMock(),
+                    host_info=HostInfo(
+                        "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com", 5432,
+                    ),
+                    props=props,
+                    is_initial_connection=True,
+                    connect_func=_connect_func,
+                )
+                # conn returned despite the timeout.
+                assert conn is raw_conn
+                assert plugin.monitor is not None
+                # Event still not set -- we observed the timeout path.
+                assert plugin.monitor._info_ready_event.is_set() is False
+            finally:
+                await aio_cleanup.release_resources_async()
+
+    asyncio.run(_body())
+
+
+def test_plugin_connect_skips_wait_when_wait_for_info_disabled():
+    """With WAIT_FOR_CUSTOM_ENDPOINT_INFO=false, connect returns as soon
+    as the monitor is started -- no await on wait_for_info."""
+    async def _body() -> None:
+        aio_cleanup.clear_shutdown_hooks()
+        props = Properties({
+            "host": "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com",
+            "cluster_id": "c",
+            "wait_for_custom_endpoint_info": "false",
+            # Large timeout would wedge the test if the wait ran.
+            "wait_for_custom_endpoint_info_timeout_ms": "10000",
+        })
+        plugin = AsyncCustomEndpointPlugin(_svc(props), props)
+
+        wait_calls: List[float] = []
+
+        original = AsyncCustomEndpointMonitor.wait_for_info
+
+        async def _tracking_wait(self: AsyncCustomEndpointMonitor, timeout_sec: float) -> bool:
+            wait_calls.append(timeout_sec)
+            return await original(self, timeout_sec)
+
+        with patch.object(
+            AsyncCustomEndpointMonitor,
+            "_fetch_members_blocking",
+            return_value=[],
+        ), patch.object(
+            AsyncCustomEndpointMonitor,
+            "wait_for_info",
+            _tracking_wait,
+        ):
+            raw_conn = MagicMock()
+
+            async def _connect_func() -> object:
+                return raw_conn
+
+            try:
+                conn = await plugin.connect(
+                    target_driver_func=lambda: None,
+                    driver_dialect=MagicMock(),
+                    host_info=HostInfo(
+                        "ep.cluster-custom-abc.us-east-1.rds.amazonaws.com", 5432,
+                    ),
+                    props=props,
+                    is_initial_connection=True,
+                    connect_func=_connect_func,
+                )
+                assert conn is raw_conn
+                # wait_for_info must not have been invoked.
+                assert wait_calls == []
+                assert plugin.monitor is not None
+                assert plugin.monitor.is_running() is True
+            finally:
+                await aio_cleanup.release_resources_async()
+
+    asyncio.run(_body())
+
+
 def test_factory_registers_active_plugin_post_task_1b():
     """Task 1-B replaces the SP-8 stub -- factory should build the active one."""
     from aws_advanced_python_wrapper.aio.plugin_factory import \
