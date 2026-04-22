@@ -3,6 +3,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/#semantic-versioning-200).
 
+## [Unreleased]
+### :magic_wand: Added
+* Async counterpart of the wrapper (`aws_advanced_python_wrapper.aio`) reaches sync parity for every shipped feature: failover v2, read/write splitting, EFM, IAM auth, AWS Secrets Manager, federated + Okta auth, Aurora connection tracker, cluster topology monitor (with panic mode), custom endpoint, stale DNS, aurora initial connection strategy, simple read/write splitting, developer plugin, blue/green deployment, limitless, fastest-response strategy. ([PR TBD]).
+* `AsyncConnectionProvider` / `AsyncConnectionProviderManager`: async counterpart of sync's pluggable connection-provider registry.
+* `AsyncSessionStateService`: async capture + restore of session state (autocommit, read-only) across failover and RWS switches.
+* Async IdP factory registry: register custom SAML/OIDC providers under `plugins=federated_auth`.
+* Async BlueGreen deployment plugin: status monitor + provider + routing dispatch matching sync semantics (substitute / suspend / suspend-until-corresponding-host-found on connect; suspend on execute).
+* `AsyncLimitlessRouterMonitor` + cache + service: background router-discovery monitor per cluster.
+* `AsyncHostResponseTimeMonitor` + cache + service: per-host response-time probing for fastest-response host selection.
+* Auto-detection of MultiAz / GlobalAurora host-list providers from the resolved DatabaseDialect.
+
+### :bug: Fixed
+* Multi-alias invalidation in `AsyncOpenedConnectionTracker`: tracks every alias returned by `HostInfo.as_aliases()`, so invalidations via any alias reach every tracked connection.
+* Pool-aware detection in `AsyncReadWriteSplittingPlugin`: consults `AsyncConnectionProviderManager` before falling back to the SQLAlchemy-pool module-string heuristic.
+
+### :crab: Changed
+* Async `CustomEndpoint` plugin's `wait_for_custom_endpoint_info_timeout_ms` now raises `AwsWrapperError` on timeout (matching sync's hard-failure contract) instead of returning a connection with an empty member-instance-id filter.
+
 ## [2.1.0] - 2026-02-11
 ### :magic_wand: Added
 * [Failover v2 Plugin](https://github.com/aws/aws-advanced-python-wrapper/blob/main/docs/using-the-python-wrapper/using-plugins/UsingTheFailoverPlugin.md), an improved version of the failover plugin with enhanced reliability ([PR #1079](https://github.com/aws/aws-advanced-python-wrapper/pull/1079)).
