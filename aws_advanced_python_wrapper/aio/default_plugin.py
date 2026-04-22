@@ -12,38 +12,46 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-"""``AsyncDefaultPlugin`` -- the terminal plugin in every async pipeline.
+"""``AsyncDefaultPlugin`` -- terminal plugin in every async pipeline.
 
-Subscribes to every method. On ``connect`` it hands off to the driver
-dialect's async ``connect``. On ``execute`` it just awaits the target
-driver func.
+Routes ``connect`` through :class:`AsyncConnectionProviderManager` so a
+user-installed custom provider (e.g., an async pool) can claim the host
+before the default driver path is used. Mirrors sync
+:class:`DefaultPlugin` in ``default_plugin.py``.
 """
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.connection_provider import \
     DriverConnectionProvider
+from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.messages import Messages
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
         AsyncDriverDialect
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 
 class AsyncDefaultPlugin(AsyncPlugin):
-    """Terminal plugin. Always last in the pipeline; drives the raw driver call."""
+    """Terminal plugin. Routes connect through the provider manager."""
 
-    # Reuse sync's 4-entry HostSelector dict so both sync and async share
-    # the same RoundRobinHostSelector rotation state and selector registry.
-    # Uses the public classmethod on DriverConnectionProvider (added in
-    # phase A follow-up) to avoid coupling to the private attr.
+    # Sync selector registry reused so sync+async share RoundRobin state.
     _SELECTORS = DriverConnectionProvider.accepted_strategies()
+
+    def __init__(
+            self,
+            plugin_service: Optional[AsyncPluginService] = None) -> None:
+        self._plugin_service = plugin_service
 
     @property
     def subscribed_methods(self) -> Set[str]:
@@ -57,10 +65,30 @@ class AsyncDefaultPlugin(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
-        # The pipeline terminates here. Open the connection via the driver
-        # dialect rather than blindly calling connect_func -- the dialect
-        # knows the target driver's async connect signature and props shape.
-        return await driver_dialect.connect(host_info, props, target_driver_func)
+        # No plugin_service wired (legacy SP-1 callers) -- fall back to
+        # driver-dialect direct connect. Production pipelines always pass
+        # a service, so this branch only affects toy tests.
+        if self._plugin_service is None:
+            return await driver_dialect.connect(host_info, props, target_driver_func)
+
+        target_driver_props = copy.copy(props)
+        provider_manager = self._plugin_service.get_connection_provider_manager()
+        provider = provider_manager.get_connection_provider(
+            host_info, target_driver_props)
+        database_dialect = self._plugin_service.database_dialect
+        # database_dialect can be None in toy tests that skip dialect
+        # resolution; the default provider only touches it via
+        # ``prepare_conn_props`` so we guard before calling.
+        if database_dialect is None:
+            return await driver_dialect.connect(
+                host_info, target_driver_props, target_driver_func)
+        return await provider.connect(
+            target_driver_func,
+            driver_dialect,
+            database_dialect,
+            host_info,
+            target_driver_props,
+        )
 
     async def force_connect(
             self,
@@ -70,7 +98,22 @@ class AsyncDefaultPlugin(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             force_connect_func: Callable[..., Awaitable[Any]]) -> Any:
-        return await driver_dialect.connect(host_info, props, target_driver_func)
+        # force_connect always uses the default provider (mirrors sync).
+        if self._plugin_service is None:
+            return await driver_dialect.connect(host_info, props, target_driver_func)
+        target_driver_props = copy.copy(props)
+        provider = self._plugin_service.get_connection_provider_manager().default_provider
+        database_dialect = self._plugin_service.database_dialect
+        if database_dialect is None:
+            return await driver_dialect.connect(
+                host_info, target_driver_props, target_driver_func)
+        return await provider.connect(
+            target_driver_func,
+            driver_dialect,
+            database_dialect,
+            host_info,
+            target_driver_props,
+        )
 
     async def execute(
             self,
@@ -84,6 +127,11 @@ class AsyncDefaultPlugin(AsyncPlugin):
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         if role == HostRole.UNKNOWN:
             return False
+        # Defer to the provider manager if available so custom providers'
+        # strategies count. Falls back to the built-in selector set.
+        if self._plugin_service is not None:
+            return self._plugin_service.get_connection_provider_manager().accepts_strategy(
+                role, strategy)
         return strategy in self._SELECTORS
 
     def get_host_info_by_strategy(
@@ -91,6 +139,16 @@ class AsyncDefaultPlugin(AsyncPlugin):
             role: HostRole,
             strategy: str,
             host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        if role == HostRole.UNKNOWN:
+            raise AwsWrapperError(Messages.get("DefaultPlugin.UnknownHosts"))
+        if self._plugin_service is not None:
+            hosts = (tuple(host_list) if host_list is not None
+                     else self._plugin_service.all_hosts)
+            if not hosts:
+                raise AwsWrapperError(Messages.get("DefaultPlugin.EmptyHosts"))
+            return self._plugin_service.get_connection_provider_manager().get_host_info_by_strategy(
+                hosts, role, strategy, self._plugin_service.props)
+        # Legacy path (no plugin_service): use built-in selectors directly.
         selector = self._SELECTORS.get(strategy)
         if selector is None or host_list is None:
             return None

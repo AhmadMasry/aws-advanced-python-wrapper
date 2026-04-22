@@ -25,6 +25,8 @@ from __future__ import annotations
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet,
                     List, Optional, Protocol, Set, Tuple)
 
+from aws_advanced_python_wrapper.aio.connection_provider import \
+    AsyncConnectionProviderManager
 from aws_advanced_python_wrapper.aio.plugin import AsyncCanReleaseResources
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
@@ -219,6 +221,15 @@ class AsyncPluginService(Protocol):
             host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
         ...
 
+    def get_connection_provider_manager(self) -> AsyncConnectionProviderManager:
+        """Return the connection-provider manager for this service.
+
+        Plugins use this to consult the provider registry (e.g., RWS
+        checks whether a connection was produced by a pool provider).
+        Mirrors sync plugin_service.py:301 + :719.
+        """
+        ...
+
     @property
     def network_bound_methods(self) -> Set[str]:
         ...
@@ -273,6 +284,9 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._telemetry_factory: Optional[TelemetryFactory] = None
         self._target_driver_func: Optional[Callable] = None
         self._status_store: Dict[Tuple[type, str], Any] = {}
+        self._connection_provider_manager: AsyncConnectionProviderManager = (
+            AsyncConnectionProviderManager()
+        )
 
     @property
     def current_connection(self) -> Optional[Any]:
@@ -354,6 +368,9 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         if self._plugin_manager is None:
             return None
         return self._plugin_manager.get_host_info_by_strategy(role, strategy, host_list)
+
+    def get_connection_provider_manager(self) -> AsyncConnectionProviderManager:
+        return self._connection_provider_manager
 
     @property
     def host_list_provider(self) -> Optional[AsyncHostListProvider]:

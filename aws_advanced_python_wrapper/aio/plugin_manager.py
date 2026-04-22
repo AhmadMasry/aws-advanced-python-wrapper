@@ -58,7 +58,10 @@ class AsyncPluginManager:
         # factory-registry-based constructor overload so `plugins="failover,efm"`
         # in connection props can build the list.
         user_plugins: List[AsyncPlugin] = list(plugins) if plugins else []
-        self._plugins: List[AsyncPlugin] = [*user_plugins, AsyncDefaultPlugin()]
+        self._plugins: List[AsyncPlugin] = [
+            *user_plugins,
+            AsyncDefaultPlugin(plugin_service),
+        ]
 
     @property
     def num_plugins(self) -> int:
