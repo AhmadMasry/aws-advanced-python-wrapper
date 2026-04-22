@@ -71,6 +71,58 @@ class AsyncDialectUtils:
         return HostRole.READER if is_reader else HostRole.WRITER
 
     @staticmethod
+    async def get_instance_id(
+            conn: Any,
+            driver_dialect: AsyncDriverDialect,
+            host_id_query: str,
+            timeout_sec: float = 5.0) -> Optional[str]:
+        """Run the dialect's ``host_id_query`` to learn the Aurora
+        instance identifier ``conn`` is bound to. Returns ``None`` on
+        empty result or query failure (best-effort; callers fall back
+        to topology resolution by host_id). Mirrors sync
+        DialectUtils.get_instance_id at database_dialect.py.
+        """
+        try:
+            result = await asyncio.wait_for(
+                AsyncDialectUtils._execute_scalar_query(conn, host_id_query),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            return None
+        except Exception:  # noqa: BLE001 - identification is best-effort
+            return None
+        if not result:
+            return None
+        first = result[0]
+        if first is None:
+            return None
+        return str(first)
+
+    @staticmethod
+    async def _execute_scalar_query(
+            conn: Any, query: str) -> Optional[tuple]:
+        """Execute a scalar-returning query, handling sync/coroutine
+        cursor shapes identically to ``_execute_is_reader_query``.
+        """
+        cursor_ret = conn.cursor()
+        if asyncio.iscoroutine(cursor_ret):
+            cursor = await cursor_ret
+        else:
+            cursor = cursor_ret
+        try:
+            await cursor.execute(query)
+            return await cursor.fetchone()
+        finally:
+            close = getattr(cursor, "close", None)
+            if close is not None:
+                try:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:  # noqa: BLE001 - cursor close best-effort
+                    pass
+
+    @staticmethod
     async def _execute_is_reader_query(
             conn: Any,
             is_reader_query: str) -> Optional[tuple]:

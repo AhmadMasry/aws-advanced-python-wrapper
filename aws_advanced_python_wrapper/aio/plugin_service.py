@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
     from aws_advanced_python_wrapper.aio.plugin_manager import \
         AsyncPluginManager
+    from aws_advanced_python_wrapper.allowed_and_blocked_hosts import \
+        AllowedAndBlockedHosts
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
     from aws_advanced_python_wrapper.host_availability import HostAvailability
     from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
@@ -243,6 +245,56 @@ class AsyncPluginService(Protocol):
         ...
 
     @property
+    def allowed_and_blocked_hosts(self) -> Optional[AllowedAndBlockedHosts]:
+        """Current include/exclude filter on the topology.
+
+        ``None`` means unrestricted. Plugins set this to filter out
+        hosts unavailable to the caller (custom endpoint plugin, blue/
+        green plugin). Mirrors sync plugin_service.py:144.
+        """
+        ...
+
+    @allowed_and_blocked_hosts.setter
+    def allowed_and_blocked_hosts(
+            self, value: Optional[AllowedAndBlockedHosts]) -> None:
+        ...
+
+    @property
+    def is_in_transaction(self) -> bool:
+        """Last-known transaction state of the current connection.
+
+        Populated by :meth:`update_in_transaction`. Mirrors sync
+        plugin_service.py:191.
+        """
+        ...
+
+    async def update_in_transaction(
+            self, is_in_transaction: Optional[bool] = None) -> None:
+        """Refresh ``is_in_transaction`` from the driver if not supplied.
+
+        Called by plugins after executing a SQL statement that may have
+        opened or closed a transaction (BEGIN/COMMIT/ROLLBACK). Mirrors
+        sync plugin_service.py:217.
+        """
+        ...
+
+    def update_driver_dialect(self, connection_provider: Any) -> None:
+        """Let the driver dialect manager re-pick the dialect now that
+        ``connection_provider`` is known. No-op on async today (no
+        pool-aware dialect manager yet) but present for sync parity.
+        """
+        ...
+
+    async def identify_connection(
+            self, connection: Optional[Any] = None) -> Optional[HostInfo]:
+        """Return the HostInfo that ``connection`` is bound to, or None.
+
+        Used by failover + RWS to correlate a fresh connection back to a
+        known topology entry. Mirrors sync plugin_service.py:619.
+        """
+        ...
+
+    @property
     def network_bound_methods(self) -> Set[str]:
         ...
 
@@ -302,6 +354,8 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._session_state_service: AsyncSessionStateService = (
             AsyncSessionStateServiceImpl(self, props)
         )
+        self._allowed_and_blocked_hosts: Optional[AllowedAndBlockedHosts] = None
+        self._is_in_transaction: bool = False
 
     @property
     def current_connection(self) -> Optional[Any]:
@@ -390,6 +444,68 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     @property
     def session_state_service(self) -> AsyncSessionStateService:
         return self._session_state_service
+
+    @property
+    def allowed_and_blocked_hosts(self) -> Optional[AllowedAndBlockedHosts]:
+        return self._allowed_and_blocked_hosts
+
+    @allowed_and_blocked_hosts.setter
+    def allowed_and_blocked_hosts(
+            self, value: Optional[AllowedAndBlockedHosts]) -> None:
+        self._allowed_and_blocked_hosts = value
+
+    @property
+    def is_in_transaction(self) -> bool:
+        return self._is_in_transaction
+
+    async def update_in_transaction(
+            self, is_in_transaction: Optional[bool] = None) -> None:
+        if is_in_transaction is not None:
+            self._is_in_transaction = is_in_transaction
+            return
+        if self._current_connection is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.update_in_transaction requires a "
+                "connection or an explicit is_in_transaction value.")
+        self._is_in_transaction = await self._driver_dialect.is_in_transaction(
+            self._current_connection)
+
+    def update_driver_dialect(self, connection_provider: Any) -> None:
+        # No-op: async has no pool-aware DriverDialectManager. The sync
+        # site swaps dialects when a pool provider is installed; async
+        # drivers don't differentiate by provider today. Kept for sync
+        # parity so callers can invoke unconditionally.
+        return
+
+    async def identify_connection(
+            self, connection: Optional[Any] = None) -> Optional[HostInfo]:
+        conn = connection if connection is not None else self._current_connection
+        if conn is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.identify_connection requires a connection")
+        if self._host_list_provider is None:
+            return None
+        if self._database_dialect is None:
+            return None
+
+        from aws_advanced_python_wrapper.aio.dialect_utils import \
+            AsyncDialectUtils
+        instance_id = await AsyncDialectUtils.get_instance_id(
+            conn,
+            self._driver_dialect,
+            self._database_dialect.host_id_query,
+        )
+        if instance_id is None:
+            return None
+
+        topology = await self._host_list_provider.refresh(conn)
+        found = next(
+            (h for h in topology if h.host_id == instance_id), None)
+        if found is None:
+            topology = await self._host_list_provider.force_refresh(conn)
+            found = next(
+                (h for h in topology if h.host_id == instance_id), None)
+        return found
 
     @property
     def host_list_provider(self) -> Optional[AsyncHostListProvider]:
