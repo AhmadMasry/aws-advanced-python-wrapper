@@ -28,6 +28,8 @@ from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet,
 from aws_advanced_python_wrapper.aio.connection_provider import \
     AsyncConnectionProviderManager
 from aws_advanced_python_wrapper.aio.plugin import AsyncCanReleaseResources
+from aws_advanced_python_wrapper.aio.session_state import (
+    AsyncSessionStateService, AsyncSessionStateServiceImpl)
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
 from aws_advanced_python_wrapper.utils.messages import Messages
@@ -231,6 +233,16 @@ class AsyncPluginService(Protocol):
         ...
 
     @property
+    def session_state_service(self) -> AsyncSessionStateService:
+        """Return the session-state service for this connection.
+
+        Failover and RWS plugins call ``begin()`` / ``apply_current_session_state``
+        to preserve autocommit/readonly across connection swaps. Mirrors
+        sync plugin_service.py:186 + :497.
+        """
+        ...
+
+    @property
     def network_bound_methods(self) -> Set[str]:
         ...
 
@@ -286,6 +298,9 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._status_store: Dict[Tuple[type, str], Any] = {}
         self._connection_provider_manager: AsyncConnectionProviderManager = (
             AsyncConnectionProviderManager()
+        )
+        self._session_state_service: AsyncSessionStateService = (
+            AsyncSessionStateServiceImpl(self, props)
         )
 
     @property
@@ -371,6 +386,10 @@ class AsyncPluginServiceImpl(AsyncPluginService):
 
     def get_connection_provider_manager(self) -> AsyncConnectionProviderManager:
         return self._connection_provider_manager
+
+    @property
+    def session_state_service(self) -> AsyncSessionStateService:
+        return self._session_state_service
 
     @property
     def host_list_provider(self) -> Optional[AsyncHostListProvider]:
@@ -535,7 +554,14 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._current_connection = connection
         self._current_host_info = host_info
         if prev is not None and prev is not connection:
-            # Give the driver dialect a chance to transfer session state.
+            # Apply tracked session state to the new connection before the
+            # driver dialect's fallback transfer, then hand off to the
+            # dialect for anything state-service doesn't cover.
+            try:
+                await self._session_state_service.apply_current_session_state(
+                    connection)
+            except Exception:  # noqa: BLE001 - best-effort apply
+                pass
             await self._driver_dialect.transfer_session_state(prev, connection)
 
 
