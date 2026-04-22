@@ -33,7 +33,7 @@ A background refresh loop (:class:`AsyncClusterTopologyMonitor`) lives in
 from __future__ import annotations
 
 import asyncio
-from typing import (TYPE_CHECKING, Any, List, Optional, Protocol, Tuple,
+from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple,
                     runtime_checkable)
 
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
@@ -376,5 +376,120 @@ class AsyncMultiAzHostListProvider(AsyncAuroraHostListProvider):
         if not writers:
             return ()
         # Writer first, readers after -- matches AsyncAuroraHostListProvider.
+        hosts.sort(key=lambda h: 0 if h.role == HostRole.WRITER else 1)
+        return tuple(hosts)
+
+
+class AsyncGlobalAuroraHostListProvider(AsyncAuroraHostListProvider):
+    """Async Global Aurora topology provider.
+
+    Subclasses :class:`AsyncAuroraHostListProvider` and overrides row
+    parsing to handle Global Aurora's cross-region topology. Row shape:
+    ``(server_id, region, is_writer)``. Each host is built from the
+    region-specific template configured via the ``instance_templates_by_region``
+    ctor argument or the ``GLOBAL_CLUSTER_INSTANCE_HOST_PATTERNS`` property
+    (comma-separated ``region=pattern`` pairs, where ``pattern`` may include
+    a ``:port`` suffix).
+
+    Minimal port -- sync's :class:`GlobalAuroraTopologyMonitor` thread
+    machinery is not mirrored; topology is fetched on-demand via the base
+    class's standard refresh path. Full auto-detection via ``DatabaseDialect``
+    is a future enhancement (sync reads the topology query from
+    ``GlobalAuroraTopologyDialect`` -- that path does not yet flow through
+    the async ``PluginService`` dialect resolution chain).
+    """
+
+    def __init__(
+            self,
+            props: Properties,
+            driver_dialect: AsyncDriverDialect,
+            topology_query: str,
+            *,
+            instance_templates_by_region: Optional[Dict[str, str]] = None,
+            cluster_id: Optional[str] = None,
+            default_port: int = 5432,
+    ) -> None:
+        super().__init__(
+            props=props,
+            driver_dialect=driver_dialect,
+            topology_query=topology_query,
+            cluster_id=cluster_id,
+            default_port=default_port,
+        )
+        if instance_templates_by_region is None:
+            raw = WrapperProperties.GLOBAL_CLUSTER_INSTANCE_HOST_PATTERNS.get(
+                props
+            )
+            if raw:
+                instance_templates_by_region = self._parse_templates(raw)
+            else:
+                instance_templates_by_region = {}
+        self._templates_by_region: Dict[str, str] = instance_templates_by_region
+
+    @staticmethod
+    def _parse_templates(raw: str) -> Dict[str, str]:
+        """Parse ``'region=pattern,region=pattern,...'`` into a dict.
+
+        Malformed pairs (missing ``=``, empty) are silently dropped so
+        one bad entry doesn't drop the whole provider.
+        """
+        result: Dict[str, str] = {}
+        for pair in raw.split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            region, pattern = pair.split("=", 1)
+            region = region.strip()
+            pattern = pattern.strip()
+            if region and pattern:
+                result[region] = pattern
+        return result
+
+    def _rows_to_topology(self, rows: List[tuple]) -> Topology:
+        """Override. Rows are ``(server_id, region, is_writer)``.
+
+        Each row's host is built from the region-specific template. Rows
+        referencing a region without a configured template are skipped.
+        Returns an empty tuple if no writer is present (matches
+        :class:`AsyncMultiAzHostListProvider`).
+        """
+        hosts: List[HostInfo] = []
+        for row in rows:
+            if len(row) < 3:
+                continue
+            server_id = str(row[0])
+            region = str(row[1])
+            is_writer = bool(row[2])
+            template = self._templates_by_region.get(region)
+            if template is None:
+                # No template for this region -- skip the host.
+                continue
+            host_str = template.replace("?", server_id)
+            host = host_str
+            port = self._default_port
+            if ":" in host_str:
+                host_part, port_part = host_str.rsplit(":", 1)
+                try:
+                    port = int(port_part)
+                    host = host_part
+                except ValueError:
+                    # Non-numeric port -- treat whole string as host.
+                    pass
+            role = HostRole.WRITER if is_writer else HostRole.READER
+            host_info = HostInfo(
+                host=host,
+                port=port,
+                role=role,
+                host_id=server_id,
+            )
+            host_info.add_alias(host)
+            hosts.append(host_info)
+
+        # Validate: at least one writer. Match the MultiAz/sync convention
+        # of returning an empty topology when no writer is found so callers
+        # fall back to the cache.
+        if not any(h.role == HostRole.WRITER for h in hosts):
+            return ()
+        # Writer first, readers after -- matches the other async providers.
         hosts.sort(key=lambda h: 0 if h.role == HostRole.WRITER else 1)
         return tuple(hosts)
