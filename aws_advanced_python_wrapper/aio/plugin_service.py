@@ -22,8 +22,8 @@ service, status storage) lands in later SPs that need it.
 
 from __future__ import annotations
 
-from typing import (TYPE_CHECKING, Any, Callable, ClassVar, FrozenSet, List,
-                    Optional, Protocol, Set, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet,
+                    List, Optional, Protocol, Set, Tuple)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncCanReleaseResources
 from aws_advanced_python_wrapper.errors import AwsWrapperError
@@ -185,6 +185,30 @@ class AsyncPluginService(Protocol):
         """
         ...
 
+    def set_status(
+            self,
+            clazz: type,
+            key: str,
+            status: Any) -> None:
+        """Publish ``status`` under (clazz, key). Plugins use this for
+        shared state within the connection's lifetime (e.g. BlueGreen
+        status, custom endpoint member cache)."""
+        ...
+
+    def get_status(
+            self,
+            clazz: type,
+            key: str) -> Optional[Any]:
+        """Retrieve a previously set status, or None. Verifies the stored
+        value is an instance of ``clazz`` (sync plugin_service.py:798-812
+        raises ValueError on mismatch; async returns None instead for
+        best-effort semantics)."""
+        ...
+
+    def remove_status(self, clazz: type, key: str) -> None:
+        """Drop a (clazz, key) entry. No-op if absent."""
+        ...
+
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         ...
 
@@ -248,6 +272,7 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._current_connection: Optional[Any] = None
         self._telemetry_factory: Optional[TelemetryFactory] = None
         self._target_driver_func: Optional[Callable] = None
+        self._status_store: Dict[Tuple[type, str], Any] = {}
 
     @property
     def current_connection(self) -> Optional[Any]:
@@ -461,6 +486,20 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     def set_target_driver_func(self, func: Callable) -> None:
         """Wired by AsyncAwsWrapperConnection.connect at connect time."""
         self._target_driver_func = func
+
+    def set_status(self, clazz, key, status):
+        self._status_store[(clazz, key)] = status
+
+    def get_status(self, clazz, key):
+        value = self._status_store.get((clazz, key))
+        if value is None:
+            return None
+        if not isinstance(value, clazz):
+            return None
+        return value
+
+    def remove_status(self, clazz, key):
+        self._status_store.pop((clazz, key), None)
 
     @property
     def network_bound_methods(self) -> Set[str]:

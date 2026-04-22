@@ -338,19 +338,8 @@ class AsyncBlueGreenPlugin(AsyncPlugin):
         return await routing.apply(self, execute_func, method_name)
 
     def _get_status(self) -> Optional[BlueGreenStatus]:
-        """Look up the published BG status. AsyncPluginService's
-        get_status is not yet implemented (Phase A/F didn't port it);
-        return None until a consumer wires get/set_status."""
-        getter = getattr(self._plugin_service, "get_status", None)
-        if getter is None:
-            return None
-        try:
-            result = getter(BlueGreenStatus, self._bg_id)
-            if isinstance(result, BlueGreenStatus):
-                return result
-        except Exception:  # noqa: BLE001 - skeleton tolerates missing infra
-            pass
-        return None
+        """Look up the published BG status via plugin_service.get_status."""
+        return self._plugin_service.get_status(BlueGreenStatus, self._bg_id)
 
 
 __all__ = [

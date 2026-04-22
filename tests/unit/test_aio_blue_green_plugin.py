@@ -183,3 +183,43 @@ def test_factory_produces_async_blue_green_plugin():
     assert isinstance(plugin, AsyncBlueGreenPlugin)
     # And "bg" is a name of the stub; confirm this is NOT it:
     assert type(plugin).__name__ == "AsyncBlueGreenPlugin"
+
+
+def test_bg_plugin_dispatches_through_set_status():
+    """When BlueGreenStatus is published via plugin_service.set_status,
+    the plugin finds it and dispatches through the routing table."""
+    from aws_advanced_python_wrapper.aio.driver_dialect.base import \
+        AsyncDriverDialect
+    from aws_advanced_python_wrapper.aio.plugin_service import \
+        AsyncPluginServiceImpl
+
+    driver_dialect = MagicMock(spec=AsyncDriverDialect)
+    driver_dialect.network_bound_methods = set()
+    svc = AsyncPluginServiceImpl(Properties(), driver_dialect)
+    plugin = AsyncBlueGreenPlugin(svc, Properties({"bg_id": "my-bg"}))
+
+    host = HostInfo(host="source.example.com", port=5432)
+    status = BlueGreenStatus(
+        bg_id="my-bg",
+        phase=BlueGreenPhase.IN_PROGRESS,
+        connect_routings=[RejectConnectRouting(
+            host_matcher="source.example.com",
+            role_matcher=BlueGreenRole.SOURCE,
+        )],
+        role_by_host={"source.example.com": BlueGreenRole.SOURCE},
+    )
+    svc.set_status(BlueGreenStatus, "my-bg", status)
+
+    async def _cf():
+        return MagicMock()
+
+    # RejectConnectRouting should raise
+    with pytest.raises(AwsWrapperError):
+        _run(plugin.connect(
+            target_driver_func=lambda: None,
+            driver_dialect=MagicMock(),
+            host_info=host,
+            props=svc.props,
+            is_initial_connection=True,
+            connect_func=_cf,
+        ))

@@ -382,3 +382,58 @@ def test_plugin_service_connect_delegates_to_plugin_manager():
     assert call.kwargs["host_info"] is host
     assert call.kwargs["props"] is props
     assert call.kwargs["is_initial_connection"] is False
+
+
+def test_set_and_get_status_round_trip():
+    svc = _make_service()
+
+    class _Fake:
+        pass
+
+    obj = _Fake()
+    svc.set_status(_Fake, "k", obj)
+    assert svc.get_status(_Fake, "k") is obj
+
+
+def test_get_status_returns_none_for_missing_key():
+    svc = _make_service()
+
+    class _Fake:
+        pass
+
+    assert svc.get_status(_Fake, "nope") is None
+
+
+def test_get_status_returns_none_on_type_mismatch():
+    svc = _make_service()
+
+    class _A:
+        pass
+
+    class _B:
+        pass
+
+    svc.set_status(_A, "k", _A())
+    # Looking up under _B should return None, not raise
+    assert svc.get_status(_B, "k") is None
+
+
+def test_remove_status_drops_entry():
+    svc = _make_service()
+
+    class _Fake:
+        pass
+
+    svc.set_status(_Fake, "k", _Fake())
+    svc.remove_status(_Fake, "k")
+    assert svc.get_status(_Fake, "k") is None
+
+
+def test_remove_status_is_noop_for_missing_key():
+    svc = _make_service()
+
+    class _Fake:
+        pass
+
+    # Must not raise
+    svc.remove_status(_Fake, "nope")
