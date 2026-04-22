@@ -118,15 +118,42 @@ class _AwsSecretsManagerFactory:
 
 
 class _FederatedAuthFactory:
+    """Resolves the concrete IdP plugin via AsyncIdpPluginRegistry.
+
+    ``IDP_NAME`` in props picks the provider; defaults to ADFS. Raises
+    ``AwsWrapperError`` for unknown IdP names (sync parity).
+    """
+
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
-        return AsyncFederatedAuthPlugin(plugin_service, props)
+        from aws_advanced_python_wrapper.aio.idp_registry import \
+            resolve_federated_plugin_class
+        plugin_class = resolve_federated_plugin_class(props)
+        return plugin_class(plugin_service, props)
 
 
 class _OktaAuthFactory:
+    """Back-compat alias for the ``okta`` plugin code.
+
+    Always instantiates AsyncOktaAuthPlugin regardless of IDP_NAME --
+    matches sync's separate ``okta`` plugin code. Users who want
+    dynamic IdP dispatch should use ``federated_auth``.
+    """
+
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
         return AsyncOktaAuthPlugin(plugin_service, props)
+
+
+def _install_default_idp_registrations() -> None:
+    """Seed the IdP registry with the shipped ADFS + Okta classes."""
+    from aws_advanced_python_wrapper.aio.idp_registry import \
+        AsyncIdpPluginRegistry
+    AsyncIdpPluginRegistry.register("adfs", AsyncFederatedAuthPlugin)
+    AsyncIdpPluginRegistry.register("okta", AsyncOktaAuthPlugin)
+
+
+_install_default_idp_registrations()
 
 
 class _AuroraConnectionTrackerFactory:
