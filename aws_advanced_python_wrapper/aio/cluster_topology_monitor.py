@@ -159,7 +159,10 @@ class AsyncClusterTopologyMonitor:
                 conn = self._connection_getter()
                 if conn is not None:
                     try:
-                        topology = await self._provider.force_refresh(conn)
+                        # Use the provider's direct-DB path to avoid
+                        # recursion; the public force_refresh now
+                        # routes through this monitor (N.1b).
+                        topology = await self._fetch_via_provider(conn)
                         self._last_topology = topology
                         self._check_for_writer_change(topology)
                     except Exception:
@@ -332,7 +335,7 @@ class AsyncClusterTopologyMonitor:
             return self._last_topology
         try:
             topology = await asyncio.wait_for(
-                self._provider.force_refresh(conn),
+                self._fetch_via_provider(conn),
                 timeout=timeout_sec,
             )
         except asyncio.TimeoutError as e:
@@ -342,6 +345,25 @@ class AsyncClusterTopologyMonitor:
         self._last_topology = topology
         self._check_for_writer_change(topology)
         return topology
+
+    async def _fetch_via_provider(self, conn: Any) -> Topology:
+        """Call the provider's direct-DB query path, preferring
+        :meth:`_fetch_from_db` when available. Falls back to
+        ``force_refresh`` for providers (or bare mocks) that don't have
+        the split -- preserves pre-N.1b behavior.
+        """
+        import inspect
+
+        # Check the class first (normal case), then the instance (tests
+        # may monkey-patch an async override). Must be a coroutine
+        # function so bare MagicMock attrs don't trigger the path.
+        cls_direct = getattr(type(self._provider), "_fetch_from_db", None)
+        if cls_direct is not None and inspect.iscoroutinefunction(cls_direct):
+            inst_direct = getattr(self._provider, "_fetch_from_db", None)
+            if inspect.iscoroutinefunction(inst_direct):
+                return await inst_direct(conn)
+            return await cls_direct(self._provider, conn)
+        return await self._provider.force_refresh(conn)
 
     async def stop(self) -> None:
         """Signal the task to exit and await its termination."""

@@ -106,9 +106,17 @@ class AsyncAuroraHostListProvider:
     :class:`TopologyAwareDatabaseDialect` classes (SP-3 reuses them rather
     than duplicating).
 
+    Refresh flow (N.1b, matches sync RdsHostListProvider -> ClusterTopologyMonitor):
+
+    * :meth:`refresh` / :meth:`force_refresh` delegate to a per-provider
+      :class:`AsyncClusterTopologyMonitor` so panic-mode probing
+      engages automatically on initial connect when writer discovery
+      stalls. The monitor also keeps a cached ``last_topology`` so
+      cache-hit refreshes don't hit the DB.
+    * The monitor itself calls :meth:`_fetch_from_db` (private, no
+      recursion) to run the actual SQL probe.
+
     Thread-safety: the cache is protected by an :class:`asyncio.Lock`.
-    No background task is spawned here -- if continuous refresh is
-    desired, pair with :class:`AsyncClusterTopologyMonitor`.
     """
 
     _DEFAULT_REFRESH_RATE_NS = 30 * 1_000_000_000  # 30 seconds
@@ -138,6 +146,10 @@ class AsyncAuroraHostListProvider:
             int(refresh_ms) * 1_000_000 if refresh_ms is not None
             else self._DEFAULT_REFRESH_RATE_NS
         )
+        # Monitor wiring (N.1b). Lazy-created on first refresh so
+        # provider construction stays cheap and test-friendly.
+        self._monitor: Optional[Any] = None  # AsyncClusterTopologyMonitor
+        self._last_conn: Optional[Any] = None
 
     @staticmethod
     def _derive_cluster_id(props: Properties) -> str:
@@ -154,7 +166,16 @@ class AsyncAuroraHostListProvider:
         return self._cluster_id
 
     async def refresh(self, connection: Optional[Any] = None) -> Topology:
-        """Return cached topology if still fresh, else force a refresh."""
+        """Return cached topology if still fresh, else force a refresh.
+
+        Matches sync :meth:`RdsHostListProvider.refresh` semantics: if the
+        cache is within the refresh window, short-circuit; otherwise
+        delegate to :meth:`force_refresh` which goes through the
+        cluster topology monitor (panic mode engages automatically on
+        initial connect when writer discovery stalls).
+        """
+        if connection is not None:
+            self._last_conn = connection
         now_ns = asyncio.get_event_loop().time() * 1_000_000_000
         if (self._topology_cache is not None
                 and now_ns - self._last_refresh_ns < self._refresh_ns):
@@ -162,20 +183,98 @@ class AsyncAuroraHostListProvider:
         return await self.force_refresh(connection)
 
     async def force_refresh(self, connection: Optional[Any] = None) -> Topology:
-        """Run the topology query and update the cache."""
+        """Run the topology query and update the cache.
+
+        Delegates to :class:`AsyncClusterTopologyMonitor.force_refresh_with_connection`
+        so panic-mode probing engages when writer discovery stalls --
+        sync parity with :meth:`RdsHostListProvider._force_refresh_monitor`.
+        Falls back to a direct DB query if the monitor can't be built
+        (e.g., no connection available and no cache).
+        """
+        if connection is not None:
+            self._last_conn = connection
+
         if connection is None:
             if self._topology_cache is not None:
                 return self._topology_cache
             return ()
+
         async with self._refresh_lock:
-            rows = await self._run_topology_query(connection)
-            topology = self._rows_to_topology(rows)
+            monitor = self._get_or_create_monitor()
+            if monitor is None:
+                # Monitor couldn't be built; fall back to direct query.
+                return await self._fetch_and_cache(connection)
+            try:
+                topology = await monitor.force_refresh_with_connection(
+                    connection, bypass_ignore_window=True)
+            except Exception:  # noqa: BLE001 - monitor failure
+                return await self._fetch_and_cache(connection)
             if topology:
                 self._topology_cache = topology
                 self._last_refresh_ns = int(
                     asyncio.get_event_loop().time() * 1_000_000_000
                 )
             return topology or (self._topology_cache or ())
+
+    def _get_or_create_monitor(self) -> Optional[Any]:
+        """Lazy-construct the per-provider topology monitor.
+
+        Returns ``None`` if monitor construction fails or if the
+        topology_query is absent (e.g., static/unsupported dialects).
+        Mirrors sync :meth:`RdsHostListProvider._get_or_create_monitor`.
+        """
+        if self._monitor is not None and self._monitor.is_running():
+            return self._monitor
+        if not self._topology_query:
+            return None
+        try:
+            from aws_advanced_python_wrapper.aio.cluster_topology_monitor import \
+                AsyncClusterTopologyMonitor
+        except Exception:  # noqa: BLE001 - defensive import guard
+            return None
+
+        high_refresh_ms = WrapperProperties.CLUSTER_TOPOLOGY_HIGH_REFRESH_RATE_MS.get_int(
+            self._props)
+        monitor = AsyncClusterTopologyMonitor(
+            provider=self,
+            connection_getter=lambda: self._last_conn,
+            refresh_interval_sec=self._refresh_ns / 1_000_000_000,
+            high_refresh_rate_sec=(
+                (high_refresh_ms / 1000.0) if high_refresh_ms else 1.0),
+        )
+        monitor.start()
+        self._monitor = monitor
+        # Register monitor teardown with the global cleanup hook so
+        # release_resources_async() tears it down.
+        try:
+            from aws_advanced_python_wrapper.aio.cleanup import \
+                register_shutdown_hook
+            register_shutdown_hook(monitor.stop)
+        except Exception:  # noqa: BLE001
+            pass
+        return monitor
+
+    async def _fetch_and_cache(self, connection: Any) -> Topology:
+        """Direct DB query + cache update, used as a monitor fallback."""
+        rows = await self._run_topology_query(connection)
+        topology = self._rows_to_topology(rows)
+        if topology:
+            self._topology_cache = topology
+            self._last_refresh_ns = int(
+                asyncio.get_event_loop().time() * 1_000_000_000
+            )
+        return topology or (self._topology_cache or ())
+
+    async def _fetch_from_db(self, connection: Any) -> Topology:
+        """Raw DB-query path used BY the cluster topology monitor.
+
+        Does NOT re-enter the monitor (which would recurse). The
+        monitor's ``_run`` / ``force_refresh_with_connection`` both
+        call this; all other callers should go through the public
+        :meth:`refresh` / :meth:`force_refresh`.
+        """
+        rows = await self._run_topology_query(connection)
+        return self._rows_to_topology(rows)
 
     async def _run_topology_query(self, connection: Any) -> List[tuple]:
         """Execute the topology query and return its rows.
