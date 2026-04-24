@@ -230,7 +230,11 @@ def test_release_resources_closes_connection_and_provider():
     async def _abort(conn):
         conn.closed = True
 
-    driver_dialect.abort_connection = MagicMock(side_effect=_abort)
+    # AsyncMock so the await path inside release_resources actually
+    # exercises the awaitable side_effect. MagicMock would call _abort
+    # synchronously and return the raw coroutine; AsyncMock makes the
+    # whole await happen end-to-end, matching the real driver shape.
+    driver_dialect.abort_connection = AsyncMock(side_effect=_abort)
     svc = AsyncPluginServiceImpl(Properties(), driver_dialect)
     conn = MagicMock()
     conn.closed = False
@@ -244,7 +248,11 @@ def test_release_resources_closes_connection_and_provider():
 def test_release_resources_survives_errors():
     driver_dialect = MagicMock(spec=AsyncDriverDialect)
     driver_dialect.network_bound_methods = set()
-    driver_dialect.abort_connection = MagicMock(side_effect=RuntimeError("boom"))
+    # AsyncMock so the error surfaces from the awaited coroutine
+    # rather than synchronously at call time -- exercises the same
+    # try/except path a real async driver would trigger.
+    driver_dialect.abort_connection = AsyncMock(
+        side_effect=RuntimeError("boom"))
     svc = AsyncPluginServiceImpl(Properties(), driver_dialect)
     conn = MagicMock()
     conn.closed = False

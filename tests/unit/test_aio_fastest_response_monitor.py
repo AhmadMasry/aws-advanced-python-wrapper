@@ -207,6 +207,37 @@ def test_service_removes_monitors_when_hosts_drop_out() -> None:
     asyncio.run(_body())
 
 
+def test_service_holds_strong_ref_on_spawned_stop_tasks() -> None:
+    """Regression guard: ``set_hosts`` spawns fire-and-forget stop
+    tasks via ``asyncio.create_task``. Without a strong reference the
+    GC can collect the task mid-cancel, which surfaces as "Task was
+    destroyed but it is pending" (fatal under pytest -Werror).
+    The service keeps the task in ``_stop_tasks`` until done."""
+    svc = _make_plugin_service()
+    service = AsyncHostResponseTimeService(svc, Properties(), 10_000)
+
+    async def _body():
+        service.set_hosts((_host("a"), _host("b")))
+        # Drop 'b' -> spawns a stop task. Inspect _stop_tasks before
+        # yielding: the task must be tracked there (not just a local
+        # variable that can be collected).
+        service.set_hosts((_host("a"),))
+        tracked_before = set(AsyncHostResponseTimeService._stop_tasks)
+        assert len(tracked_before) >= 1
+        # Await the tracked stop tasks directly so we observe the
+        # done_callback removing each from _stop_tasks. Using
+        # stop_all() wouldn't help -- it tears down the 'a' monitor
+        # whose stop task is spawned synchronously inside stop_all,
+        # not the prior 'b' stop task spawned by set_hosts.
+        await asyncio.gather(*tracked_before, return_exceptions=True)
+        # After completion the done_callback has discarded each.
+        for task in tracked_before:
+            assert task not in AsyncHostResponseTimeService._stop_tasks
+        await AsyncHostResponseTimeService.stop_all()
+
+    asyncio.run(_body())
+
+
 def test_service_get_response_time_ns_reads_cache() -> None:
     h = _host("cached-host")
     AsyncHostResponseTimeCache.put(h.url, 5_000_000)

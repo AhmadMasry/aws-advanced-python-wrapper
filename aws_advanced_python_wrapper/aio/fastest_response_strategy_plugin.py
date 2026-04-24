@@ -251,6 +251,11 @@ class AsyncHostResponseTimeService:
 
     _lock: ClassVar[Lock] = Lock()
     _monitors: ClassVar[Dict[str, AsyncHostResponseTimeMonitor]] = {}
+    # Holds strong references to in-flight stop tasks spawned from
+    # ``set_hosts`` so the GC doesn't collect them mid-cancel (which
+    # triggers "Task was destroyed but it is pending" warnings under
+    # -Werror). Entries self-remove via done_callback.
+    _stop_tasks: ClassVar[set] = set()
 
     def __init__(
             self,
@@ -296,14 +301,22 @@ class AsyncHostResponseTimeService:
             monitor.start()
             register_shutdown_hook(monitor.stop)
 
-        # Tear down monitors for removed hosts.
+        # Tear down monitors for removed hosts. Keep a strong ref on
+        # each in-flight stop task until it completes; otherwise the
+        # event loop may collect the task mid-cancel and surface a
+        # "Task was destroyed but it is pending" warning -- fatal
+        # under pytest's -Werror. done_callback removes the ref once
+        # the stop finishes.
         for url in to_remove:
             with AsyncHostResponseTimeService._lock:
                 stopped = AsyncHostResponseTimeService._monitors.get(url)
                 if stopped is not None:
                     del AsyncHostResponseTimeService._monitors[url]
             if stopped is not None:
-                asyncio.create_task(stopped.stop())
+                task = asyncio.create_task(stopped.stop())
+                AsyncHostResponseTimeService._stop_tasks.add(task)
+                task.add_done_callback(
+                    AsyncHostResponseTimeService._stop_tasks.discard)
 
         self._known_urls = new_urls
 
