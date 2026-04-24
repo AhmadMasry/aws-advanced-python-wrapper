@@ -19,11 +19,16 @@ behaviour during the four BG phases (CREATED / PREPARATION / IN_PROGRESS /
 POST_SWITCHOVER).
 
 Translation notes vs the sync file:
-- Each thread monitor runs its own ``asyncio.run()`` event loop for async
-  connection open / cursor operations (OS threads are independent; they can
-  each own one event loop).
+- Each thread monitor owns ONE persistent event loop for its entire
+  lifetime; all async work on that thread's connection (open, cursor
+  operations, close, cleanup) is driven via ``loop.run_until_complete``.
+  Driver connection state (psycopg AsyncConnection wait futures, aiomysql
+  stream locks) binds to the loop the connection was opened on — repeated
+  ``asyncio.run()`` would create a fresh loop each call and trigger
+  ``RuntimeError: got Future attached to a different loop`` or silent
+  hangs. See ``_run_worker_with_loop``.
 - ``AwsWrapperConnection.connect(...)`` → ``AsyncAwsWrapperConnection.connect(...)``
-  (awaited inside each per-thread ``asyncio.run`` call).
+  (awaited inside each thread's persistent loop).
 - ``conn.cursor()`` sync context manager → ``conn.cursor()`` async context
   manager (``async with``); ``execute`` / ``fetchall`` / ``fetchone`` are
   awaited.
@@ -38,6 +43,8 @@ Translation notes vs the sync file:
 - boto3 RDS Blue/Green switchover/wait calls stay synchronous.
 - ``sleep()`` calls inside threads remain synchronous (OS threads; no event
   loop blocked).
+- Every thread teardown invokes ``cleanup_async()`` on its own loop so
+  wrapper background tasks are released cleanly.
 """
 
 from __future__ import annotations
@@ -49,7 +56,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from threading import Event, Thread
 from time import perf_counter_ns, sleep
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Type
+from typing import (TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional,
+                    Tuple, Type)
 
 import psycopg
 import pytest
@@ -66,6 +74,8 @@ from aws_advanced_python_wrapper.utils.concurrent import (ConcurrentDict,
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
+from tests.integration.container.utils.async_connection_helpers import \
+    cleanup_async
 from tests.integration.container.utils.conditions import (
     enable_on_deployments, enable_on_features)
 from tests.integration.container.utils.database_engine import DatabaseEngine
@@ -126,7 +136,8 @@ def _is_conn_closed_async(conn: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-thread async helpers  (called inside asyncio.run() in worker threads)
+# Per-thread async helpers  (driven via loop.run_until_complete in worker
+# threads that own a persistent event loop; see ``_run_worker_with_loop``).
 # ---------------------------------------------------------------------------
 
 async def _open_direct_conn_async(
@@ -152,6 +163,36 @@ async def _close_conn_async(conn: Any) -> None:
             await conn.close()
     except Exception:
         pass
+
+
+def _run_worker_with_loop(
+        body: Callable[[asyncio.AbstractEventLoop], None]) -> None:
+    """Drive ``body`` on a persistent event loop owned by the current thread.
+
+    Async driver connections (psycopg AsyncConnection, aiomysql.Connection)
+    bind internal state (wait futures, stream locks) to the event loop they
+    were created on. Repeatedly calling ``asyncio.run()`` inside a worker
+    thread creates a fresh loop per call and breaks that binding, producing
+    ``RuntimeError: got Future attached to a different loop`` or silent
+    hangs.
+
+    This helper encapsulates the correct shape: one loop per thread for
+    the thread's entire lifetime, with ``cleanup_async()`` always invoked
+    on that same loop in ``finally`` so wrapper background tasks are
+    released even if the body raises.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        try:
+            body(loop)
+        finally:
+            try:
+                loop.run_until_complete(cleanup_async())
+            except Exception:
+                pass
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -504,11 +545,24 @@ class TestBlueGreenDeploymentAsync:
 
         return conn
 
-    def close_connection_async(self, conn: Any) -> None:
-        """Synchronously close an async connection from a thread context."""
+    def close_connection_async(
+            self,
+            conn: Any,
+            loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        """Close an async connection from a thread context.
+
+        ``loop`` must be the same event loop the connection was opened on
+        (the thread's persistent loop). Falls back to ``asyncio.run`` only
+        when no loop is supplied (e.g., the retry helpers that run entirely
+        on their own transient loop); callers inside a monitor thread
+        body MUST pass their persistent loop.
+        """
         try:
             if conn is not None and not _is_conn_closed_async(conn):
-                asyncio.run(_close_conn_async(conn))
+                if loop is not None:
+                    loop.run_until_complete(_close_conn_async(conn))
+                else:
+                    asyncio.run(_close_conn_async(conn))
         except Exception:
             pass
 
@@ -579,7 +633,6 @@ class TestBlueGreenDeploymentAsync:
             finish_latch: CountDownLatch,
             results: BlueGreenResultsAsync) -> None:
         """Monitor BG status changes; can terminate for itself."""
-        conn = None
         test_env = TestEnvironment.get_current()
         engine = test_env.get_engine()
 
@@ -596,12 +649,6 @@ class TestBlueGreenDeploymentAsync:
                 pytest.fail(f"Unsupported blue/green database engine deployment: {db_deployment}")
         else:
             pytest.fail(f"Unsupported database engine: {engine}")
-
-        async def _run() -> None:
-            nonlocal conn
-            conn = await _open_direct_conn_async(
-                test_driver, conn_utils.get_connect_params(host=host, port=port, dbname=db))
-            self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Connection opened.")
 
         async def _execute_topology(c: Any) -> None:
             async with c.cursor() as cursor:
@@ -621,37 +668,45 @@ class TestBlueGreenDeploymentAsync:
                     else:
                         results.blue_status_time.compute_if_absent(status, _log_and_return_time)
 
-        try:
-            asyncio.run(_run())
-            sleep(1)
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Any = None
+            try:
+                conn = loop.run_until_complete(_open_direct_conn_async(
+                    test_driver, conn_utils.get_connect_params(host=host, port=port, dbname=db)))
+                self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Connection opened.")
+                sleep(1)
 
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Starting BG status monitoring.")
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Starting BG status monitoring.")
 
-            end_time_ns = perf_counter_ns() + 15 * 60 * 1_000_000_000
-            while not stop.is_set() and perf_counter_ns() < end_time_ns:
-                if conn is None:
+                end_time_ns = perf_counter_ns() + 15 * 60 * 1_000_000_000
+                while not stop.is_set() and perf_counter_ns() < end_time_ns:
+                    if conn is None:
+                        try:
+                            conn = loop.run_until_complete(_open_direct_conn_async(
+                                test_driver, conn_utils.get_connect_params(host=host, port=port, dbname=db)))
+                            self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Connection re-opened.")
+                        except Exception:
+                            sleep(0.1)
+                            continue
+
                     try:
-                        conn = asyncio.run(_open_direct_conn_async(
-                            test_driver, conn_utils.get_connect_params(host=host, port=port, dbname=db)))
-                        self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Connection re-opened.")
-                    except Exception:
+                        loop.run_until_complete(_execute_topology(conn))
                         sleep(0.1)
-                        continue
+                    except Exception as e:
+                        self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Thread exception: {e}.")
+                        self.close_connection_async(conn, loop)
+                        conn = None
+            except Exception as e:
+                self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Thread unhandled exception: {e}.")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
 
-                try:
-                    asyncio.run(_execute_topology(conn))
-                    sleep(0.1)
-                except Exception as e:
-                    self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Thread exception: {e}.")
-                    self.close_connection_async(conn)
-                    conn = None
-        except Exception as e:
-            self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Thread unhandled exception: {e}.")
-            self.unhandled_exceptions.append(e)
+        try:
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(f"[AsyncDirectTopology @ {host_id}] Thread is completed.")
 
@@ -668,7 +723,6 @@ class TestBlueGreenDeploymentAsync:
             finish_latch: CountDownLatch,
             results: BlueGreenResultsAsync) -> None:
         """Blue node: check connectivity with SELECT 1; can terminate for itself."""
-        conn = None
 
         async def _open() -> Any:
             return await _open_direct_conn_async(
@@ -679,28 +733,37 @@ class TestBlueGreenDeploymentAsync:
                 await cursor.execute("SELECT 1")
                 await cursor.fetchall()
 
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Any = None
+            try:
+                conn = loop.run_until_complete(_open())
+                self.logger.debug(f"[AsyncDirectBlueConnectivity @ {host_id}] Connection opened.")
+
+                sleep(1)
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(
+                    f"[AsyncDirectBlueConnectivity @ {host_id}] Starting connectivity monitoring.")
+
+                while not stop.is_set():
+                    try:
+                        loop.run_until_complete(_select1(conn))
+                        sleep(1)
+                    except Exception as e:
+                        self.logger.debug(
+                            f"[AsyncDirectBlueConnectivity @ {host_id}] Thread exception: {e}")
+                        results.direct_blue_lost_connection_time_ns.set(perf_counter_ns())
+                        break
+            except Exception as e:
+                self.logger.debug(
+                    f"[AsyncDirectBlueConnectivity @ {host_id}] Thread unhandled exception: {e}")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
+
         try:
-            conn = asyncio.run(_open())
-            self.logger.debug(f"[AsyncDirectBlueConnectivity @ {host_id}] Connection opened.")
-
-            sleep(1)
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(f"[AsyncDirectBlueConnectivity @ {host_id}] Starting connectivity monitoring.")
-
-            while not stop.is_set():
-                try:
-                    asyncio.run(_select1(conn))
-                    sleep(1)
-                except Exception as e:
-                    self.logger.debug(f"[AsyncDirectBlueConnectivity @ {host_id}] Thread exception: {e}")
-                    results.direct_blue_lost_connection_time_ns.set(perf_counter_ns())
-                    break
-        except Exception as e:
-            self.logger.debug(f"[AsyncDirectBlueConnectivity @ {host_id}] Thread unhandled exception: {e}")
-            self.unhandled_exceptions.append(e)
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(f"[AsyncDirectBlueConnectivity @ {host_id}] Thread is completed.")
 
@@ -717,36 +780,44 @@ class TestBlueGreenDeploymentAsync:
             finish_latch: CountDownLatch,
             results: BlueGreenResultsAsync) -> None:
         """Blue node: check connectivity via is_closed; can terminate for itself."""
-        conn = None
 
         async def _open() -> Any:
             return await _open_direct_conn_async(
                 test_driver, conn_utils.get_connect_params(host=host, port=port, dbname=db))
 
-        try:
-            conn = asyncio.run(_open())
-            self.logger.debug(f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Connection opened.")
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Any = None
+            try:
+                conn = loop.run_until_complete(_open())
+                self.logger.debug(f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Connection opened.")
 
-            sleep(1)
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Starting connectivity monitoring.")
+                sleep(1)
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(
+                    f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Starting connectivity monitoring.")
 
-            while not stop.is_set():
-                try:
-                    if _is_conn_closed_async(conn):
+                while not stop.is_set():
+                    try:
+                        if _is_conn_closed_async(conn):
+                            results.direct_blue_idle_lost_connection_time_ns.set(perf_counter_ns())
+                            break
+                        sleep(1)
+                    except Exception as e:
+                        self.logger.debug(
+                            f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Thread exception: {e}")
                         results.direct_blue_idle_lost_connection_time_ns.set(perf_counter_ns())
                         break
-                    sleep(1)
-                except Exception as e:
-                    self.logger.debug(f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Thread exception: {e}")
-                    results.direct_blue_idle_lost_connection_time_ns.set(perf_counter_ns())
-                    break
-        except Exception as e:
-            self.logger.debug(f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Thread unhandled exception: {e}")
-            self.unhandled_exceptions.append(e)
+            except Exception as e:
+                self.logger.debug(
+                    f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Thread unhandled exception: {e}")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
+
+        try:
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(f"[AsyncDirectBlueIdleConnectivity @ {host_id}] Thread is completed.")
 
@@ -763,36 +834,44 @@ class TestBlueGreenDeploymentAsync:
             finish_latch: CountDownLatch,
             results: BlueGreenResultsAsync) -> None:
         """Blue node (wrapper): check connectivity via is_closed; can terminate for itself."""
-        conn = None
 
         async def _open() -> AsyncAwsWrapperConnection:
             return await _open_wrapper_conn_async(
                 test_driver, self.get_wrapper_connect_params(conn_utils, host, port, db))
 
-        try:
-            conn = asyncio.run(_open())
-            self.logger.debug(f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Connection opened.")
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Optional[AsyncAwsWrapperConnection] = None
+            try:
+                conn = loop.run_until_complete(_open())
+                self.logger.debug(f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Connection opened.")
 
-            sleep(1)
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Starting connectivity monitoring.")
+                sleep(1)
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(
+                    f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Starting connectivity monitoring.")
 
-            while not stop.is_set():
-                try:
-                    if _is_conn_closed_async(conn):
-                        results.wrapper_blue_idle_lost_connection_time_ns.set(perf_counter_ns())
+                while not stop.is_set():
+                    try:
+                        if _is_conn_closed_async(conn):
+                            results.wrapper_blue_idle_lost_connection_time_ns.set(perf_counter_ns())
+                            break
+                        sleep(1)
+                    except Exception as e:
+                        self.logger.debug(
+                            f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Thread exception: {e}")
+                        results.direct_blue_idle_lost_connection_time_ns.set(perf_counter_ns())
                         break
-                    sleep(1)
-                except Exception as e:
-                    self.logger.debug(f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Thread exception: {e}")
-                    results.direct_blue_idle_lost_connection_time_ns.set(perf_counter_ns())
-                    break
-        except Exception as e:
-            self.logger.debug(f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Thread unhandled exception: {e}")
-            self.unhandled_exceptions.append(e)
+            except Exception as e:
+                self.logger.debug(
+                    f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Thread unhandled exception: {e}")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
+
+        try:
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(f"[AsyncWrapperBlueIdleConnectivity @ {host_id}] Thread is completed.")
 
@@ -809,7 +888,6 @@ class TestBlueGreenDeploymentAsync:
             finish_latch: CountDownLatch,
             results: BlueGreenResultsAsync) -> None:
         """Blue node (wrapper): check connectivity with sleep query; can terminate for itself."""
-        conn: Optional[AsyncAwsWrapperConnection] = None
         query = None
         test_env = TestEnvironment.get_current()
         engine = test_env.get_engine()
@@ -830,35 +908,44 @@ class TestBlueGreenDeploymentAsync:
                 await cursor.execute(query)
                 await cursor.fetchall()
 
-        try:
-            conn = asyncio.run(_open())
-            bg_plugin: Optional[BlueGreenPlugin] = _unwrap_plugin_async(conn, BlueGreenPlugin)
-            assert bg_plugin is not None, f"Unable to find blue/green plugin in wrapper connection for {host}."
-            self.logger.debug(f"[AsyncWrapperBlueExecute @ {host_id}] Connection opened.")
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Optional[AsyncAwsWrapperConnection] = None
+            try:
+                conn = loop.run_until_complete(_open())
+                bg_plugin: Optional[BlueGreenPlugin] = _unwrap_plugin_async(conn, BlueGreenPlugin)
+                assert bg_plugin is not None, \
+                    f"Unable to find blue/green plugin in wrapper connection for {host}."
+                self.logger.debug(f"[AsyncWrapperBlueExecute @ {host_id}] Connection opened.")
 
-            sleep(1)
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(f"[AsyncWrapperBlueExecute @ {host_id}] Starting connectivity monitoring.")
-
-            while not stop.is_set():
-                start_time_ns = perf_counter_ns()
-                try:
-                    asyncio.run(_execute_sleep(conn))
-                    end_time_ns = perf_counter_ns()
-                    results.blue_wrapper_execute_times.append(
-                        TimeHolder(start_time_ns, end_time_ns, bg_plugin.get_hold_time_ns()))
-                except Exception as e:
-                    results.blue_wrapper_execute_times.append(
-                        TimeHolder(start_time_ns, perf_counter_ns(), bg_plugin.get_hold_time_ns(), str(e)))
-                    if _is_conn_closed_async(conn):
-                        break
                 sleep(1)
-        except Exception as e:
-            self.logger.debug(f"[AsyncWrapperBlueExecute @ {host_id}] Thread unhandled exception: {e}")
-            self.unhandled_exceptions.append(e)
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(
+                    f"[AsyncWrapperBlueExecute @ {host_id}] Starting connectivity monitoring.")
+
+                while not stop.is_set():
+                    start_time_ns = perf_counter_ns()
+                    try:
+                        loop.run_until_complete(_execute_sleep(conn))
+                        end_time_ns = perf_counter_ns()
+                        results.blue_wrapper_execute_times.append(
+                            TimeHolder(start_time_ns, end_time_ns, bg_plugin.get_hold_time_ns()))
+                    except Exception as e:
+                        results.blue_wrapper_execute_times.append(
+                            TimeHolder(start_time_ns, perf_counter_ns(),
+                                       bg_plugin.get_hold_time_ns(), str(e)))
+                        if _is_conn_closed_async(conn):
+                            break
+                    sleep(1)
+            except Exception as e:
+                self.logger.debug(f"[AsyncWrapperBlueExecute @ {host_id}] Thread unhandled exception: {e}")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
+
+        try:
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(f"[AsyncWrapperBlueExecute @ {host_id}] Thread is completed.")
 
@@ -875,56 +962,66 @@ class TestBlueGreenDeploymentAsync:
             finish_latch: CountDownLatch,
             results: BlueGreenResultsAsync) -> None:
         """Blue node (wrapper): check new connection open time; needs stop signal."""
-        conn: Optional[AsyncAwsWrapperConnection] = None
         connect_params = self.get_wrapper_connect_params(conn_utils, host, port, db)
 
         async def _open() -> AsyncAwsWrapperConnection:
             return await _open_wrapper_conn_async(test_driver, connect_params)
 
-        try:
-            sleep(1)
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(f"[AsyncWrapperBlueNewConnection @ {host_id}] Starting connectivity monitoring.")
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Optional[AsyncAwsWrapperConnection] = None
+            try:
+                sleep(1)
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(
+                    f"[AsyncWrapperBlueNewConnection @ {host_id}] Starting connectivity monitoring.")
 
-            while not stop.is_set():
-                start_time_ns = perf_counter_ns()
+                while not stop.is_set():
+                    start_time_ns = perf_counter_ns()
 
-                try:
-                    conn = asyncio.run(_open())
-                    end_time_ns = perf_counter_ns()
-                    bg_plugin: Optional[BlueGreenPlugin] = _unwrap_plugin_async(conn, BlueGreenPlugin)
-                    assert bg_plugin is not None, \
-                        f"Unable to find blue/green plugin in wrapper connection for {host}."
-
-                    results.blue_wrapper_connect_times.append(
-                        TimeHolder(start_time_ns, end_time_ns, bg_plugin.get_hold_time_ns()))
-                except Exception as e:
-                    if self.is_timeout_exception(e):
-                        self.logger.debug(f"[AsyncWrapperBlueNewConnection @ {host_id}] Thread timeout exception: {e}")
-                    else:
-                        self.logger.debug(f"[AsyncWrapperBlueNewConnection @ {host_id}] Thread exception: {e}")
-
-                    end_time_ns = perf_counter_ns()
-                    if conn is not None:
-                        bg_plugin = _unwrap_plugin_async(conn, BlueGreenPlugin)
+                    try:
+                        conn = loop.run_until_complete(_open())
+                        end_time_ns = perf_counter_ns()
+                        bg_plugin: Optional[BlueGreenPlugin] = _unwrap_plugin_async(conn, BlueGreenPlugin)
                         assert bg_plugin is not None, \
                             f"Unable to find blue/green plugin in wrapper connection for {host}."
-                        results.blue_wrapper_connect_times.append(
-                            TimeHolder(start_time_ns, end_time_ns, bg_plugin.get_hold_time_ns(), str(e)))
-                    else:
-                        results.blue_wrapper_connect_times.append(
-                            TimeHolder(start_time_ns, end_time_ns, error=str(e)))
 
-                self.close_connection_async(conn)
-                conn = None
-                sleep(1)
+                        results.blue_wrapper_connect_times.append(
+                            TimeHolder(start_time_ns, end_time_ns, bg_plugin.get_hold_time_ns()))
+                    except Exception as e:
+                        if self.is_timeout_exception(e):
+                            self.logger.debug(
+                                f"[AsyncWrapperBlueNewConnection @ {host_id}] Thread timeout exception: {e}")
+                        else:
+                            self.logger.debug(
+                                f"[AsyncWrapperBlueNewConnection @ {host_id}] Thread exception: {e}")
 
-        except Exception as e:
-            self.logger.debug(f"[AsyncWrapperBlueNewConnection @ {host_id}] Thread unhandled exception: {e}")
-            self.unhandled_exceptions.append(e)
+                        end_time_ns = perf_counter_ns()
+                        if conn is not None:
+                            bg_plugin = _unwrap_plugin_async(conn, BlueGreenPlugin)
+                            assert bg_plugin is not None, \
+                                f"Unable to find blue/green plugin in wrapper connection for {host}."
+                            results.blue_wrapper_connect_times.append(
+                                TimeHolder(start_time_ns, end_time_ns,
+                                           bg_plugin.get_hold_time_ns(), str(e)))
+                        else:
+                            results.blue_wrapper_connect_times.append(
+                                TimeHolder(start_time_ns, end_time_ns, error=str(e)))
+
+                    self.close_connection_async(conn, loop)
+                    conn = None
+                    sleep(1)
+
+            except Exception as e:
+                self.logger.debug(
+                    f"[AsyncWrapperBlueNewConnection @ {host_id}] Thread unhandled exception: {e}")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
+
+        try:
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(f"[AsyncWrapperBlueNewConnection @ {host_id}] Thread is completed.")
 
@@ -979,7 +1076,6 @@ class TestBlueGreenDeploymentAsync:
             finish_latch: CountDownLatch,
             results: BlueGreenResultsAsync) -> None:
         """Green node (wrapper): check connectivity with SELECT 1; can terminate for itself."""
-        conn: Optional[AsyncAwsWrapperConnection] = None
 
         async def _open() -> AsyncAwsWrapperConnection:
             return await _open_wrapper_conn_async(
@@ -990,45 +1086,56 @@ class TestBlueGreenDeploymentAsync:
                 await cursor.execute("SELECT 1")
                 await cursor.fetchall()
 
-        try:
-            conn = asyncio.run(_open())
-            self.logger.debug(f"[AsyncWrapperGreenConnectivity @ {host_id}] Connection opened.")
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Optional[AsyncAwsWrapperConnection] = None
+            try:
+                conn = loop.run_until_complete(_open())
+                self.logger.debug(f"[AsyncWrapperGreenConnectivity @ {host_id}] Connection opened.")
 
-            bg_plugin: Optional[BlueGreenPlugin] = _unwrap_plugin_async(conn, BlueGreenPlugin)
-            assert bg_plugin is not None, f"Unable to find blue/green plugin in wrapper connection for {host}."
+                bg_plugin: Optional[BlueGreenPlugin] = _unwrap_plugin_async(conn, BlueGreenPlugin)
+                assert bg_plugin is not None, \
+                    f"Unable to find blue/green plugin in wrapper connection for {host}."
 
-            sleep(1)
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(f"[AsyncWrapperGreenConnectivity @ {host_id}] Starting connectivity monitoring.")
+                sleep(1)
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(
+                    f"[AsyncWrapperGreenConnectivity @ {host_id}] Starting connectivity monitoring.")
 
-            start_time_ns = perf_counter_ns()
-            while not stop.is_set():
-                try:
-                    start_time_ns = perf_counter_ns()
-                    asyncio.run(_select1(conn))
-                    end_time_ns = perf_counter_ns()
-                    results.green_wrapper_execute_times.append(
-                        TimeHolder(start_time_ns, end_time_ns, bg_plugin.get_hold_time_ns()))
-                    sleep(1)
-                except Exception as e:
-                    if self.is_timeout_exception(e):
-                        self.logger.debug(
-                            f"[AsyncWrapperGreenConnectivity @ {host_id}] Thread timeout exception: {e}")
+                start_time_ns = perf_counter_ns()
+                while not stop.is_set():
+                    try:
+                        start_time_ns = perf_counter_ns()
+                        loop.run_until_complete(_select1(conn))
+                        end_time_ns = perf_counter_ns()
                         results.green_wrapper_execute_times.append(
-                            TimeHolder(start_time_ns, perf_counter_ns(), bg_plugin.get_hold_time_ns(), str(e)))
-                        if _is_conn_closed_async(conn):
+                            TimeHolder(start_time_ns, end_time_ns, bg_plugin.get_hold_time_ns()))
+                        sleep(1)
+                    except Exception as e:
+                        if self.is_timeout_exception(e):
+                            self.logger.debug(
+                                f"[AsyncWrapperGreenConnectivity @ {host_id}] Thread timeout exception: {e}")
+                            results.green_wrapper_execute_times.append(
+                                TimeHolder(start_time_ns, perf_counter_ns(),
+                                           bg_plugin.get_hold_time_ns(), str(e)))
+                            if _is_conn_closed_async(conn):
+                                results.wrapper_green_lost_connection_time_ns.set(perf_counter_ns())
+                                break
+                        else:
+                            self.logger.debug(
+                                f"[AsyncWrapperGreenConnectivity @ {host_id}] Thread exception: {e}")
                             results.wrapper_green_lost_connection_time_ns.set(perf_counter_ns())
                             break
-                    else:
-                        self.logger.debug(f"[AsyncWrapperGreenConnectivity @ {host_id}] Thread exception: {e}")
-                        results.wrapper_green_lost_connection_time_ns.set(perf_counter_ns())
-                        break
-        except Exception as e:
-            self.logger.debug(f"[AsyncWrapperGreenConnectivity @ {host_id}] Thread unhandled exception: {e}")
-            self.unhandled_exceptions.append(e)
+            except Exception as e:
+                self.logger.debug(
+                    f"[AsyncWrapperGreenConnectivity @ {host_id}] Thread unhandled exception: {e}")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
+
+        try:
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(f"[AsyncWrapperGreenConnectivity @ {host_id}] Thread is completed.")
 
@@ -1081,70 +1188,81 @@ class TestBlueGreenDeploymentAsync:
             notify_on_first_error: bool,
             exit_on_first_success: bool) -> None:
         """Green node: IAM connectivity with IP address; can terminate for itself."""
-        conn = None
 
         async def _open_direct(params: Dict[str, Any]) -> Any:
             return await _open_direct_conn_async(test_driver, params)
 
-        try:
-            test_env = TestEnvironment.get_current()
-            iam_user = test_env.get_info().get_iam_user_name()
-            green_ip = socket.gethostbyname(connect_host)
-            connect_params = conn_utils.get_connect_params(host=green_ip, port=port, user=iam_user, dbname=db)
-            connect_params[WrapperProperties.CONNECT_TIMEOUT_SEC.name] = 10
-            if test_env.get_engine() == DatabaseEngine.MYSQL:
-                connect_params["auth_plugin"] = "mysql_clear_password"
+        def _body(loop: asyncio.AbstractEventLoop) -> None:
+            conn: Any = None
+            try:
+                test_env = TestEnvironment.get_current()
+                iam_user = test_env.get_info().get_iam_user_name()
+                green_ip = socket.gethostbyname(connect_host)
+                connect_params = conn_utils.get_connect_params(
+                    host=green_ip, port=port, user=iam_user, dbname=db)
+                connect_params[WrapperProperties.CONNECT_TIMEOUT_SEC.name] = 10
+                if test_env.get_engine() == DatabaseEngine.MYSQL:
+                    connect_params["auth_plugin"] = "mysql_clear_password"
 
-            sleep(1)
-            start_latch.count_down()
-            start_latch.wait_sec(5 * 60)
-            self.logger.debug(
-                f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
-                f"Starting connectivity monitoring {iam_token_host}")
+                sleep(1)
+                start_latch.count_down()
+                start_latch.wait_sec(5 * 60)
+                self.logger.debug(
+                    f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
+                    f"Starting connectivity monitoring {iam_token_host}")
 
-            while not stop.is_set():
-                token = rds_client.generate_db_auth_token(
-                    DBHostname=iam_token_host, Port=port, DBUsername=iam_user)
-                connect_params[WrapperProperties.PASSWORD.name] = token
+                while not stop.is_set():
+                    token = rds_client.generate_db_auth_token(
+                        DBHostname=iam_token_host, Port=port, DBUsername=iam_user)
+                    connect_params[WrapperProperties.PASSWORD.name] = token
 
-                start_ns = perf_counter_ns()
-                try:
-                    conn = asyncio.run(_open_direct(connect_params))
-                    end_ns = perf_counter_ns()
-                    result_queue.append(TimeHolder(start_ns, end_ns))
+                    start_ns = perf_counter_ns()
+                    try:
+                        conn = loop.run_until_complete(_open_direct(connect_params))
+                        end_ns = perf_counter_ns()
+                        result_queue.append(TimeHolder(start_ns, end_ns))
 
-                    if exit_on_first_success:
-                        results.green_node_changed_name_time_ns.compare_and_set(0, perf_counter_ns())
-                        self.logger.debug(
-                            f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
-                            f"Successfully connected. Exiting thread...")
-                        return
-                except Exception as e:
-                    if self.is_timeout_exception(e):
-                        self.logger.debug(
-                            f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] Thread exception: {e}")
-                        result_queue.append(TimeHolder(start_ns, perf_counter_ns(), error=str(e)))
-                    else:
-                        self.logger.debug(
-                            f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] Thread exception: {e}")
-                        result_queue.append(TimeHolder(start_ns, perf_counter_ns(), error=str(e)))
-                        if notify_on_first_error and "access denied" in str(e).lower():
-                            results.green_node_changed_name_time_ns.compare_and_set(0, perf_counter_ns())
+                        if exit_on_first_success:
+                            results.green_node_changed_name_time_ns.compare_and_set(
+                                0, perf_counter_ns())
                             self.logger.debug(
                                 f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
-                                f"Encountered first 'Access denied' exception. Exiting thread...")
+                                f"Successfully connected. Exiting thread...")
                             return
+                    except Exception as e:
+                        if self.is_timeout_exception(e):
+                            self.logger.debug(
+                                f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
+                                f"Thread exception: {e}")
+                            result_queue.append(TimeHolder(start_ns, perf_counter_ns(), error=str(e)))
+                        else:
+                            self.logger.debug(
+                                f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
+                                f"Thread exception: {e}")
+                            result_queue.append(TimeHolder(start_ns, perf_counter_ns(), error=str(e)))
+                            if notify_on_first_error and "access denied" in str(e).lower():
+                                results.green_node_changed_name_time_ns.compare_and_set(
+                                    0, perf_counter_ns())
+                                self.logger.debug(
+                                    f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
+                                    f"Encountered first 'Access denied' exception. Exiting thread...")
+                                return
 
-                self.close_connection_async(conn)
-                conn = None
-                sleep(1)
+                    self.close_connection_async(conn, loop)
+                    conn = None
+                    sleep(1)
 
-        except Exception as e:
-            self.logger.debug(
-                f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] Thread unhandled exception: {e}")
-            self.unhandled_exceptions.append(e)
+            except Exception as e:
+                self.logger.debug(
+                    f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] "
+                    f"Thread unhandled exception: {e}")
+                self.unhandled_exceptions.append(e)
+            finally:
+                self.close_connection_async(conn, loop)
+
+        try:
+            _run_worker_with_loop(_body)
         finally:
-            self.close_connection_async(conn)
             finish_latch.count_down()
             self.logger.debug(
                 f"[AsyncDirectGreenIamIp{thread_prefix} @ {host_id}] Thread is completed.")
