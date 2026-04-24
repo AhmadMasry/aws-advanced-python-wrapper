@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING, List
 import pytest
 
 from tests.integration.container.utils.async_connection_helpers import (
-    cleanup_async, connect_async)
+    assert_first_query_throws_async, cleanup_async, connect_async,
+    query_instance_id_async)
 
 if TYPE_CHECKING:
     from tests.integration.container.utils.connection_utils import ConnectionUtils
@@ -38,8 +39,6 @@ from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.conditions import (
     enable_on_features, enable_on_num_instances)
-from tests.integration.container.utils.database_engine_deployment import \
-    DatabaseEngineDeployment
 from tests.integration.container.utils.rds_test_utility import RdsTestUtility
 from tests.integration.container.utils.test_environment import TestEnvironment
 from tests.integration.container.utils.test_environment_features import \
@@ -48,55 +47,6 @@ from tests.integration.container.utils.test_environment_features import \
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.wrapper import \
         AsyncAwsWrapperConnection
-
-
-# ---------------------------------------------------------------------------
-# Module-level async helpers
-# ---------------------------------------------------------------------------
-
-async def _query_instance_id_async(
-        conn: AsyncAwsWrapperConnection,
-        rds_utils: RdsTestUtility) -> str:
-    """Async counterpart of ``rds_utils.query_instance_id(conn)``."""
-    deployment = TestEnvironment.get_current().get_deployment()
-    from tests.integration.container.utils.database_engine import \
-        DatabaseEngine
-    engine = TestEnvironment.get_current().get_engine()
-
-    if deployment == DatabaseEngineDeployment.AURORA:
-        sql = rds_utils.get_instance_id_query(engine)
-        async with conn.cursor() as cur:
-            await cur.execute(sql)
-            record = await cur.fetchone()
-            return record[0]
-
-    elif deployment == DatabaseEngineDeployment.RDS_MULTI_AZ_CLUSTER:
-        if engine == DatabaseEngine.MYSQL:
-            endpoint_sql = "SELECT endpoint FROM mysql.rds_topology WHERE id=(SELECT @@server_id)"
-        else:
-            endpoint_sql = (
-                "SELECT endpoint FROM rds_tools.show_topology() "
-                "WHERE id=(SELECT dbi_resource_id FROM rds_tools.dbi_resource_id())"
-            )
-        async with conn.cursor() as cur:
-            await cur.execute(endpoint_sql)
-            row = await cur.fetchone()
-            endpoint: str = row[0]
-            return endpoint[:endpoint.find(".")]
-
-    else:
-        raise RuntimeError(
-            f"_query_instance_id_async: unsupported deployment {deployment}"
-        )
-
-
-async def _assert_first_query_throws_async(
-        conn: AsyncAwsWrapperConnection,
-        rds_utils: RdsTestUtility,
-        exception_cls: type) -> None:
-    """Async counterpart of ``rds_utils.assert_first_query_throws``."""
-    with pytest.raises(exception_cls):
-        await _query_instance_id_async(conn, rds_utils)
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +139,10 @@ class TestAutoScalingAsync:
 
                     await asyncio.sleep(5)
 
-                    writer_id = await _query_instance_id_async(new_instance_conn, rds_utils)
+                    writer_id = await query_instance_id_async(new_instance_conn, rds_utils)
 
                     await new_instance_conn.set_read_only(True)
-                    reader_id = await _query_instance_id_async(new_instance_conn, rds_utils)
+                    reader_id = await query_instance_id_async(new_instance_conn, rds_utils)
 
                     assert new_instance.get_instance_id() == reader_id
                     assert writer_id != reader_id
@@ -211,7 +161,7 @@ class TestAutoScalingAsync:
 
                 await new_instance_conn.set_read_only(True)
 
-                instance_id = await _query_instance_id_async(new_instance_conn, rds_utils)
+                instance_id = await query_instance_id_async(new_instance_conn, rds_utils)
                 assert writer_id != instance_id
                 assert new_instance.get_instance_id() != instance_id
 
@@ -269,16 +219,16 @@ class TestAutoScalingAsync:
                     connections.append(new_instance_conn)
 
                     await new_instance_conn.set_read_only(True)
-                    reader_id = await _query_instance_id_async(new_instance_conn, rds_utils)
+                    reader_id = await query_instance_id_async(new_instance_conn, rds_utils)
 
                     assert new_instance.get_instance_id() == reader_id
                     assert TestAutoScalingAsync.is_url_in_pool(new_instance.get_url(), provider.pool_urls)
                 finally:
                     rds_utils.delete_db_instance(new_instance.get_instance_id())
 
-                await _assert_first_query_throws_async(new_instance_conn, rds_utils, FailoverSuccessError)
+                await assert_first_query_throws_async(new_instance_conn, rds_utils, FailoverSuccessError)
 
-                new_reader_id = await _query_instance_id_async(new_instance_conn, rds_utils)
+                new_reader_id = await query_instance_id_async(new_instance_conn, rds_utils)
                 assert new_instance.get_instance_id() != new_reader_id
             finally:
                 for conn in connections:

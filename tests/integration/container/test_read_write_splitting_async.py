@@ -22,8 +22,8 @@ property setters cannot be async).
 Translation notes vs the sync file:
 - ``conn.read_only = True`` → ``await conn.set_read_only(True)``
 - ``conn.read_only`` (getter) → ``conn.read_only`` unchanged (sync passthrough)
-- ``rds_utils.query_instance_id(conn)`` → ``await _query_instance_id_async(conn, rds_utils)``
-- ``rds_utils.assert_first_query_throws(conn, exc)`` → ``await _assert_first_query_throws_async(conn, rds_utils, exc)``
+- ``rds_utils.query_instance_id(conn)`` → ``await query_instance_id_async(conn, rds_utils)``
+- ``rds_utils.assert_first_query_throws(conn, exc)`` → ``await assert_first_query_throws_async(conn, rds_utils, exc)``
 - ``rds_utils.create_user(conn, ...)`` → ``await _create_user_async(conn, ...)``
 - Pooled-connection tests use ``AsyncConnectionProviderManager`` in place of
   ``ConnectionProviderManager``; ``SqlAlchemyPooledConnectionProvider``
@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
-from typing import TYPE_CHECKING, Type
+from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import PoolProxiedConnection
@@ -54,7 +54,8 @@ from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.async_connection_helpers import (
-    cleanup_async, connect_async)
+    assert_first_query_throws_async, cleanup_async, connect_async,
+    query_instance_id_async)
 from tests.integration.container.utils.conditions import (
     disable_on_engines, disable_on_features, enable_on_deployments,
     enable_on_features, enable_on_num_instances)
@@ -77,55 +78,6 @@ if TYPE_CHECKING:
 # Module-level async helpers (inlined from sync rds_test_utility to avoid
 # calling sync cursor methods on an AsyncAwsWrapperConnection).
 # ---------------------------------------------------------------------------
-
-async def _query_instance_id_async(
-        conn: AsyncAwsWrapperConnection,
-        rds_utils: RdsTestUtility) -> str:
-    """Async counterpart of ``rds_utils.query_instance_id(conn)``.
-
-    ``rds_test_utility.query_instance_id`` calls ``conn.cursor()`` and uses
-    sync cursor methods, which do not work with ``AsyncAwsWrapperConnection``
-    whose ``cursor.execute`` / ``fetchone`` are coroutines.  We replicate
-    the Aurora + Multi-AZ paths directly here.
-    """
-    deployment = TestEnvironment.get_current().get_deployment()
-    engine = TestEnvironment.get_current().get_engine()
-
-    if deployment == DatabaseEngineDeployment.AURORA:
-        sql = rds_utils.get_instance_id_query(engine)
-        async with conn.cursor() as cur:
-            await cur.execute(sql)
-            record = await cur.fetchone()
-            return record[0]
-
-    elif deployment == DatabaseEngineDeployment.RDS_MULTI_AZ_CLUSTER:
-        if engine == DatabaseEngine.MYSQL:
-            endpoint_sql = "SELECT endpoint FROM mysql.rds_topology WHERE id=(SELECT @@server_id)"
-        else:
-            endpoint_sql = (
-                "SELECT endpoint FROM rds_tools.show_topology() "
-                "WHERE id=(SELECT dbi_resource_id FROM rds_tools.dbi_resource_id())"
-            )
-        async with conn.cursor() as cur:
-            await cur.execute(endpoint_sql)
-            row = await cur.fetchone()
-            endpoint: str = row[0]
-            return endpoint[:endpoint.find(".")]
-
-    else:
-        raise RuntimeError(
-            f"_query_instance_id_async: unsupported deployment {deployment}"
-        )
-
-
-async def _assert_first_query_throws_async(
-        conn: AsyncAwsWrapperConnection,
-        rds_utils: RdsTestUtility,
-        exception_cls: Type[BaseException]) -> None:
-    """Async counterpart of ``rds_utils.assert_first_query_throws``."""
-    with pytest.raises(exception_cls):
-        await _query_instance_id_async(conn, rds_utils)
-
 
 async def _create_user_async(
         conn: AsyncAwsWrapperConnection,
@@ -313,26 +265,26 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_read_only(True)
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != reader_id
 
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id == current_id
 
                 await conn.set_read_only(False)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
 
                 await conn.set_read_only(False)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
 
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id == current_id
             finally:
                 await conn.close()
@@ -363,14 +315,14 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id == current_id
 
                 await conn.set_read_only(False)
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id != writer_id
             finally:
                 await conn.close()
@@ -388,14 +340,14 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id == current_id
 
                 await conn.set_read_only(False)
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id != writer_id
             finally:
                 await conn.close()
@@ -413,10 +365,10 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_read_only(True)
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != reader_id
 
                 async with conn.cursor() as cursor:
@@ -427,13 +379,13 @@ class TestReadWriteSplittingAsync:
                     with pytest.raises(ReadWriteSplittingError):
                         await conn.set_read_only(False)
 
-                    current_id = await _query_instance_id_async(conn, rds_utils)
+                    current_id = await query_instance_id_async(conn, rds_utils)
                     assert reader_id == current_id
 
                     await cursor.execute("COMMIT")
 
                     await conn.set_read_only(False)
-                    current_id = await _query_instance_id_async(conn, rds_utils)
+                    current_id = await query_instance_id_async(conn, rds_utils)
                     assert writer_id == current_id
             finally:
                 await conn.close()
@@ -451,10 +403,10 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_read_only(True)
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != reader_id
 
                 async with conn.cursor() as cursor:
@@ -464,12 +416,12 @@ class TestReadWriteSplittingAsync:
                     with pytest.raises(ReadWriteSplittingError):
                         await conn.set_read_only(False)
 
-                    current_id = await _query_instance_id_async(conn, rds_utils)
+                    current_id = await query_instance_id_async(conn, rds_utils)
                     assert reader_id == current_id
 
                     await cursor.execute("COMMIT")
                     await conn.set_read_only(False)
-                    current_id = await _query_instance_id_async(conn, rds_utils)
+                    current_id = await query_instance_id_async(conn, rds_utils)
                     assert writer_id == current_id
             finally:
                 await conn.close()
@@ -487,7 +439,7 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 cursor = conn.cursor()
                 await conn.set_autocommit(False)
@@ -501,7 +453,7 @@ class TestReadWriteSplittingAsync:
                         await conn.set_read_only(True)
                     assert conn.read_only is False
 
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
             finally:
                 await conn.close()
@@ -526,7 +478,7 @@ class TestReadWriteSplittingAsync:
                 **dict(proxied_props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 # Disable all reader instance ids and reader cluster endpoint.
                 instance_ids = [
@@ -540,16 +492,16 @@ class TestReadWriteSplittingAsync:
                 )
 
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
 
                 await conn.set_read_only(False)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
 
                 ProxyHelper.enable_all_connectivity()
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != current_id
             finally:
                 await conn.close()
@@ -619,7 +571,7 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 old_cursor = conn.cursor()
                 await old_cursor.execute("SELECT 1")
@@ -630,11 +582,11 @@ class TestReadWriteSplittingAsync:
                 with pytest.raises(AwsWrapperError):
                     await old_cursor.execute("SELECT 1")
 
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != reader_id
 
                 await old_cursor.close()
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id == current_id
             finally:
                 await conn.close()
@@ -660,7 +612,7 @@ class TestReadWriteSplittingAsync:
                 **dict(proxied_failover_props),
             )
             try:
-                original_writer_id = await _query_instance_id_async(conn, rds_utils)
+                original_writer_id = await query_instance_id_async(conn, rds_utils)
 
                 # Disable all reader instance ids and reader cluster endpoint.
                 instance_ids = [
@@ -675,24 +627,24 @@ class TestReadWriteSplittingAsync:
 
                 # Force internal reader connection to the writer instance
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert original_writer_id == current_id
                 await conn.set_read_only(False)
 
                 ProxyHelper.enable_all_connectivity()
                 rds_utils.failover_cluster_and_wait_until_writer_changed(original_writer_id)
-                await _assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
+                await assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
 
-                new_writer_id = await _query_instance_id_async(conn, rds_utils)
+                new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert original_writer_id != new_writer_id
                 assert rds_utils.is_db_instance_writer(new_writer_id)
 
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert new_writer_id != current_id
 
                 await conn.set_read_only(False)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert new_writer_id == current_id
             finally:
                 await conn.close()
@@ -732,10 +684,10 @@ class TestReadWriteSplittingAsync:
                 **dict(proxied_failover_props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_read_only(True)
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != reader_id
 
                 instances = test_environment.get_instances()
@@ -756,21 +708,21 @@ class TestReadWriteSplittingAsync:
                     if instance_id != other_reader_id:
                         ProxyHelper.disable_connectivity(instance_id)
 
-                await _assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
+                await assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
                 assert not conn.is_closed
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert other_reader_id == current_id
                 assert reader_id != current_id
 
                 ProxyHelper.enable_all_connectivity()
                 await conn.set_read_only(False)
                 assert not conn.is_closed
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
 
                 await conn.set_read_only(True)
                 assert not conn.is_closed
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert other_reader_id == current_id
             finally:
                 await conn.close()
@@ -803,10 +755,10 @@ class TestReadWriteSplittingAsync:
                 **dict(proxied_failover_props),
             )
             try:
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_read_only(True)
-                reader_id = await _query_instance_id_async(conn, rds_utils)
+                reader_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != reader_id
 
                 # Kill all instances except the writer
@@ -818,18 +770,18 @@ class TestReadWriteSplittingAsync:
                     test_environment.get_proxy_database_info().get_cluster_read_only_endpoint()
                 )
 
-                await _assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
+                await assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
                 assert not conn.is_closed
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
 
                 ProxyHelper.enable_all_connectivity()
                 await conn.set_read_only(True)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id != current_id
 
                 await conn.set_read_only(False)
-                current_id = await _query_instance_id_async(conn, rds_utils)
+                current_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_id == current_id
             finally:
                 await conn.close()
@@ -870,17 +822,17 @@ class TestReadWriteSplittingAsync:
                 **dict(props),
             )
             try:
-                writer_connection_id = await _query_instance_id_async(conn, rds_utils)
+                writer_connection_id = await query_instance_id_async(conn, rds_utils)
 
                 # Switch to reader successfully
                 await conn.set_read_only(True)
-                reader_connection_id = await _query_instance_id_async(conn, rds_utils)
+                reader_connection_id = await query_instance_id_async(conn, rds_utils)
                 # Should stay on writer as fallback since reader endpoint points to a writer
                 assert writer_connection_id == reader_connection_id
 
                 # Going to the write endpoint will be the same connection again
                 await conn.set_read_only(False)
-                final_connection_id = await _query_instance_id_async(conn, rds_utils)
+                final_connection_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_connection_id == final_connection_id
             finally:
                 await conn.close()
@@ -908,13 +860,13 @@ class TestReadWriteSplittingAsync:
                 # Set autocommit to False on writer
                 await conn.set_autocommit(False)
                 assert await conn.autocommit is False
-                writer_connection_id = await _query_instance_id_async(conn, rds_utils)
+                writer_connection_id = await query_instance_id_async(conn, rds_utils)
                 await conn.commit()
 
                 # Switch to reader - autocommit should remain False
                 await conn.set_read_only(True)
                 assert await conn.autocommit is False
-                reader_connection_id = await _query_instance_id_async(conn, rds_utils)
+                reader_connection_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_connection_id != reader_connection_id
                 await conn.commit()
 
@@ -925,7 +877,7 @@ class TestReadWriteSplittingAsync:
                 # Switch back to writer - autocommit should be True
                 await conn.set_read_only(False)
                 assert await conn.autocommit is True
-                final_writer_connection_id = await _query_instance_id_async(conn, rds_utils)
+                final_writer_connection_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_connection_id == final_writer_connection_id
             finally:
                 await conn.close()
@@ -982,13 +934,13 @@ class TestReadWriteSplittingAsync:
                 )
                 assert isinstance(conn.target_connection, PoolProxiedConnection)
                 initial_driver_conn = conn.target_connection.driver_connection
-                initial_writer_id = await _query_instance_id_async(conn, rds_utils)
+                initial_writer_id = await query_instance_id_async(conn, rds_utils)
 
                 rds_utils.failover_cluster_and_wait_until_writer_changed()
                 with pytest.raises(FailoverSuccessError):
-                    await _query_instance_id_async(conn, rds_utils)
+                    await query_instance_id_async(conn, rds_utils)
 
-                new_writer_id = await _query_instance_id_async(conn, rds_utils)
+                new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert initial_writer_id != new_writer_id
 
                 assert not isinstance(conn.target_connection, PoolProxiedConnection)
@@ -1002,7 +954,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=conn_utils.get_connect_params(),
                     **dict(failover_props),
                 )
-                current_id = await _query_instance_id_async(conn2, rds_utils)
+                current_id = await query_instance_id_async(conn2, rds_utils)
                 assert initial_writer_id == current_id
 
                 assert isinstance(conn2.target_connection, PoolProxiedConnection)
@@ -1033,15 +985,15 @@ class TestReadWriteSplittingAsync:
                 # The internal connection pool should not be used if the connection is established via a cluster URL.
                 assert 0 == len(SqlAlchemyPooledConnectionProvider._database_pools)
 
-                initial_writer_id = await _query_instance_id_async(conn, rds_utils)
+                initial_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert not isinstance(conn.target_connection, PoolProxiedConnection)
                 initial_driver_conn = conn.target_connection
 
                 rds_utils.failover_cluster_and_wait_until_writer_changed()
                 with pytest.raises(FailoverSuccessError):
-                    await _query_instance_id_async(conn, rds_utils)
+                    await query_instance_id_async(conn, rds_utils)
 
-                new_writer_id = await _query_instance_id_async(conn, rds_utils)
+                new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert initial_writer_id != new_writer_id
                 assert 0 == len(SqlAlchemyPooledConnectionProvider._database_pools)
 
@@ -1093,11 +1045,11 @@ class TestReadWriteSplittingAsync:
                 )
                 assert isinstance(conn.target_connection, PoolProxiedConnection)
                 initial_driver_conn = conn.target_connection.driver_connection
-                writer_id = await _query_instance_id_async(conn, rds_utils)
+                writer_id = await query_instance_id_async(conn, rds_utils)
 
                 ProxyHelper.disable_all_connectivity()
                 with pytest.raises(FailoverFailedError):
-                    await _query_instance_id_async(conn, rds_utils)
+                    await query_instance_id_async(conn, rds_utils)
 
                 ProxyHelper.enable_all_connectivity()
                 conn2 = await connect_async(
@@ -1106,7 +1058,7 @@ class TestReadWriteSplittingAsync:
                     **dict(proxied_failover_props),
                 )
 
-                current_writer_id = await _query_instance_id_async(conn2, rds_utils)
+                current_writer_id = await query_instance_id_async(conn2, rds_utils)
                 assert writer_id == current_writer_id
 
                 assert isinstance(conn2.target_connection, PoolProxiedConnection)
@@ -1136,7 +1088,7 @@ class TestReadWriteSplittingAsync:
                 )
                 assert isinstance(conn.target_connection, PoolProxiedConnection)
                 initial_driver_conn = conn.target_connection.driver_connection
-                initial_writer_id = await _query_instance_id_async(conn, rds_utils)
+                initial_writer_id = await query_instance_id_async(conn, rds_utils)
 
                 await conn.set_autocommit(False)
                 cursor = conn.cursor()
@@ -1144,9 +1096,9 @@ class TestReadWriteSplittingAsync:
 
                 rds_utils.failover_cluster_and_wait_until_writer_changed()
                 with pytest.raises(TransactionResolutionUnknownError):
-                    await _query_instance_id_async(conn, rds_utils)
+                    await query_instance_id_async(conn, rds_utils)
 
-                new_writer_id = await _query_instance_id_async(conn, rds_utils)
+                new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert initial_writer_id != new_writer_id
 
                 assert not isinstance(conn.target_connection, PoolProxiedConnection)
@@ -1163,7 +1115,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=conn_utils.get_connect_params(),
                     **dict(failover_props),
                 )
-                current_id = await _query_instance_id_async(conn2, rds_utils)
+                current_id = await query_instance_id_async(conn2, rds_utils)
                 assert initial_writer_id == current_id
 
                 assert isinstance(conn2.target_connection, PoolProxiedConnection)
@@ -1298,7 +1250,7 @@ class TestReadWriteSplittingAsync:
                     connections.append(conn)
 
                     await conn.set_read_only(True)
-                    reader_id = await _query_instance_id_async(conn, rds_utils)
+                    reader_id = await query_instance_id_async(conn, rds_utils)
                     assert reader_id not in connected_reader_ids
                     connected_reader_ids.append(reader_id)
             finally:
@@ -1373,7 +1325,7 @@ class TestReadWriteSplittingAsync:
                     connections.append(conn)
 
                     await conn.set_read_only(True)
-                    current_id = await _query_instance_id_async(conn, rds_utils)
+                    current_id = await query_instance_id_async(conn, rds_utils)
                     assert reader_to_overload.get_instance_id() != current_id
             finally:
                 for conn in connections:

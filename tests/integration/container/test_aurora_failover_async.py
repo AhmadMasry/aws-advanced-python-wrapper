@@ -26,7 +26,7 @@ from aws_advanced_python_wrapper.errors import (
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.async_connection_helpers import (
-    cleanup_async, connect_async)
+    cleanup_async, connect_async, query_instance_id_async)
 from .utils.conditions import (disable_on_features, enable_on_deployments,
                                enable_on_features, enable_on_num_instances)
 from .utils.database_engine_deployment import DatabaseEngineDeployment
@@ -43,21 +43,6 @@ from .utils.test_environment import TestEnvironment
 from .utils.test_environment_features import TestEnvironmentFeatures
 
 logger = Logger(__name__)
-
-
-async def _query_instance_id_async(conn: AsyncAwsWrapperConnection, aurora_utility: RdsTestUtility) -> str:
-    """Async inline of rds_utils.query_instance_id for AsyncAwsWrapperConnection.
-
-    rds_test_utility.query_instance_id calls conn.cursor() and uses sync
-    cursor methods, which do not work with AsyncAwsWrapperConnection whose
-    cursor.execute/fetchone are coroutines. We replicate the Aurora path
-    (the only deployment these tests target) directly here.
-    """
-    sql = aurora_utility.get_instance_id_query()
-    async with conn.cursor() as cur:
-        await cur.execute(sql)
-        record = await cur.fetchone()
-        return record[0]
 
 
 @enable_on_num_instances(min_instances=2)
@@ -132,10 +117,10 @@ class TestAuroraFailoverAsync:
 
                 # failure occurs on Connection invocation
                 with pytest.raises(FailoverSuccessError):
-                    await _query_instance_id_async(conn, aurora_utility)
+                    await query_instance_id_async(conn, aurora_utility)
 
                 # assert that we are connected to the new writer after failover happens.
-                current_connection_id = await _query_instance_id_async(conn, aurora_utility)
+                current_connection_id = await query_instance_id_async(conn, aurora_utility)
                 assert aurora_utility.is_db_instance_writer(current_connection_id) is True
                 assert current_connection_id != initial_writer_id
             finally:
@@ -163,10 +148,10 @@ class TestAuroraFailoverAsync:
 
                 # failure occurs on Cursor invocation
                 with pytest.raises(FailoverSuccessError):
-                    await _query_instance_id_async(conn, aurora_utility)
+                    await query_instance_id_async(conn, aurora_utility)
 
                 # assert that we are connected to the new writer after failover happens and we can reuse the cursor
-                current_connection_id = await _query_instance_id_async(conn, aurora_utility)
+                current_connection_id = await query_instance_id_async(conn, aurora_utility)
                 assert aurora_utility.is_db_instance_writer(current_connection_id) is True
                 assert current_connection_id != initial_writer_id
             finally:
@@ -200,8 +185,8 @@ class TestAuroraFailoverAsync:
             try:
                 ProxyHelper.disable_connectivity(reader.get_instance_id())
                 with pytest.raises(FailoverSuccessError):
-                    await _query_instance_id_async(conn, aurora_utility)
-                current_connection_id = await _query_instance_id_async(conn, aurora_utility)
+                    await query_instance_id_async(conn, aurora_utility)
+                current_connection_id = await query_instance_id_async(conn, aurora_utility)
 
                 assert writer_id == current_connection_id
                 assert aurora_utility.is_db_instance_writer(current_connection_id) is True
@@ -243,7 +228,7 @@ class TestAuroraFailoverAsync:
                         await cursor_2.execute("INSERT INTO session_states VALUES (2, 'test field string 2')")
 
                 # Attempt to query the instance id.
-                current_connection_id = await _query_instance_id_async(conn, aurora_utility)
+                current_connection_id = await query_instance_id_async(conn, aurora_utility)
                 # Assert that we are connected to the new writer after failover happens.
                 assert aurora_utility.is_db_instance_writer(current_connection_id) is True
                 next_cluster_writer_id = aurora_utility.get_cluster_writer_instance_id()
@@ -285,10 +270,10 @@ class TestAuroraFailoverAsync:
                 aurora_utility.failover_cluster_and_wait_until_writer_changed()
 
                 with pytest.raises(FailoverSuccessError):
-                    await _query_instance_id_async(conn, aurora_utility)
+                    await query_instance_id_async(conn, aurora_utility)
 
                 # Attempt to query the instance id.
-                current_connection_id = await _query_instance_id_async(conn, aurora_utility)
+                current_connection_id = await query_instance_id_async(conn, aurora_utility)
                 # Assert that we are connected to the new writer after failover happens.
                 assert aurora_utility.is_db_instance_writer(current_connection_id) is True
                 next_cluster_writer_id = aurora_utility.get_cluster_writer_instance_id()
@@ -335,7 +320,7 @@ class TestAuroraFailoverAsync:
                         await cursor_2.execute("INSERT INTO test3_2 VALUES (2, 'test field string 2')")
 
                 # attempt to query the instance id
-                current_connection_id: str = await _query_instance_id_async(conn, aurora_utility)
+                current_connection_id: str = await query_instance_id_async(conn, aurora_utility)
 
                 # assert that we are connected to the new writer after failover happens
                 assert aurora_utility.is_db_instance_writer(current_connection_id)
@@ -390,7 +375,7 @@ class TestAuroraFailoverAsync:
                         await cursor_2.execute("INSERT INTO test3_3 VALUES (2, 'test field string 2')")
 
                 # attempt to query the instance id
-                current_connection_id: str = await _query_instance_id_async(conn, aurora_utility)
+                current_connection_id: str = await query_instance_id_async(conn, aurora_utility)
 
                 # assert that we are connected to the new writer after failover happens
                 assert aurora_utility.is_db_instance_writer(current_connection_id)
@@ -440,7 +425,7 @@ class TestAuroraFailoverAsync:
                 connect_params=conn_utils.get_connect_params(),
                 **props_copy)
             try:
-                instance_id = await _query_instance_id_async(conn, aurora_utility)
+                instance_id = await query_instance_id_async(conn, aurora_utility)
                 assert current_writer_id == instance_id
 
                 # ensure that all idle connections are still opened
@@ -450,7 +435,7 @@ class TestAuroraFailoverAsync:
                 aurora_utility.failover_cluster_and_wait_until_writer_changed()
 
                 with pytest.raises(FailoverSuccessError):
-                    await _query_instance_id_async(conn, aurora_utility)
+                    await query_instance_id_async(conn, aurora_utility)
             finally:
                 await conn.close()
                 await cleanup_async()

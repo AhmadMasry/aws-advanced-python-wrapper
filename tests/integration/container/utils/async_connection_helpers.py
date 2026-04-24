@@ -25,17 +25,24 @@ to tear down wrapper background tasks cleanly (parallel to the sync
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Type
 
 import aiomysql
 import psycopg
+import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from aws_advanced_python_wrapper.aio.cleanup import release_resources_async
 from aws_advanced_python_wrapper.aio.wrapper import AsyncAwsWrapperConnection
 from aws_advanced_python_wrapper.errors import UnsupportedOperationError
 from aws_advanced_python_wrapper.utils.messages import Messages
+from .database_engine import DatabaseEngine
+from .database_engine_deployment import DatabaseEngineDeployment
 from .test_driver import TestDriver
+from .test_environment import TestEnvironment
+
+if TYPE_CHECKING:
+    from .rds_test_utility import RdsTestUtility
 
 
 async def connect_async(
@@ -108,3 +115,58 @@ async def cleanup_async() -> None:
     Mirrors the sync ``release_resources()`` convention.
     """
     await release_resources_async()
+
+
+async def query_instance_id_async(
+        conn: AsyncAwsWrapperConnection,
+        rds_utils: RdsTestUtility) -> str:
+    """Return the driver-reported instance ID via an async cursor.
+
+    Deployment-aware: handles both AURORA and RDS_MULTI_AZ_CLUSTER
+    deployments. Mirrors the sync ``rds_utils.query_instance_id(conn)``
+    but uses an async cursor so it can be called with an
+    ``AsyncAwsWrapperConnection`` whose ``cursor.execute`` / ``fetchone``
+    are coroutines.
+    """
+    deployment = TestEnvironment.get_current().get_deployment()
+    engine = TestEnvironment.get_current().get_engine()
+
+    if deployment == DatabaseEngineDeployment.AURORA:
+        sql = rds_utils.get_instance_id_query(engine)
+        async with conn.cursor() as cur:
+            await cur.execute(sql)
+            record = await cur.fetchone()
+            return record[0]
+
+    elif deployment == DatabaseEngineDeployment.RDS_MULTI_AZ_CLUSTER:
+        if engine == DatabaseEngine.MYSQL:
+            endpoint_sql = "SELECT endpoint FROM mysql.rds_topology WHERE id=(SELECT @@server_id)"
+        else:
+            endpoint_sql = (
+                "SELECT endpoint FROM rds_tools.show_topology() "
+                "WHERE id=(SELECT dbi_resource_id FROM rds_tools.dbi_resource_id())"
+            )
+        async with conn.cursor() as cur:
+            await cur.execute(endpoint_sql)
+            row = await cur.fetchone()
+            endpoint: str = row[0]
+            return endpoint[:endpoint.find(".")]
+
+    else:
+        raise RuntimeError(
+            f"query_instance_id_async: unsupported deployment {deployment}"
+        )
+
+
+async def assert_first_query_throws_async(
+        conn: AsyncAwsWrapperConnection,
+        rds_utils: RdsTestUtility,
+        exception_cls: Type[BaseException]) -> None:
+    """Execute the instance-id query against an async connection and assert
+    the given exception class is raised.
+
+    Mirrors the sync ``rds_utils.assert_first_query_throws`` but uses an
+    async cursor so it can be called with an ``AsyncAwsWrapperConnection``.
+    """
+    with pytest.raises(exception_cls):
+        await query_instance_id_async(conn, rds_utils)
