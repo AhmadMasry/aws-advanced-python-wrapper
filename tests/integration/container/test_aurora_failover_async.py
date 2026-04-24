@@ -115,7 +115,7 @@ class TestAuroraFailoverAsync:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
-    def test_fail_from_writer_to_new_writer_fail_on_connection_invocation(
+    def test_fail_from_writer_to_new_writer_fail_on_connection_invocation_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
         async def inner() -> None:
             initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
@@ -146,7 +146,7 @@ class TestAuroraFailoverAsync:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
-    def test_fail_from_writer_to_new_writer_fail_on_connection_bound_object_invocation(
+    def test_fail_from_writer_to_new_writer_fail_on_connection_bound_object_invocation_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
         async def inner() -> None:
             initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
@@ -179,7 +179,7 @@ class TestAuroraFailoverAsync:
                                          "failover_v2,host_monitoring", "failover_v2,host_monitoring_v2"])
     @enable_on_features([TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
-    def test_fail_from_reader_to_writer(
+    def test_fail_from_reader_to_writer_async(
             self,
             test_environment: TestEnvironment,
             test_driver: TestDriver,
@@ -213,7 +213,7 @@ class TestAuroraFailoverAsync:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
-    def test_fail_from_writer_with_session_states_autocommit(
+    def test_fail_from_writer_with_session_states_autocommit_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
         async def inner() -> None:
             initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
@@ -266,7 +266,7 @@ class TestAuroraFailoverAsync:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
-    def test_fail_from_writer_with_session_states_readonly(
+    def test_fail_from_writer_with_session_states_readonly_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
         async def inner() -> None:
             initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
@@ -305,7 +305,7 @@ class TestAuroraFailoverAsync:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
-    def test_writer_fail_within_transaction_set_autocommit_false(
+    def test_writer_fail_within_transaction_set_autocommit_false_async(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility,
             plugins):
         async def inner() -> None:
@@ -360,7 +360,7 @@ class TestAuroraFailoverAsync:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
-    def test_writer_fail_within_transaction_start_transaction(
+    def test_writer_fail_within_transaction_start_transaction_async(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility,
             plugins):
         async def inner() -> None:
@@ -416,7 +416,7 @@ class TestAuroraFailoverAsync:
     @pytest.mark.parametrize("plugins", ["aurora_connection_tracker,failover", "aurora_connection_tracker,failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     @pytest.mark.repeat(5)  # Run this test case a few more times since it is a flakey test
-    def test_writer_failover_in_idle_connections(
+    def test_writer_failover_in_idle_connections_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
         # idle_connections is populated inside inner() and read after asyncio.run();
         # use a mutable container so the outer scope can access it.
