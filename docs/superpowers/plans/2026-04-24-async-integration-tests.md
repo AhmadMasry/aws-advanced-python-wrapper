@@ -99,7 +99,7 @@ export AWS_SECRET_ACCESS_KEY=<secret>
 ```bash
 export RDS_DB_NAME=<pg-cluster-id>
 export RDS_DB_DOMAIN=<pg-cluster>.xxx.us-west-2.rds.amazonaws.com
-(cd tests/integration/host && ./gradlew test-pg-aurora)
+./gradlew :integration-testing:test-pg-aurora
 ```
 
 Expected: suite runs to completion. Failures fall into three triage buckets:
@@ -112,7 +112,7 @@ Expected: suite runs to completion. Failures fall into three triage buckets:
 ```bash
 export RDS_DB_NAME=<mysql-cluster-id>
 export RDS_DB_DOMAIN=<mysql-cluster>.xxx.us-west-2.rds.amazonaws.com
-(cd tests/integration/host && ./gradlew test-mysql-aurora)
+./gradlew :integration-testing:test-mysql-aurora
 ```
 
 Apply the same triage taxonomy. Only proceed to Task 1 once baseline is green or failures are classified.
@@ -421,7 +421,7 @@ public enum TestEnvironmentFeatures {
 - [ ] **Step 2: Verify the project compiles**
 
 ```bash
-(cd tests/integration/host && ./gradlew compileTestJava)
+./gradlew :integration-testing:compileTestJava
 ```
 
 Expected: `BUILD SUCCESSFUL`. If it fails, there's a downstream reference we haven't updated yet — come back after Task 5.
@@ -478,7 +478,7 @@ Add two new lines immediately after:
 - [ ] **Step 3: Compile**
 
 ```bash
-(cd tests/integration/host && ./gradlew compileTestJava)
+./gradlew :integration-testing:compileTestJava
 ```
 
 Expected: `BUILD SUCCESSFUL`.
@@ -626,7 +626,7 @@ tasks.register<Test>("test-mysql-multi-az-async") {
 - [ ] **Step 6: Smoke — verify the tasks exist and sync task collection still passes**
 
 ```bash
-(cd tests/integration/host && ./gradlew tasks --group=verification) | grep -E 'test-(pg|mysql)-(aurora|multi-az)(-async)?'
+./gradlew :integration-testing:tasks --group=verification | grep -E 'test-(pg|mysql)-(aurora|multi-az)(-async)?'
 ```
 
 Expected output includes eight task names: four existing + four new async tasks.
@@ -635,7 +635,7 @@ Also run one existing sync task end-to-end (against your PG cluster) to confirm 
 
 ```bash
 # Same env vars as Task 0.
-(cd tests/integration/host && ./gradlew test-pg-aurora --tests 'integration.host.TestRunner.runTests' 2>&1 | tail -30)
+./gradlew :integration-testing:test-pg-aurora --tests 'integration.host.TestRunner.runTests' 2>&1 | tail -30
 ```
 
 Expected: same passing tests as Task 0's Step 4. No new failures.
@@ -645,7 +645,7 @@ Expected: same passing tests as Task 0's Step 4. No new failures.
 At this point no `*_async.py` files exist yet, so async tasks should find zero tests and exit 0:
 
 ```bash
-(cd tests/integration/host && ./gradlew test-pg-aurora-async 2>&1 | tail -30)
+./gradlew :integration-testing:test-pg-aurora-async 2>&1 | tail -30
 ```
 
 Expected: `BUILD SUCCESSFUL`. The pytest run inside the container reports `collected 0 items` or equivalent. If it reports tests being collected, the gating is wrong.
@@ -1061,7 +1061,7 @@ Same env vars as Task 0 Step 3, then:
 ```bash
 export RDS_DB_NAME=<pg-cluster-id>
 export RDS_DB_DOMAIN=<pg-cluster>.xxx.us-west-2.rds.amazonaws.com
-(cd tests/integration/host && ./gradlew test-pg-aurora-async 2>&1 | tee /tmp/pg-async.log | tail -60)
+./gradlew :integration-testing:test-pg-aurora-async 2>&1 | tee /tmp/pg-async.log | tail -60
 ```
 
 Expected: tests collect (at least `test_direct_connection_async[PG_ASYNC]`), connect to the cluster, pass, `BUILD SUCCESSFUL`.
@@ -1075,7 +1075,7 @@ If you get `AttributeError: 'NoneType' object has no attribute ...` in a type-in
 ```bash
 export RDS_DB_NAME=<mysql-cluster-id>
 export RDS_DB_DOMAIN=<mysql-cluster>.xxx.us-west-2.rds.amazonaws.com
-(cd tests/integration/host && ./gradlew test-mysql-aurora-async 2>&1 | tee /tmp/mysql-async.log | tail -60)
+./gradlew :integration-testing:test-mysql-aurora-async 2>&1 | tee /tmp/mysql-async.log | tail -60
 ```
 
 Expected: same pattern — tests collect with `[MYSQL_ASYNC]`, pass, `BUILD SUCCESSFUL`.
@@ -1245,12 +1245,12 @@ poetry run isort --check-only tests/integration/container/test_sqlalchemy_async.
 # PG
 export RDS_DB_NAME=<pg-cluster-id>
 export RDS_DB_DOMAIN=<pg-cluster>.xxx.us-west-2.rds.amazonaws.com
-(cd tests/integration/host && FILTER="test_sqlalchemy_async" ./gradlew test-pg-aurora-async 2>&1 | tail -40)
+FILTER="test_sqlalchemy_async" ./gradlew :integration-testing:test-pg-aurora-async 2>&1 | tail -40
 
 # MySQL
 export RDS_DB_NAME=<mysql-cluster-id>
 export RDS_DB_DOMAIN=<mysql-cluster>.xxx.us-west-2.rds.amazonaws.com
-(cd tests/integration/host && FILTER="test_sqlalchemy_async" ./gradlew test-mysql-aurora-async 2>&1 | tail -40)
+FILTER="test_sqlalchemy_async" ./gradlew :integration-testing:test-mysql-aurora-async 2>&1 | tail -40
 ```
 
 Expected: both `BUILD SUCCESSFUL`, tests collected and passing (failover test skipped until ported).
@@ -1305,7 +1305,7 @@ Every task's commit message follows: `test(integration): add async <feature> tes
 
 - [ ] **Step 1:** Apply the translation rules above to port `test_basic_functionality.py`. No file-specific quirks — exercises basic SQL operations (INSERT / SELECT / transactions / autocommit) which port mechanically.
 - [ ] **Step 2:** Lint + type check: `poetry run mypy tests/integration/container/test_basic_functionality_async.py && poetry run flake8 tests/integration/container/test_basic_functionality_async.py && poetry run isort --check-only tests/integration/container/test_basic_functionality_async.py`.
-- [ ] **Step 3:** Run: `FILTER="test_basic_functionality_async" ./gradlew test-pg-aurora-async` and same for MySQL.
+- [ ] **Step 3:** Run: `FILTER="test_basic_functionality_async" ./gradlew :integration-testing:test-pg-aurora-async` and same for MySQL.
 - [ ] **Step 4:** Commit: `test(integration): add async basic functionality tests`.
 
 ### Task 11: `test_aurora_failover_async.py`
@@ -1384,7 +1384,7 @@ Every task's commit message follows: `test(integration): add async <feature> tes
 
 - [ ] **Step 1:** Port.
 - [ ] **Step 2:** Lint + type check.
-- [ ] **Step 3:** Run. Expect environmental skips against real clusters; verify by running `./gradlew test-docker` async if the Docker test path is available — but that's out of scope for your Serverless run.
+- [ ] **Step 3:** Run. Expect environmental skips against real clusters; verify by running `./gradlew :integration-testing:test-docker` async if the Docker test path is available — but that's out of scope for your Serverless run.
 - [ ] **Step 4:** Commit: `test(integration): add async host monitoring v2 tests`.
 
 ### Task 16: `test_custom_endpoint_async.py`
