@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from .utils.test_driver import TestDriver
     from aws_advanced_python_wrapper.aio.wrapper import AsyncAwsWrapperConnection
 
-from aws_advanced_python_wrapper import release_resources
 from aws_advanced_python_wrapper.utils.log import Logger
 from .utils.rds_test_utility import RdsTestUtility
 from .utils.test_environment import TestEnvironment
@@ -74,9 +73,9 @@ class TestAuroraFailoverAsync:
     def setup_method(self, request):
         self.logger.info(f"Starting test: {request.node.name}")
         yield
-        release_resources()
+        asyncio.run(cleanup_async())
         self.logger.info(f"Ending test: {request.node.name}")
-        release_resources()
+        asyncio.run(cleanup_async())
         gc.collect()
 
     @pytest.fixture(scope='class')
