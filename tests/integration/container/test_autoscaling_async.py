@@ -221,7 +221,7 @@ class TestAutoScalingAsync:
                 for conn in connections:
                     await conn.close()
 
-                AsyncConnectionProviderManager.release_resources()
+                await AsyncConnectionProviderManager.release_resources()
                 AsyncConnectionProviderManager.reset_provider()
                 await cleanup_async()
 
@@ -284,7 +284,7 @@ class TestAutoScalingAsync:
                 for conn in connections:
                     await conn.close()
 
-                AsyncConnectionProviderManager.release_resources()
+                await AsyncConnectionProviderManager.release_resources()
                 AsyncConnectionProviderManager.reset_provider()
                 await cleanup_async()
 
