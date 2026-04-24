@@ -21,9 +21,9 @@ behavior when endpoint membership changes mid-connection.
 Translation notes vs the sync file:
 - ``AwsWrapperConnection.connect(...)`` → ``await connect_async(...)``
 - ``conn.read_only = value`` → ``await conn.set_read_only(value)``
-- ``rds_utils.query_instance_id(conn)`` → ``await _query_instance_id_async(conn, rds_utils)``
+- ``rds_utils.query_instance_id(conn)`` → ``await query_instance_id_async(conn, rds_utils)``
 - ``rds_utils.query_host_role(conn, engine)`` → ``await _query_host_role_async(conn, rds_utils)``
-- ``rds_utils.assert_first_query_throws(conn, exc)`` → ``await _assert_first_query_throws_async(conn, rds_utils, exc)``
+- ``rds_utils.assert_first_query_throws(conn, exc)`` → ``await assert_first_query_throws_async(conn, rds_utils, exc)``
 - boto3 RDS management calls (create/modify/delete endpoints) stay synchronous
 - ``with AwsWrapperConnection.connect(...) as conn:`` → manual open + try/finally close
 """
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from time import perf_counter_ns, sleep
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Set, Type
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Set
 from uuid import uuid4
 
 import pytest
@@ -46,7 +46,8 @@ from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.async_connection_helpers import (
-    cleanup_async, connect_async)
+    assert_first_query_throws_async, cleanup_async, connect_async,
+    query_instance_id_async)
 from tests.integration.container.utils.conditions import (
     disable_on_features, enable_on_deployments, enable_on_num_instances)
 from tests.integration.container.utils.database_engine import DatabaseEngine
@@ -69,23 +70,6 @@ if TYPE_CHECKING:
 # Module-level async helpers (inlined from sync rds_test_utility to avoid
 # calling sync cursor methods on an AsyncAwsWrapperConnection).
 # ---------------------------------------------------------------------------
-
-async def _query_instance_id_async(
-        conn: AsyncAwsWrapperConnection,
-        rds_utils: RdsTestUtility) -> str:
-    """Async counterpart of ``rds_utils.query_instance_id(conn)``.
-
-    ``rds_test_utility.query_instance_id`` calls ``conn.cursor()`` and uses
-    sync cursor methods, which do not work with ``AsyncAwsWrapperConnection``
-    whose ``cursor.execute`` / ``fetchone`` are coroutines. We replicate the
-    Aurora path (the only deployment these tests target) directly here.
-    """
-    sql = rds_utils.get_instance_id_query()
-    async with conn.cursor() as cur:
-        await cur.execute(sql)
-        record = await cur.fetchone()
-        return record[0]
-
 
 async def _query_host_role_async(
         conn: AsyncAwsWrapperConnection,
@@ -110,15 +94,6 @@ async def _query_host_role_async(
         return HostRole.READER
     else:
         return HostRole.WRITER
-
-
-async def _assert_first_query_throws_async(
-        conn: AsyncAwsWrapperConnection,
-        rds_utils: RdsTestUtility,
-        exception_cls: Type[BaseException]) -> None:
-    """Async counterpart of ``rds_utils.assert_first_query_throws``."""
-    with pytest.raises(exception_cls):
-        await _query_instance_id_async(conn, rds_utils)
 
 
 # ---------------------------------------------------------------------------
@@ -329,16 +304,16 @@ class TestCustomEndpointAsync:
             )
             try:
                 endpoint_members = self.endpoint_info["StaticMembers"]
-                instance_id = await _query_instance_id_async(conn, rds_utils)
+                instance_id = await query_instance_id_async(conn, rds_utils)
                 assert instance_id in endpoint_members
 
                 # Use failover API to break connection.
                 target_id = None if instance_id == rds_utils.get_cluster_writer_instance_id() else instance_id
                 rds_utils.failover_cluster_and_wait_until_writer_changed(target_id=target_id)
 
-                await _assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
+                await assert_first_query_throws_async(conn, rds_utils, FailoverSuccessError)
 
-                instance_id = await _query_instance_id_async(conn, rds_utils)
+                instance_id = await query_instance_id_async(conn, rds_utils)
                 assert instance_id in endpoint_members
             finally:
                 await conn.close()
@@ -364,7 +339,7 @@ class TestCustomEndpointAsync:
         )
         try:
             endpoint_members = self.endpoint_info["StaticMembers"]
-            original_instance_id = await _query_instance_id_async(conn, rds_utils)
+            original_instance_id = await query_instance_id_async(conn, rds_utils)
             self.logger.debug("Original instance id: " + original_instance_id)
             assert original_instance_id in endpoint_members
 
@@ -393,7 +368,7 @@ class TestCustomEndpointAsync:
         )
         try:
             endpoint_members = self.endpoint_info["StaticMembers"]
-            original_instance_id = await _query_instance_id_async(conn, rds_utils)
+            original_instance_id = await query_instance_id_async(conn, rds_utils)
             assert original_instance_id in endpoint_members
 
             new_role = await _query_host_role_async(conn, rds_utils)
@@ -432,7 +407,7 @@ class TestCustomEndpointAsync:
             )
             try:
                 endpoint_members = self.endpoint_info["StaticMembers"]
-                original_reader_id = await _query_instance_id_async(conn, rds_utils)
+                original_reader_id = await query_instance_id_async(conn, rds_utils)
                 assert original_reader_id in endpoint_members
 
                 # Attempt to switch to an instance of the opposite role. This should fail since the custom endpoint
@@ -454,12 +429,12 @@ class TestCustomEndpointAsync:
 
                     # We should now be able to switch to writer.
                     await conn.set_read_only(False)
-                    new_instance_id = await _query_instance_id_async(conn, rds_utils)
+                    new_instance_id = await query_instance_id_async(conn, rds_utils)
                     assert new_instance_id == writer_id
 
                     # Switch back to original instance
                     await conn.set_read_only(True)
-                    new_instance_id = await _query_instance_id_async(conn, rds_utils)
+                    new_instance_id = await query_instance_id_async(conn, rds_utils)
                     assert new_instance_id == original_reader_id
                 finally:
                     # Remove the writer from the custom endpoint.
@@ -508,7 +483,7 @@ class TestCustomEndpointAsync:
             )
             try:
                 endpoint_members = self.endpoint_info["StaticMembers"]
-                original_writer_id = str(await _query_instance_id_async(conn, rds_utils))
+                original_writer_id = str(await query_instance_id_async(conn, rds_utils))
                 assert original_writer_id in endpoint_members
 
                 # We are connected to the writer. Attempting to switch to the reader will not work but will
@@ -516,7 +491,7 @@ class TestCustomEndpointAsync:
                 # with the writer.
                 self.logger.debug("Initial connection is to the writer. Attempting to switch to reader...")
                 await conn.set_read_only(True)
-                new_instance_id = await _query_instance_id_async(conn, rds_utils)
+                new_instance_id = await query_instance_id_async(conn, rds_utils)
                 assert new_instance_id == original_writer_id
 
                 instances = TestEnvironment.get_current().get_instances()
@@ -539,7 +514,7 @@ class TestCustomEndpointAsync:
                     self.wait_until_endpoint_has_members(rds_client, {original_writer_id, reader_id_to_add}, rds_utils)
                     # We should now be able to switch to new_member.
                     await conn.set_read_only(True)
-                    new_instance_id = await _query_instance_id_async(conn, rds_utils)
+                    new_instance_id = await query_instance_id_async(conn, rds_utils)
                     assert new_instance_id == reader_id_to_add
 
                     # Switch back to original instance
@@ -555,7 +530,7 @@ class TestCustomEndpointAsync:
                 # We are connected to the writer. Attempting to switch to the reader will not work but will
                 # intentionally not throw an exception. In this scenario we log a warning and fallback to the writer.
                 await conn.set_read_only(True)
-                new_instance_id = await _query_instance_id_async(conn, rds_utils)
+                new_instance_id = await query_instance_id_async(conn, rds_utils)
                 assert new_instance_id == original_writer_id
             finally:
                 await conn.close()
