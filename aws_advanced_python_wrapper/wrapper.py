@@ -248,6 +248,111 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def remove_notify_handler(self, callback: Any) -> Any:
         return self.target_connection.remove_notify_handler(callback)
 
+    # ---- psycopg3-parity passthroughs (read-only + local-state) --------
+    #
+    # These mirror psycopg3.Connection's public surface. All bypass the
+    # plugin chain: they're client-side state accessors / local ops.
+    # MySQL drivers that don't implement a given attribute raise the
+    # underlying driver's AttributeError -- matches psycopg3 parity
+    # (several of these are PostgreSQL-specific).
+
+    @property
+    def info(self) -> Any:
+        return self.target_connection.info
+
+    @property
+    def broken(self) -> Any:
+        return self.target_connection.broken
+
+    @property
+    def adapters(self) -> Any:
+        return self.target_connection.adapters
+
+    @property
+    def prepare_threshold(self) -> Any:
+        return self.target_connection.prepare_threshold
+
+    @prepare_threshold.setter
+    def prepare_threshold(self, value: Any) -> None:
+        self.target_connection.prepare_threshold = value
+
+    @property
+    def prepared_max(self) -> Any:
+        return self.target_connection.prepared_max
+
+    @prepared_max.setter
+    def prepared_max(self, value: Any) -> None:
+        self.target_connection.prepared_max = value
+
+    @property
+    def deferrable(self) -> Any:
+        return self.target_connection.deferrable
+
+    def set_deferrable(self, value: Any) -> None:
+        self.target_connection.set_deferrable(value)
+
+    def set_isolation_level(self, value: Any) -> None:
+        self.target_connection.set_isolation_level(value)
+
+    def set_read_only(self, value: Any) -> None:
+        # Route through the existing plugin-aware setter so read_only
+        # changes keep their intended plugin-chain semantics.
+        self.read_only = value
+
+    def set_autocommit(self, value: Any) -> None:
+        # Same plugin-chain routing as read_only.
+        self.autocommit = value
+
+    def fileno(self) -> int:
+        return self.target_connection.fileno()
+
+    def cancel(self) -> None:
+        self.target_connection.cancel()
+
+    def cancel_safe(self, *, timeout: float = 30.0) -> None:
+        self.target_connection.cancel_safe(timeout=timeout)
+
+    def execute(
+            self,
+            query: Any,
+            params: Any = None,
+            *,
+            prepare: Any = None,
+            binary: bool = False) -> Any:
+        # psycopg3's Connection.execute() opens an internal cursor and
+        # issues the query as a shortcut. The returned cursor is the
+        # driver's raw cursor, NOT our plugin-intercepting
+        # AwsWrapperCursor -- callers who need failover/RWS interception
+        # on the query should use conn.cursor().execute(...) instead.
+        return self.target_connection.execute(
+            query, params, prepare=prepare, binary=binary)
+
+    def pipeline(self) -> Any:
+        return self.target_connection.pipeline()
+
+    def notifies(
+            self,
+            *,
+            timeout: Any = None,
+            stop_after: Any = None) -> Any:
+        return self.target_connection.notifies(
+            timeout=timeout, stop_after=stop_after)
+
+    def wait(self, gen: Any, interval: float = 0.1) -> Any:
+        return self.target_connection.wait(gen, interval=interval)
+
+    def xid(self, format_id: int, gtrid: str, bqual: str) -> Any:
+        return self.target_connection.xid(format_id, gtrid, bqual)
+
+    def transaction(
+            self,
+            savepoint_name: Any = None,
+            force_rollback: bool = False) -> Any:
+        return self.target_connection.transaction(
+            savepoint_name=savepoint_name,
+            force_rollback=force_rollback,
+        )
+
     def release_resources(self):
         self._plugin_manager.release_resources()
         if isinstance(self._plugin_service, CanReleaseResources):

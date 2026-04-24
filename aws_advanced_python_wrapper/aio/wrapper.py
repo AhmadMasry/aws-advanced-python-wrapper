@@ -418,6 +418,113 @@ class AsyncAwsWrapperConnection:
     def remove_notify_handler(self, callback: Any) -> Any:
         return self._target_conn.remove_notify_handler(callback)
 
+    # ---- psycopg3-parity passthroughs (read-only + local-state) --------
+    #
+    # Mirror psycopg3.AsyncConnection's public surface. All bypass the
+    # plugin chain: they're client-side state accessors / local ops.
+    # aiomysql lacks most of these -- callers on MySQL targets will
+    # get the underlying driver's AttributeError, matching parity
+    # with psycopg3 (these are PostgreSQL-specific).
+    #
+    # Async-vs-sync shape matches psycopg3.AsyncConnection exactly
+    # (verified against psycopg 3.3.3 via inspect.iscoroutinefunction):
+    #   sync:  fileno, cancel, xid, pipeline, notifies, transaction
+    #   async: cancel_safe, execute, wait, set_deferrable,
+    #          set_read_only, set_autocommit
+
+    @property
+    def info(self) -> Any:
+        return self._target_conn.info
+
+    @property
+    def broken(self) -> Any:
+        return self._target_conn.broken
+
+    @property
+    def adapters(self) -> Any:
+        return self._target_conn.adapters
+
+    @property
+    def prepare_threshold(self) -> Any:
+        return self._target_conn.prepare_threshold
+
+    @prepare_threshold.setter
+    def prepare_threshold(self, value: Any) -> None:
+        self._target_conn.prepare_threshold = value
+
+    @property
+    def prepared_max(self) -> Any:
+        return self._target_conn.prepared_max
+
+    @prepared_max.setter
+    def prepared_max(self, value: Any) -> None:
+        self._target_conn.prepared_max = value
+
+    @property
+    def deferrable(self) -> Any:
+        return self._target_conn.deferrable
+
+    @property
+    def read_only(self) -> Any:
+        return self._target_conn.read_only
+
+    async def set_deferrable(self, value: Any) -> None:
+        await self._target_conn.set_deferrable(value)
+
+    async def set_read_only(self, value: Any) -> None:
+        await self._target_conn.set_read_only(value)
+
+    def fileno(self) -> int:
+        return self._target_conn.fileno()
+
+    def cancel(self) -> None:
+        self._target_conn.cancel()
+
+    async def cancel_safe(self, *, timeout: float = 30.0) -> None:
+        await self._target_conn.cancel_safe(timeout=timeout)
+
+    async def execute(
+            self,
+            query: Any,
+            params: Any = None,
+            *,
+            prepare: Any = None,
+            binary: bool = False) -> Any:
+        # psycopg3's AsyncConnection.execute() opens an internal
+        # cursor and awaits the query as a shortcut. The returned
+        # cursor is the driver's raw async cursor, NOT our
+        # plugin-intercepting AsyncAwsWrapperCursor -- callers who
+        # need failover/RWS interception on the query should use
+        # conn.cursor().execute(...) instead.
+        return await self._target_conn.execute(
+            query, params, prepare=prepare, binary=binary)
+
+    def pipeline(self) -> Any:
+        return self._target_conn.pipeline()
+
+    def notifies(
+            self,
+            *,
+            timeout: Any = None,
+            stop_after: Any = None) -> Any:
+        return self._target_conn.notifies(
+            timeout=timeout, stop_after=stop_after)
+
+    async def wait(self, gen: Any, interval: float = 0.1) -> Any:
+        return await self._target_conn.wait(gen, interval=interval)
+
+    def xid(self, format_id: int, gtrid: str, bqual: str) -> Any:
+        return self._target_conn.xid(format_id, gtrid, bqual)
+
+    def transaction(
+            self,
+            savepoint_name: Any = None,
+            force_rollback: bool = False) -> Any:
+        return self._target_conn.transaction(
+            savepoint_name=savepoint_name,
+            force_rollback=force_rollback,
+        )
+
     @staticmethod
     async def connect(
             target: Union[None, str, Callable] = None,
