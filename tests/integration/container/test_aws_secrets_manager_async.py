@@ -190,18 +190,21 @@ class TestAwsSecretsManagerAsync:
         region = TestEnvironment.get_current().get_info().get_region()
 
         async def inner() -> None:
-            p = dict(props)
-            p.update({
-                "secrets_manager_secret_id": "incorrectSecretId",
-                "secrets_manager_region": region
-            })
+            try:
+                p = dict(props)
+                p.update({
+                    "secrets_manager_secret_id": "incorrectSecretId",
+                    "secrets_manager_region": region
+                })
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=conn_utils.get_connect_params(),
-                    **p)
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=conn_utils.get_connect_params(),
+                        **p)
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
@@ -210,17 +213,20 @@ class TestAwsSecretsManagerAsync:
         region = TestEnvironment.get_current().get_info().get_region()
 
         async def inner() -> None:
-            p = dict(props)
-            p.update({
-                "secrets_manager_region": region
-            })
+            try:
+                p = dict(props)
+                p.update({
+                    "secrets_manager_region": region
+                })
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
-                    **p)
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
+                        **p)
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
@@ -229,18 +235,21 @@ class TestAwsSecretsManagerAsync:
         secret_name, _ = create_secret
 
         async def inner() -> None:
-            p = dict(props)
-            p.update({
-                "secrets_manager_secret_id": secret_name,
-                "secrets_manager_region": "invalidRegion"
-            })
+            try:
+                p = dict(props)
+                p.update({
+                    "secrets_manager_secret_id": secret_name,
+                    "secrets_manager_region": "invalidRegion"
+                })
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
-                    **p)
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
+                        **p)
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
@@ -249,17 +258,20 @@ class TestAwsSecretsManagerAsync:
         secret_name, _ = create_secret
 
         async def inner() -> None:
-            p = dict(props)
-            p.update({
-                "secrets_manager_secret_id": secret_name
-            })
+            try:
+                p = dict(props)
+                p.update({
+                    "secrets_manager_secret_id": secret_name
+                })
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
-                    **p)
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
+                        **p)
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
@@ -268,18 +280,21 @@ class TestAwsSecretsManagerAsync:
         secret_name, _ = create_secret
 
         async def inner() -> None:
-            p = dict(props)
-            p.update({
-                "secrets_manager_secret_id": secret_name,
-                "secrets_manager_region": "ca-central-1"
-            })
+            try:
+                p = dict(props)
+                p.update({
+                    "secrets_manager_secret_id": secret_name,
+                    "secrets_manager_region": "ca-central-1"
+                })
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
-                    **p)
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=conn_utils.get_connect_params(user="incorrectUser", password="incorrectPassword"),
+                        **p)
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
