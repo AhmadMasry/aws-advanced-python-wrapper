@@ -194,6 +194,8 @@ public class TestEnvironmentProvider implements TestTemplateInvocationContextPro
                             config.excludePerformance ? null : TestEnvironmentFeatures.PERFORMANCE,
                             config.excludeMysqlDriver ? TestEnvironmentFeatures.SKIP_MYSQL_DRIVER_TESTS : null,
                             config.excludePgDriver ? TestEnvironmentFeatures.SKIP_PG_DRIVER_TESTS : null,
+                            config.excludeSyncDrivers ? TestEnvironmentFeatures.SKIP_SYNC_DRIVER_TESTS : null,
+                            config.excludeAsyncDrivers ? TestEnvironmentFeatures.SKIP_ASYNC_DRIVER_TESTS : null,
                             config.testAutoscalingOnly ? TestEnvironmentFeatures.RUN_AUTOSCALING_TESTS_ONLY : null,
                             config.excludeTracesTelemetry ? null : TestEnvironmentFeatures.TELEMETRY_TRACES_ENABLED,
                             config.excludeMetricsTelemetry ? null : TestEnvironmentFeatures.TELEMETRY_METRICS_ENABLED,
