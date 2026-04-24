@@ -23,8 +23,8 @@ intercept it.
 from __future__ import annotations
 
 import asyncio
-from typing import (TYPE_CHECKING, Any, Callable, List, Optional, Sequence,
-                    Type, Union)
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
+                    Sequence, Type, Union)
 
 from aws_advanced_python_wrapper.aio.plugin_manager import AsyncPluginManager
 from aws_advanced_python_wrapper.aio.plugin_service import \
@@ -524,6 +524,49 @@ class AsyncAwsWrapperConnection:
             savepoint_name=savepoint_name,
             force_rollback=force_rollback,
         )
+
+    # ---- SQLAlchemy AdaptedConnection / AsyncAdapt_*_connection parity --
+    #
+    # Duck-type the contract SQLAlchemy's async dialects expect on the
+    # DBAPI-level connection (see the sync wrapper's matching block for
+    # the full rationale and SA source references). The psycopg async
+    # dialect's ``_type_info_fetch`` calls ``adapted.await_`` and
+    # ``adapted.driver_connection`` during engine initialize, and SA
+    # sometimes hits ``_connection`` directly.
+    #
+    # All four bypass the plugin chain.
+
+    @property
+    def driver_connection(self) -> Any:
+        """The native driver connection -- matches ``AdaptedConnection.driver_connection``."""
+        return self._target_conn
+
+    @property
+    def _connection(self) -> Any:
+        """Alias for SA's ``AdaptedConnection._connection`` slot."""
+        return self._target_conn
+
+    @staticmethod
+    def await_(coro: Any) -> Any:
+        """SA async-adapter bridge: run a coroutine from sync context.
+
+        SA's ``AsyncAdapt_dbapi_connection`` exposes this as
+        ``staticmethod(sqlalchemy.util.concurrency.await_only)``.
+        Lazy import so SA stays a soft runtime dep.
+        """
+        from sqlalchemy.util.concurrency import await_only
+        return await_only(coro)
+
+    def run_async(self, fn: Callable[[Any], Awaitable[Any]]) -> Any:
+        """Match ``sqlalchemy.engine.interfaces.AdaptedConnection.run_async``.
+
+        Runs the awaitable returned by ``fn(raw_driver_connection)`` to
+        completion from sync context. Callers inside an already-running
+        event loop will hit ``await_only``'s normal "no outer greenlet"
+        error -- same as SA's own implementation.
+        """
+        from sqlalchemy.util.concurrency import await_only
+        return await_only(fn(self._target_conn))
 
     @staticmethod
     async def connect(

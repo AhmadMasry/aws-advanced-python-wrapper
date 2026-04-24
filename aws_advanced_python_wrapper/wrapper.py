@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-from typing import (TYPE_CHECKING, Any, Callable, Iterator, List, Optional,
-                    Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Iterator, List,
+                    Optional, Type, TypeVar, Union)
 
 from aws_advanced_python_wrapper.plugin_service import (
     PluginManager, PluginServiceImpl, PluginServiceManagerContainer)
@@ -352,6 +352,70 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
             savepoint_name=savepoint_name,
             force_rollback=force_rollback,
         )
+
+    # ---- SQLAlchemy AdaptedConnection / AsyncAdapt_*_connection parity --
+    #
+    # SQLAlchemy's async dialects (including the psycopg async dialect)
+    # treat the DBAPI-level connection as an "adapted connection" and
+    # call ``adapted.await_`` / ``adapted.driver_connection`` /
+    # ``adapted.run_async`` against it -- see
+    # ``sqlalchemy/engine/interfaces.py:AdaptedConnection`` and
+    # ``sqlalchemy/connectors/asyncio.py:AsyncAdapt_dbapi_connection``.
+    # The psycopg async dialect's ``_type_info_fetch`` hits
+    # ``adapted.await_`` during engine initialize; without these methods
+    # SQLAlchemy crashes with AttributeError.
+    #
+    # We don't inherit from ``AdaptedConnection`` (we pre-date it and
+    # have our own plugin-mediated hierarchy) -- we duck-type its
+    # contract instead so SA's async dialects see what they expect.
+    #
+    # All four bypass the plugin chain: they expose client-side state
+    # (driver connection handle) or greenlet machinery (``await_``,
+    # ``run_async``). The plugin pipeline has no say in these.
+
+    @property
+    def driver_connection(self) -> Any:
+        """The native driver connection -- matches ``AdaptedConnection.driver_connection``."""
+        return self.target_connection
+
+    @property
+    def _connection(self) -> Any:
+        """Alias for SA's ``AdaptedConnection._connection`` slot.
+
+        SA's ``AsyncAdapt_*_connection`` subclasses read ``self._connection``
+        directly in some paths (e.g., ``AsyncAdapt_dbapi_connection.rollback``).
+        We expose the same attribute name so duck-typed access works.
+        """
+        return self.target_connection
+
+    @staticmethod
+    def await_(coro: Any) -> Any:
+        """SA async-adapter bridge: run a coroutine from sync context.
+
+        SA's ``AsyncAdapt_dbapi_connection`` exposes this as
+        ``staticmethod(sqlalchemy.util.concurrency.await_only)``. We
+        delegate to the same utility lazily so SQLAlchemy stays a
+        soft runtime dependency -- callers who don't use SA never
+        hit the import.
+        """
+        from sqlalchemy.util.concurrency import await_only
+        return await_only(coro)
+
+    def run_async(self, fn: Callable[[Any], Awaitable[Any]]) -> Any:
+        """Match ``sqlalchemy.engine.interfaces.AdaptedConnection.run_async``.
+
+        SA docs: "Run the awaitable returned by the given function,
+        which is passed the raw asyncio driver connection. Used to
+        invoke awaitable-only methods on the driver connection within
+        the context of a synchronous method, like a connection pool
+        event handler."
+
+        Calling this from an already-running event loop will raise
+        through ``await_only`` -- same behavior as SA's built-in
+        implementation.
+        """
+        from sqlalchemy.util.concurrency import await_only
+        return await_only(fn(self.target_connection))
 
     def release_resources(self):
         self._plugin_manager.release_resources()

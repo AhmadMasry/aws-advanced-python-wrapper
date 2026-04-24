@@ -35,7 +35,7 @@ other downstream libraries may touch:
 All passthroughs delegate directly to the target connection (bypass
 the plugin chain) -- they are local/client-side operations.
 
-The \`set_read_only\` / \`set_autocommit\` passthroughs on the SYNC
+The ``set_read_only`` / ``set_autocommit`` passthroughs on the SYNC
 wrapper route through the existing plugin-aware property setters so
 their semantics stay consistent with the property assignment form.
 """
@@ -289,7 +289,7 @@ def test_sync_wrapper_set_read_only_routes_through_property() -> None:
     target = MagicMock()
     wrapper = _sync_wrapper(target)
     # Stub out the property setter path so we observe plugin_manager.
-    wrapper._plugin_manager.execute = MagicMock(return_value=None)
+    wrapper._plugin_manager.execute = MagicMock(return_value=None)  # type: ignore[method-assign]
     wrapper.set_read_only(True)
     # Plugin-manager was called (property setter routes through plugin chain).
     wrapper._plugin_manager.execute.assert_called_once()
@@ -298,7 +298,7 @@ def test_sync_wrapper_set_read_only_routes_through_property() -> None:
 def test_sync_wrapper_set_autocommit_routes_through_property() -> None:
     target = MagicMock()
     wrapper = _sync_wrapper(target)
-    wrapper._plugin_manager.execute = MagicMock(return_value=None)
+    wrapper._plugin_manager.execute = MagicMock(return_value=None)  # type: ignore[method-assign]
     wrapper.set_autocommit(True)
     wrapper._plugin_manager.execute.assert_called_once()
 
@@ -327,7 +327,7 @@ def test_sync_wrapper_passthroughs_bypass_plugin_chain(call) -> None:
     attr = getattr(wrapper, name)
     if callable(attr):
         attr(*args)
-    wrapper._plugin_manager.execute.assert_not_called()
+    wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[attr-defined]
 
 
 # ---- Signature-shape sanity check --------------------------------------
