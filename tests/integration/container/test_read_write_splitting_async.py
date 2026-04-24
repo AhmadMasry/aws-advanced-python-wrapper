@@ -458,7 +458,7 @@ class TestReadWriteSplittingAsync:
                 assert writer_id != reader_id
 
                 async with conn.cursor() as cursor:
-                    conn.autocommit = False
+                    await conn.set_autocommit(False)
                     await cursor.execute("START TRANSACTION")
 
                     with pytest.raises(ReadWriteSplittingError):
@@ -490,7 +490,7 @@ class TestReadWriteSplittingAsync:
                 writer_id = await _query_instance_id_async(conn, rds_utils)
 
                 cursor = conn.cursor()
-                conn.autocommit = False
+                await conn.set_autocommit(False)
                 await cursor.execute("START TRANSACTION")
 
                 # MySQL allows users to change the read_only value during a transaction, Psycopg does not
@@ -625,7 +625,7 @@ class TestReadWriteSplittingAsync:
                 await old_cursor.execute("SELECT 1")
                 await old_cursor.fetchone()
                 await conn.set_read_only(True)  # Switch connection internally
-                conn.autocommit = False
+                await conn.set_autocommit(False)
 
                 with pytest.raises(AwsWrapperError):
                     await old_cursor.execute("SELECT 1")
@@ -906,25 +906,25 @@ class TestReadWriteSplittingAsync:
             )
             try:
                 # Set autocommit to False on writer
-                conn.autocommit = False
-                assert conn.autocommit is False
+                await conn.set_autocommit(False)
+                assert await conn.autocommit is False
                 writer_connection_id = await _query_instance_id_async(conn, rds_utils)
                 await conn.commit()
 
                 # Switch to reader - autocommit should remain False
                 await conn.set_read_only(True)
-                assert conn.autocommit is False
+                assert await conn.autocommit is False
                 reader_connection_id = await _query_instance_id_async(conn, rds_utils)
                 assert writer_connection_id != reader_connection_id
                 await conn.commit()
 
                 # Change autocommit on reader
-                conn.autocommit = True
-                assert conn.autocommit is True
+                await conn.set_autocommit(True)
+                assert await conn.autocommit is True
 
                 # Switch back to writer - autocommit should be True
                 await conn.set_read_only(False)
-                assert conn.autocommit is True
+                assert await conn.autocommit is True
                 final_writer_connection_id = await _query_instance_id_async(conn, rds_utils)
                 assert writer_connection_id == final_writer_connection_id
             finally:
@@ -1138,7 +1138,7 @@ class TestReadWriteSplittingAsync:
                 initial_driver_conn = conn.target_connection.driver_connection
                 initial_writer_id = await _query_instance_id_async(conn, rds_utils)
 
-                conn.autocommit = False
+                await conn.set_autocommit(False)
                 cursor = conn.cursor()
                 await cursor.execute("START TRANSACTION")
 
