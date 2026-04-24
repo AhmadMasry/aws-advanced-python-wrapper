@@ -121,49 +121,58 @@ class TestAwsIamAuthenticationAsync:
     def test_iam_wrong_database_username_async(
             self, test_environment: TestEnvironment, test_driver: TestDriver, conn_utils, props):
         async def inner() -> None:
-            user = f"WRONG_{conn_utils.iam_user}_USER"
-            params: Dict[str, Any] = conn_utils.get_connect_params(user=user)
-            params.pop("use_pure", None)  # AWS tokens are truncated when using the pure Python MySQL driver
+            try:
+                user = f"WRONG_{conn_utils.iam_user}_USER"
+                params: Dict[str, Any] = conn_utils.get_connect_params(user=user)
+                params.pop("use_pure", None)  # AWS tokens are truncated when using the pure Python MySQL driver
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=params,
-                    plugins="iam",
-                    **dict(props))
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=params,
+                        plugins="iam",
+                        **dict(props))
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
     def test_iam_no_database_username_async(self, test_driver: TestDriver, conn_utils, props):
         async def inner() -> None:
-            params: Dict[str, Any] = conn_utils.get_connect_params()
-            params.pop("use_pure", None)  # AWS tokens are truncated when using the pure Python MySQL driver
-            params.pop("user", None)
+            try:
+                params: Dict[str, Any] = conn_utils.get_connect_params()
+                params.pop("use_pure", None)  # AWS tokens are truncated when using the pure Python MySQL driver
+                params.pop("user", None)
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=params,
-                    plugins="iam",
-                    **dict(props))
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=params,
+                        plugins="iam",
+                        **dict(props))
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
     def test_iam_invalid_host_async(self, test_driver: TestDriver, conn_utils, props):
         async def inner() -> None:
-            params: Dict[str, Any] = conn_utils.get_connect_params()
-            params.pop("use_pure", None)  # AWS tokens are truncated when using the pure Python MySQL driver
-            params["iam_host"] = "<>"
+            try:
+                params: Dict[str, Any] = conn_utils.get_connect_params()
+                params.pop("use_pure", None)  # AWS tokens are truncated when using the pure Python MySQL driver
+                params["iam_host"] = "<>"
 
-            with pytest.raises(AwsWrapperError):
-                conn = await connect_async(
-                    test_driver=test_driver,
-                    connect_params=params,
-                    plugins="iam",
-                    **dict(props))
-                await conn.close()
+                with pytest.raises(AwsWrapperError):
+                    conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=params,
+                        plugins="iam",
+                        **dict(props))
+                    await conn.close()
+            finally:
+                await cleanup_async()
 
         asyncio.run(inner())
 
