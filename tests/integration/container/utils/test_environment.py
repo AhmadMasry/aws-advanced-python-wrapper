@@ -237,11 +237,28 @@ class TestEnvironment:
 
         if test_driver == TestDriver.MYSQL:
             driver_compatible_to_database_engine = database_engine == DatabaseEngine.MYSQL
-            disabled_by_feature = TestEnvironmentFeatures.SKIP_MYSQL_DRIVER_TESTS in features
+            disabled_by_feature = (
+                TestEnvironmentFeatures.SKIP_MYSQL_DRIVER_TESTS in features
+                or TestEnvironmentFeatures.SKIP_SYNC_DRIVER_TESTS in features
+            )
         elif test_driver == TestDriver.PG:
-            driver_compatible_to_database_engine = (
-                    database_engine == DatabaseEngine.PG)
-            disabled_by_feature = TestEnvironmentFeatures.SKIP_PG_DRIVER_TESTS in features
+            driver_compatible_to_database_engine = database_engine == DatabaseEngine.PG
+            disabled_by_feature = (
+                TestEnvironmentFeatures.SKIP_PG_DRIVER_TESTS in features
+                or TestEnvironmentFeatures.SKIP_SYNC_DRIVER_TESTS in features
+            )
+        elif test_driver == TestDriver.MYSQL_ASYNC:
+            driver_compatible_to_database_engine = database_engine == DatabaseEngine.MYSQL
+            disabled_by_feature = (
+                TestEnvironmentFeatures.SKIP_MYSQL_DRIVER_TESTS in features
+                or TestEnvironmentFeatures.SKIP_ASYNC_DRIVER_TESTS in features
+            )
+        elif test_driver == TestDriver.PG_ASYNC:
+            driver_compatible_to_database_engine = database_engine == DatabaseEngine.PG
+            disabled_by_feature = (
+                TestEnvironmentFeatures.SKIP_PG_DRIVER_TESTS in features
+                or TestEnvironmentFeatures.SKIP_ASYNC_DRIVER_TESTS in features
+            )
         else:
             raise UnsupportedOperationError(test_driver.value)
 
