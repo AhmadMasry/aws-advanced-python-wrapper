@@ -183,7 +183,7 @@ class TestReadWriteSplittingAsync:
     def clear_caches(self):
         services_container.get_storage_service().clear_all()
         yield
-        AsyncConnectionProviderManager.release_resources()
+        asyncio.run(AsyncConnectionProviderManager.release_resources())
         AsyncConnectionProviderManager.reset_provider()
         gc.collect()
         ProxyHelper.enable_all_connectivity()
