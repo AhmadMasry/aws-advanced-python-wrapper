@@ -103,11 +103,54 @@ class AwsWrapperAsyncPsycopgAdaptDBAPI:
 
 
 class AwsWrapperPGPsycopgAsyncDialect(PGDialectAsync_psycopg):
-    """Async SQLAlchemy dialect that uses the AWS Advanced Python Wrapper as its DBAPI."""
+    """Async SQLAlchemy dialect that uses the AWS Advanced Python Wrapper as its DBAPI.
+
+    Wrapper-specific override pattern
+    ---------------------------------
+    The wrapper interposes on DBAPI-level calls (connect / execute /
+    commit etc.) -- everything SA drives through the DBAPI connection
+    contract passes through our plugin pipeline.
+
+    SQLAlchemy's psycopg dialect, however, also calls into psycopg
+    internals directly, bypassing the DBAPI connection: it passes a
+    ``driver_connection`` into ``psycopg.types.TypeInfo.fetch`` and
+    similar helpers. Those helpers ``isinstance``-check their argument
+    against the real ``psycopg.Connection`` / ``psycopg.AsyncConnection``
+    classes -- our proxy is NOT a subclass, so they raise TypeError.
+
+    Wherever SA's dialect reaches the raw driver connection, we override
+    the method here to unwrap to the native psycopg connection via
+    ``AsyncAwsWrapperConnection.target_connection`` before handing it
+    to psycopg. Current overrides: ``_type_info_fetch``.
+    """
 
     driver = "psycopg_async"
     supports_statement_cache = True
     is_async = True
+
+    def _type_info_fetch(self, connection: Any, name: str) -> Any:
+        """Unwrap to native psycopg.AsyncConnection before TypeInfo.fetch.
+
+        SA native (``sqlalchemy/dialects/postgresql/psycopg.py:838``):
+            adapted = connection.connection
+            return adapted.await_(TypeInfo.fetch(adapted.driver_connection, name))
+
+        ``adapted.driver_connection`` in our setup is the
+        :class:`AsyncAwsWrapperConnection` proxy, which
+        ``psycopg.TypeInfo.fetch`` rejects with
+        ``TypeError: expected Connection or AsyncConnection, got ...``
+        because we don't subclass ``psycopg.AsyncConnection``. Reach
+        the underlying native via ``target_connection`` (exposed on
+        our wrapper at ``aio/wrapper.py:326``). ``TypeInfo.fetch`` only
+        reads catalog rows, so bypassing the plugin pipeline here is
+        semantically safe -- there's no DB-side state the plugin chain
+        would need to intercept.
+        """
+        from psycopg.types import TypeInfo
+        adapted = connection.connection
+        wrapper = adapted.driver_connection
+        native = getattr(wrapper, "target_connection", wrapper)
+        return adapted.await_(TypeInfo.fetch(native, name))
 
     @classmethod
     def import_dbapi(cls) -> AwsWrapperAsyncPsycopgAdaptDBAPI:

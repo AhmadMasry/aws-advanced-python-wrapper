@@ -115,3 +115,72 @@ def test_url_query_args_flow_through_to_wrapper_connect(mocker):
     assert "wrapper_plugins" not in kwargs, (
         "dialect should have renamed wrapper_plugins → plugins before the connect call"
     )
+
+
+# ---- _type_info_fetch unwrap (sync) -------------------------------------
+
+
+def test_pg_dialect_type_info_fetch_unwraps_target_connection(mocker):
+    """Regression guard for
+
+        TypeError: expected Connection or AsyncConnection,
+                   got AwsWrapperConnection
+
+    at ``psycopg/_typeinfo.py:90``. ``psycopg.TypeInfo.fetch`` strictly
+    isinstance-checks its first argument -- our wrapper proxy is not a
+    subclass of ``psycopg.Connection``. The dialect override unwraps
+    to the native psycopg connection via ``target_connection`` before
+    calling into psycopg.
+    """
+    from unittest.mock import MagicMock
+    native_conn = MagicMock(name="native_psycopg_connection")
+    wrapper = MagicMock(name="AwsWrapperConnection")
+    wrapper.target_connection = native_conn
+    # SA's sync path: connection.connection IS the DBAPI conn (our
+    # wrapper). No extra adapter layer between them.
+    sa_connection = MagicMock()
+    sa_connection.connection = wrapper
+    # Make the wrapper look like it has driver_connection too (mirrors
+    # AdaptedConnection contract added in d372b5f):
+    wrapper.driver_connection = wrapper
+
+    # Patch TypeInfo.fetch so we can assert its first arg without
+    # needing a live Postgres.
+    fetch_mock = mocker.patch(
+        "psycopg.types.TypeInfo.fetch", return_value="type-info-sentinel")
+
+    dialect = AwsWrapperPGPsycopgDialect()
+    result = dialect._type_info_fetch(sa_connection, "hstore")
+
+    assert result == "type-info-sentinel"
+    fetch_mock.assert_called_once()
+    called_arg = fetch_mock.call_args.args[0]
+    assert called_arg is native_conn, (
+        "TypeInfo.fetch must receive the native psycopg connection, "
+        "not our wrapper proxy")
+
+
+def test_pg_dialect_type_info_fetch_falls_through_when_no_target_connection(mocker):
+    """If the DBAPI connection lacks ``target_connection`` (e.g., SA is
+    pointed at a real psycopg connection directly, no wrapper in the
+    middle), pass the connection through unchanged -- don't break
+    non-wrapper deployments."""
+    from unittest.mock import MagicMock
+
+    # spec= so attribute-lookup returns a real AttributeError for
+    # target_connection and we fall through to the conn itself.
+    class _NativeLike:
+        pass
+    native = _NativeLike()
+    sa_connection = MagicMock()
+    sa_connection.connection = native
+
+    fetch_mock = mocker.patch(
+        "psycopg.types.TypeInfo.fetch", return_value="ok")
+
+    dialect = AwsWrapperPGPsycopgDialect()
+    dialect._type_info_fetch(sa_connection, "hstore")
+
+    called_arg = fetch_mock.call_args.args[0]
+    assert called_arg is native, (
+        "no-wrapper deployments should pass the native conn through unchanged")

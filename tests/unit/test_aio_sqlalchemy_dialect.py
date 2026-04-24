@@ -178,3 +178,81 @@ def test_async_dialect_create_connect_args_renames_wrapper_plugins():
     assert kwargs.get("wrapper_dialect") == "aurora-pg"
     assert kwargs.get("plugins") == "failover"
     assert "wrapper_plugins" not in kwargs
+
+
+# ---- _type_info_fetch unwrap (async) -----------------------------------
+
+
+def test_async_dialect_type_info_fetch_unwraps_target_connection(mocker):
+    """Regression guard for
+
+        TypeError: expected Connection or AsyncConnection,
+                   got AsyncAwsWrapperConnection
+
+    at ``psycopg/_typeinfo.py:90``. ``psycopg.TypeInfo.fetch`` strictly
+    isinstance-checks its first argument. SA's native
+    ``_type_info_fetch`` passes ``adapted.driver_connection`` which in
+    our setup is the wrapper proxy, not the native psycopg
+    AsyncConnection. Our dialect override unwraps via
+    ``AsyncAwsWrapperConnection.target_connection`` before calling
+    TypeInfo.fetch.
+    """
+    # Build the 3-layer shape SA's async path constructs:
+    #   sa_connection (engine-level)
+    #     .connection = AsyncAdapt_psycopg_connection (SA adapter)
+    #       .driver_connection = AsyncAwsWrapperConnection (our wrapper)
+    #         .target_connection = psycopg.AsyncConnection (native)
+    native_conn = MagicMock(name="native_psycopg_AsyncConnection")
+    wrapper = MagicMock(name="AsyncAwsWrapperConnection")
+    wrapper.target_connection = native_conn
+
+    adapted = MagicMock(name="AsyncAdapt_psycopg_connection")
+    adapted.driver_connection = wrapper
+    # await_ unwraps the awaitable passed to it synchronously in the
+    # test -- matches SA's ``staticmethod(await_only)`` shape.
+    adapted.await_ = lambda coro: "type-info-sentinel"
+
+    sa_connection = MagicMock()
+    sa_connection.connection = adapted
+
+    fetch_mock = mocker.patch(
+        "psycopg.types.TypeInfo.fetch", return_value="raw-fetch-result")
+
+    dialect = AwsWrapperPGPsycopgAsyncDialect()
+    result = dialect._type_info_fetch(sa_connection, "hstore")
+
+    # await_ returned the sentinel (confirming the result flows through).
+    assert result == "type-info-sentinel"
+    # TypeInfo.fetch was called with the NATIVE, not our wrapper.
+    fetch_mock.assert_called_once()
+    called_arg = fetch_mock.call_args.args[0]
+    assert called_arg is native_conn, (
+        "TypeInfo.fetch must receive the native psycopg connection, "
+        "not our AsyncAwsWrapperConnection proxy")
+    # And the second arg is the type name.
+    assert fetch_mock.call_args.args[1] == "hstore"
+
+
+def test_async_dialect_type_info_fetch_falls_through_without_wrapper(mocker):
+    """If ``driver_connection`` is already a native psycopg AsyncConnection
+    (no wrapper in the middle), pass it through unchanged -- don't break
+    SA configurations that bypass our wrapper."""
+    class _NativeLike:
+        pass
+    native = _NativeLike()
+
+    adapted = MagicMock()
+    adapted.driver_connection = native
+    adapted.await_ = lambda coro: "ok"
+
+    sa_connection = MagicMock()
+    sa_connection.connection = adapted
+
+    fetch_mock = mocker.patch(
+        "psycopg.types.TypeInfo.fetch", return_value="raw")
+
+    AwsWrapperPGPsycopgAsyncDialect()._type_info_fetch(
+        sa_connection, "hstore")
+
+    called_arg = fetch_mock.call_args.args[0]
+    assert called_arg is native
