@@ -382,6 +382,42 @@ class AsyncAwsWrapperConnection:
         # Fallback: attribute assignment.
         target.isolation_level = level
 
+    # Notice/notify handler passthroughs (psycopg3 parity).
+    #
+    # SQLAlchemy's psycopg dialect registers a notice handler on every
+    # engine.connect() (sqlalchemy/dialects/postgresql/psycopg.py:575).
+    # Without these passthroughs the wrapper would AttributeError there
+    # and break every connect on the Aurora path.
+    #
+    # These delegate straight to the target connection and BYPASS the
+    # plugin chain: notice/notify handler registration is pure local
+    # client-side state (it just installs a callback slot on the
+    # connection object), it does not hit the database, and plugins
+    # have no reason to intercept it.
+    #
+    # Signatures are plain ``def`` (not ``async def``) because
+    # ``psycopg.AsyncConnection.add_notice_handler`` is itself a sync
+    # method -- it does not await anything. Verified against
+    # ``psycopg 3.3.3`` in this repo's venv (iscoroutinefunction=False
+    # for both sync and async variants).
+    #
+    # The aiomysql driver does not expose these methods -- callers on
+    # MySQL targets will get the underlying driver's AttributeError,
+    # which matches psycopg3 parity (these are PostgreSQL-only
+    # features).
+
+    def add_notice_handler(self, callback: Any) -> Any:
+        return self._target_conn.add_notice_handler(callback)
+
+    def remove_notice_handler(self, callback: Any) -> Any:
+        return self._target_conn.remove_notice_handler(callback)
+
+    def add_notify_handler(self, callback: Any) -> Any:
+        return self._target_conn.add_notify_handler(callback)
+
+    def remove_notify_handler(self, callback: Any) -> Any:
+        return self._target_conn.remove_notify_handler(callback)
+
     @staticmethod
     async def connect(
             target: Union[None, str, Callable] = None,

@@ -218,6 +218,36 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
         return self._plugin_manager.execute(self.target_connection, DbApiMethod.CONNECTION_TPC_RECOVER,
                                             lambda: self.target_connection.tpc_recover())
 
+    # Notice/notify handler passthroughs (psycopg3 parity).
+    #
+    # SQLAlchemy's psycopg dialect registers a notice handler on every
+    # engine.connect() (sqlalchemy/dialects/postgresql/psycopg.py:575).
+    # Without these passthroughs the wrapper would AttributeError there
+    # and break every connect on the Aurora path.
+    #
+    # These delegate straight to the target connection and BYPASS the
+    # plugin chain: notice/notify handler registration is pure local
+    # client-side state (it just installs a callback slot on the
+    # connection object), it does not hit the database, and plugins
+    # have no reason to intercept it.
+    #
+    # The MySQL drivers (mysql-connector, aiomysql) do not expose these
+    # methods -- callers on MySQL targets will get the underlying
+    # driver's AttributeError, which matches psycopg3 parity (these are
+    # PostgreSQL-only features).
+
+    def add_notice_handler(self, callback: Any) -> Any:
+        return self.target_connection.add_notice_handler(callback)
+
+    def remove_notice_handler(self, callback: Any) -> Any:
+        return self.target_connection.remove_notice_handler(callback)
+
+    def add_notify_handler(self, callback: Any) -> Any:
+        return self.target_connection.add_notify_handler(callback)
+
+    def remove_notify_handler(self, callback: Any) -> Any:
+        return self.target_connection.remove_notify_handler(callback)
+
     def release_resources(self):
         self._plugin_manager.release_resources()
         if isinstance(self._plugin_service, CanReleaseResources):
