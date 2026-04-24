@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, List
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -123,7 +123,7 @@ def test_routings_for_not_created_empty() -> None:
 
 
 def test_routings_for_preparation_substitutes() -> None:
-    corresponding = {
+    corresponding: Dict[str, Tuple[str, Optional[str]]] = {
         "src.example.com": ("src.example.com", "tgt.example.com"),
         "tgt.example.com": ("tgt.example.com", "src.example.com"),
     }

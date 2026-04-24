@@ -36,8 +36,8 @@ class _FakeDriverDialect:
                  read_only: bool = False) -> None:
         self._autocommit = autocommit
         self._read_only = read_only
-        self.set_autocommit_calls = []
-        self.set_read_only_calls = []
+        self.set_autocommit_calls: list[bool] = []
+        self.set_read_only_calls: list[bool] = []
 
     async def get_autocommit(self, conn: Any) -> bool:
         return self._autocommit
@@ -298,7 +298,7 @@ def test_plugin_service_exposes_session_state_service() -> None:
         AsyncPluginServiceImpl
 
     class _Noop:
-        network_bound_methods = set()
+        network_bound_methods: set[str] = set()
 
         async def transfer_session_state(self, a, b):
             pass

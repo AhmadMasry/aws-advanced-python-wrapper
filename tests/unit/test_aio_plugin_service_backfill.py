@@ -90,9 +90,9 @@ def _make_service(
         in_txn: bool = False,
         conn: Optional[Any] = None) -> AsyncPluginServiceImpl:
     props = Properties()
-    svc = AsyncPluginServiceImpl(props, _FakeDriverDialect(in_txn))
+    svc = AsyncPluginServiceImpl(props, _FakeDriverDialect(in_txn))  # type: ignore[arg-type]
     svc._current_connection = conn
-    svc._database_dialect = _FakeDatabaseDialect()
+    svc._database_dialect = _FakeDatabaseDialect()  # type: ignore[assignment]
     return svc
 
 
@@ -107,8 +107,8 @@ def test_allowed_and_blocked_hosts_default_is_none() -> None:
 def test_allowed_and_blocked_hosts_setter_round_trip() -> None:
     svc = _make_service()
     filter_ = AllowedAndBlockedHosts(
-        allowed_host_ids=frozenset({"a", "b"}),
-        blocked_host_ids=frozenset({"c"}),
+        allowed_host_ids={"a", "b"},
+        blocked_host_ids={"c"},
     )
     svc.allowed_and_blocked_hosts = filter_
     assert svc.allowed_and_blocked_hosts is filter_
@@ -117,7 +117,7 @@ def test_allowed_and_blocked_hosts_setter_round_trip() -> None:
 def test_allowed_and_blocked_hosts_can_be_cleared() -> None:
     svc = _make_service()
     svc.allowed_and_blocked_hosts = AllowedAndBlockedHosts(
-        allowed_host_ids=frozenset(), blocked_host_ids=frozenset())
+        allowed_host_ids=set(), blocked_host_ids=set())
     svc.allowed_and_blocked_hosts = None
     assert svc.allowed_and_blocked_hosts is None
 
@@ -175,7 +175,7 @@ def test_identify_connection_returns_topology_match() -> None:
     ]
     for h in hosts:
         h.set_availability(HostAvailability.AVAILABLE)
-    svc.host_list_provider = _FakeHostListProvider(hosts)
+    svc.host_list_provider = _FakeHostListProvider(hosts)  # type: ignore[assignment]
 
     result = asyncio.run(svc.identify_connection())
     assert result is not None
@@ -190,7 +190,7 @@ def test_identify_connection_falls_back_to_force_refresh() -> None:
                  role=HostRole.READER),
     ]
     provider = _FakeHostListProvider(hosts)
-    svc.host_list_provider = provider
+    svc.host_list_provider = provider  # type: ignore[assignment]
 
     asyncio.run(svc.identify_connection())
     # refresh hit first; no fallback needed when match is found.
@@ -208,7 +208,7 @@ def test_identify_connection_forces_refresh_on_miss() -> None:
                  role=HostRole.READER),
     ]
     provider = _FakeHostListProvider(hosts)
-    svc.host_list_provider = provider
+    svc.host_list_provider = provider  # type: ignore[assignment]
 
     result = asyncio.run(svc.identify_connection())
     assert result is None
