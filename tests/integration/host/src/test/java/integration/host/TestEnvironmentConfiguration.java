@@ -42,6 +42,10 @@ public class TestEnvironmentConfiguration {
       Boolean.parseBoolean(System.getProperty("exclude-pg-engine", "false"));
   public boolean excludePgDriver =
       Boolean.parseBoolean(System.getProperty("exclude-pg-driver", "false"));
+  public boolean excludeSyncDrivers =
+      Boolean.parseBoolean(System.getProperty("exclude-sync-drivers", "false"));
+  public boolean excludeAsyncDrivers =
+      Boolean.parseBoolean(System.getProperty("exclude-async-drivers", "false"));
   public boolean excludeFailover =
       Boolean.parseBoolean(System.getProperty("exclude-failover", "false"));
   public boolean excludeIam =
