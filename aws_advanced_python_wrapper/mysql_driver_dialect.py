@@ -96,7 +96,7 @@ class MySQLDriverDialect(DriverDialect):
                 socket_timeout = WrapperProperties.SOCKET_TIMEOUT_SEC.get_float(self._props)
                 timeout_sec = socket_timeout if socket_timeout > 0 else MySQLDriverDialect.IS_CLOSED_TIMEOUT_SEC
                 is_connected_with_timeout = timeout(
-                    self._thread_pool, timeout_sec)(conn.is_connected)  # type: ignore
+                    self._thread_pool, timeout_sec)(conn.is_connected)  # type: ignore[attr-defined]
 
                 try:
                     return not is_connected_with_timeout()
@@ -108,14 +108,14 @@ class MySQLDriverDialect(DriverDialect):
 
     def get_autocommit(self, conn: Connection) -> bool:
         if MySQLDriverDialect._is_mysql_connection(conn):
-            return conn.autocommit  # type: ignore
+            return conn.autocommit  # type: ignore[attr-defined]
 
         raise UnsupportedOperationError(
             Messages.get_formatted("DriverDialect.UnsupportedOperationError", self._driver_name, "autocommit"))
 
     def set_autocommit(self, conn: Connection, autocommit: bool):
         if MySQLDriverDialect._is_mysql_connection(conn):
-            conn.autocommit = autocommit  # type: ignore
+            conn.autocommit = autocommit  # type: ignore[attr-defined]
             return
 
         raise UnsupportedOperationError(
@@ -134,13 +134,13 @@ class MySQLDriverDialect(DriverDialect):
 
     def can_execute_query(self, conn: Connection) -> bool:
         if MySQLDriverDialect._is_mysql_connection(conn):
-            if conn.unread_result:  # type: ignore
-                return conn.can_consume_results  # type: ignore
+            if conn.unread_result:  # type: ignore[attr-defined]
+                return conn.can_consume_results  # type: ignore[attr-defined]
         return True
 
     def is_in_transaction(self, conn: Connection) -> bool:
         if MySQLDriverDialect._is_mysql_connection(conn):
-            return bool(conn.in_transaction)  # type: ignore
+            return bool(conn.in_transaction)  # type: ignore[attr-defined]
 
         raise UnsupportedOperationError(
             Messages.get_formatted("DriverDialect.UnsupportedOperationError", self._driver_name,
@@ -178,7 +178,7 @@ class MySQLDriverDialect(DriverDialect):
 
     def transfer_session_state(self, from_conn: Connection, to_conn: Connection):
         if MySQLDriverDialect._is_mysql_connection(from_conn) and MySQLDriverDialect._is_mysql_connection(to_conn):
-            to_conn.autocommit = from_conn.autocommit  # type: ignore
+            to_conn.autocommit = from_conn.autocommit  # type: ignore[attr-defined]
 
     def ping(self, conn: Connection) -> bool:
         return not self.is_closed(conn)

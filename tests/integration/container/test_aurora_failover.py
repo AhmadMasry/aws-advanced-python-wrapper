@@ -18,7 +18,7 @@ import gc
 from time import sleep
 from typing import TYPE_CHECKING, List
 
-import pytest  # type: ignore
+import pytest
 
 from aws_advanced_python_wrapper.errors import (
     FailoverSuccessError, TransactionResolutionUnknownError)

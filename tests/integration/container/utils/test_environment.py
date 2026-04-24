@@ -37,7 +37,7 @@ import os
 import typing
 from typing import Any, Dict, List, Optional
 
-from toxiproxy import Toxiproxy  # type: ignore
+from toxiproxy import Toxiproxy  # type: ignore[import-untyped]
 
 from aws_advanced_python_wrapper.errors import UnsupportedOperationError
 from aws_advanced_python_wrapper.utils.messages import Messages
@@ -120,7 +120,7 @@ class TestEnvironment:
 
     @staticmethod
     def _init_proxies(environment: TestEnvironment):
-        environment._proxies: Dict[str, ProxyInfo] = dict()  # type: ignore
+        environment._proxies: Dict[str, ProxyInfo] = dict()  # type: ignore[misc]
         proxy_control_port: int = environment.get_proxy_database_info().get_control_port()
 
         for instance in environment.get_proxy_instances():
@@ -173,13 +173,13 @@ class TestEnvironment:
     def get_proxy_info(self, instance_name: str) -> ProxyInfo:
         if self._proxies is None:
             raise Exception(Messages.get_formatted("Testing.ProxyNotFound", instance_name))
-        p: ProxyInfo = self._proxies.get(instance_name)  # type: ignore
+        p: ProxyInfo = self._proxies.get(instance_name)  # type: ignore[assignment]
         if p is None:
             raise Exception(Messages.get_formatted("Testing.ProxyNotFound", instance_name))
         return p
 
     def get_proxy_infos(self) -> List[ProxyInfo]:
-        return list(self._proxies.values())  # type: ignore
+        return list(self._proxies.values())  # type: ignore[union-attr]
 
     def get_info(self) -> TestEnvironmentInfo:
         return self._info

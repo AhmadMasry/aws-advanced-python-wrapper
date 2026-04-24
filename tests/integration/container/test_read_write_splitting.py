@@ -14,8 +14,8 @@
 
 import gc
 
-import pytest  # type: ignore
-from sqlalchemy import PoolProxiedConnection  # type: ignore
+import pytest
+from sqlalchemy import PoolProxiedConnection
 
 from aws_advanced_python_wrapper import AwsWrapperConnection, release_resources
 from aws_advanced_python_wrapper.connection_provider import \

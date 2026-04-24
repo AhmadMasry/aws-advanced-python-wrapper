@@ -17,7 +17,7 @@ from __future__ import annotations
 import atexit
 from typing import TYPE_CHECKING, Optional
 
-from aws_xray_sdk.core import xray_recorder  # type: ignore
+from aws_xray_sdk.core import xray_recorder
 
 from aws_advanced_python_wrapper.connection_provider import \
     ConnectionProviderManager
@@ -34,14 +34,14 @@ from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
 
 if TYPE_CHECKING:
     from .utils.test_driver import TestDriver
-    from aws_xray_sdk.core.models.segment import Segment  # type: ignore
+    from aws_xray_sdk.core.models.segment import Segment
 
 import socket
 import timeit
 from time import sleep
 from typing import List
 
-import pytest  # type: ignore
+import pytest
 
 from .utils.connection_utils import ConnectionUtils
 from .utils.database_engine_deployment import DatabaseEngineDeployment
@@ -156,7 +156,7 @@ def pytest_generate_tests(metafunc):
         environment = TestEnvironment.get_current()
         metafunc.parametrize("test_environment", [environment], ids=[repr(environment)])
     if "test_driver" in metafunc.fixturenames:
-        allowed_drivers: List[TestDriver] = TestEnvironment.get_current().get_allowed_test_drivers()  # type: ignore
+        allowed_drivers: List[TestDriver] = TestEnvironment.get_current().get_allowed_test_drivers()
         metafunc.parametrize("test_driver", allowed_drivers)
 
 

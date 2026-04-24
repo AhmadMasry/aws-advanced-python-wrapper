@@ -212,7 +212,7 @@ class OpenedConnectionTracker:
 
     def _invalidate_connections(self, connections_list: list):
         invalidate_connection_thread: Thread = Thread(daemon=True, target=self._task,
-                                                      args=[connections_list])  # type: ignore
+                                                      args=[connections_list])  # type: ignore[arg-type]
         invalidate_connection_thread.start()
 
     def log_opened_connections(self):

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import gc
 
-import pytest  # type: ignore
+import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
     from aws_advanced_python_wrapper.driver_dialect import DriverDialect
 
-from sqlalchemy import QueuePool, pool  # type: ignore
+from sqlalchemy import QueuePool, pool
 
 from aws_advanced_python_wrapper.connection_provider import ConnectionProvider
 from aws_advanced_python_wrapper.errors import AwsWrapperError
