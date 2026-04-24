@@ -200,6 +200,7 @@ tasks.register<Test>("test-pg-aurora") {
         systemProperty("exclude-mysql-engine", "true")
         systemProperty("exclude-mariadb-driver", "true")
         systemProperty("exclude-mariadb-engine", "true")
+        systemProperty("exclude-async-drivers", "true")
     }
 }
 
@@ -214,6 +215,7 @@ tasks.register<Test>("test-mysql-aurora") {
         systemProperty("exclude-performance", "true")
         systemProperty("exclude-pg-driver", "true")
         systemProperty("exclude-pg-engine", "true")
+        systemProperty("exclude-async-drivers", "true")
     }
 }
 
@@ -240,6 +242,7 @@ tasks.register<Test>("test-pg-multi-az") {
         systemProperty("exclude-mariadb-driver", "true")
         systemProperty("exclude-mariadb-engine", "true")
         systemProperty("exclude-bg", "true")
+        systemProperty("exclude-async-drivers", "true")
     }
 }
 
@@ -253,6 +256,69 @@ tasks.register<Test>("test-mysql-multi-az") {
         systemProperty("exclude-pg-driver", "true")
         systemProperty("exclude-pg-engine", "true")
         systemProperty("exclude-bg", "true")
+        systemProperty("exclude-async-drivers", "true")
+    }
+}
+
+tasks.register<Test>("test-pg-aurora-async") {
+    group = "verification"
+    filter.includeTestsMatching("integration.host.TestRunner.runTests")
+    doFirst {
+        systemProperty("exclude-docker", "true")
+        systemProperty("exclude-multi-az-cluster", "true")
+        systemProperty("exclude-multi-az-instance", "true")
+        systemProperty("exclude-bg", "true")
+        systemProperty("exclude-performance", "true")
+        systemProperty("exclude-mysql-driver", "true")
+        systemProperty("exclude-mysql-engine", "true")
+        systemProperty("exclude-mariadb-driver", "true")
+        systemProperty("exclude-mariadb-engine", "true")
+        systemProperty("exclude-sync-drivers", "true")
+    }
+}
+
+tasks.register<Test>("test-mysql-aurora-async") {
+    group = "verification"
+    filter.includeTestsMatching("integration.host.TestRunner.runTests")
+    doFirst {
+        systemProperty("exclude-docker", "true")
+        systemProperty("exclude-multi-az-cluster", "true")
+        systemProperty("exclude-multi-az-instance", "true")
+        systemProperty("exclude-bg", "true")
+        systemProperty("exclude-performance", "true")
+        systemProperty("exclude-pg-driver", "true")
+        systemProperty("exclude-pg-engine", "true")
+        systemProperty("exclude-sync-drivers", "true")
+    }
+}
+
+tasks.register<Test>("test-pg-multi-az-async") {
+    group = "verification"
+    filter.includeTestsMatching("integration.host.TestRunner.runTests")
+    doFirst {
+        systemProperty("exclude-docker", "true")
+        systemProperty("exclude-performance", "true")
+        systemProperty("exclude-aurora", "true")
+        systemProperty("exclude-mysql-driver", "true")
+        systemProperty("exclude-mysql-engine", "true")
+        systemProperty("exclude-mariadb-driver", "true")
+        systemProperty("exclude-mariadb-engine", "true")
+        systemProperty("exclude-bg", "true")
+        systemProperty("exclude-sync-drivers", "true")
+    }
+}
+
+tasks.register<Test>("test-mysql-multi-az-async") {
+    group = "verification"
+    filter.includeTestsMatching("integration.host.TestRunner.runTests")
+    doFirst {
+        systemProperty("exclude-docker", "true")
+        systemProperty("exclude-performance", "true")
+        systemProperty("exclude-aurora", "true")
+        systemProperty("exclude-pg-driver", "true")
+        systemProperty("exclude-pg-engine", "true")
+        systemProperty("exclude-bg", "true")
+        systemProperty("exclude-sync-drivers", "true")
     }
 }
 
