@@ -60,6 +60,41 @@ def test_async_dialect_import_dbapi_returns_adapter_wrapping_aio_submodule():
     assert adapter.apilevel == "2.0"
 
 
+def test_async_dialect_import_dbapi_sets_exec_status_on_cursor_class():
+    """Regression guard for AttributeError at
+    sqlalchemy/dialects/postgresql/psycopg.py:679 ("'NoneType' object
+    has no attribute 'TUPLES_OK'").
+
+    SA's native ``PGDialectAsync_psycopg.import_dbapi`` has a side
+    effect: it sets ``AsyncAdapt_psycopg_cursor._psycopg_ExecStatus``
+    to ``psycopg.pq.ExecStatus``. SA's async cursor.execute()
+    dereferences ``self._psycopg_ExecStatus.TUPLES_OK`` on every call.
+    Our dialect overrides ``import_dbapi`` wholesale, so without
+    mirroring that side effect the class attribute stays at its
+    default ``None`` and first cursor.execute() crashes.
+
+    This test resets the attribute to None, calls our
+    ``import_dbapi``, and confirms the assignment happens and matches
+    the real ``psycopg.pq.ExecStatus`` (identity check).
+    """
+    from psycopg.pq import ExecStatus
+    from sqlalchemy.dialects.postgresql.psycopg import \
+        AsyncAdapt_psycopg_cursor
+
+    # Blank slate: ensure the assignment must happen now, not rely
+    # on a prior test's leftover.
+    AsyncAdapt_psycopg_cursor._psycopg_ExecStatus = None
+    try:
+        AwsWrapperPGPsycopgAsyncDialect.import_dbapi()
+        assert AsyncAdapt_psycopg_cursor._psycopg_ExecStatus is ExecStatus
+        # Sanity: the thing SA's execute() actually reads is present.
+        assert AsyncAdapt_psycopg_cursor._psycopg_ExecStatus.TUPLES_OK \
+            is ExecStatus.TUPLES_OK
+    finally:
+        # Restore to the real value so downstream tests don't see None.
+        AsyncAdapt_psycopg_cursor._psycopg_ExecStatus = ExecStatus
+
+
 # ---- Registry tests -----------------------------------------------------
 
 

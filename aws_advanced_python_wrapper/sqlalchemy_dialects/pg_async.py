@@ -111,6 +111,27 @@ class AwsWrapperPGPsycopgAsyncDialect(PGDialectAsync_psycopg):
 
     @classmethod
     def import_dbapi(cls) -> AwsWrapperAsyncPsycopgAdaptDBAPI:
+        # Mirror PGDialectAsync_psycopg.import_dbapi's side effect:
+        # SA's AsyncAdapt_psycopg_cursor.execute reads
+        # self._psycopg_ExecStatus.TUPLES_OK
+        # (sqlalchemy/dialects/postgresql/psycopg.py:679). The class-
+        # level attribute defaults to None; SA's native import_dbapi
+        # sets it during engine init. Our override replaced the parent
+        # import_dbapi wholesale and skipped the assignment, so
+        # cursor.execute() crashed with
+        # "'NoneType' object has no attribute 'TUPLES_OK'" on first
+        # use. Explicit mirror of the side effect here (not
+        # super().import_dbapi()) -- avoids pulling in the parent's
+        # PsycopgAdaptDBAPI construction we don't need.
+        from psycopg.pq import ExecStatus
+        from sqlalchemy.dialects.postgresql.psycopg import \
+            AsyncAdapt_psycopg_cursor
+
+        # SA types this class attribute as ``None`` (its default value);
+        # narrow the ignore to the exact code rather than using a bare
+        # ``# type: ignore`` so unrelated errors on this line would
+        # still surface.
+        AsyncAdapt_psycopg_cursor._psycopg_ExecStatus = ExecStatus  # type: ignore[assignment]
         return AwsWrapperAsyncPsycopgAdaptDBAPI()
 
     @classmethod
