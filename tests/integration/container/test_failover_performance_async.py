@@ -230,38 +230,39 @@ class TestPerformanceAsync:
         downtime: AtomicInt = AtomicInt()
         elapsed_times: List[int] = []
 
+        proxy_connect_params = conn_utils.get_proxy_connect_params(
+            test_environment.get_proxy_writer().get_host())
+
         for _ in range(TestPerformanceAsync.REPEAT_TIMES):
             downtime.set(0)
 
-            aws_conn: Optional[AsyncAwsWrapperConnection] = None
-            aws_conn = await self._open_connect_with_retry_async(
-                test_driver,
-                conn_utils.get_proxy_connect_params(
-                    test_environment.get_proxy_writer().get_host()),
-                props)
-            try:
-                with ThreadPoolExecutor() as executor:
-                    try:
-                        futures = [
-                            executor.submit(
-                                self._stop_network_thread, test_environment, sleep_delay_sec, downtime),
-                            executor.submit(
-                                self._execute_async_in_thread,
-                                aws_conn, query, downtime, elapsed_times),
-                        ]
+            # The worker thread opens its own connection on its own persistent
+            # event loop and executes the sleep query there. The async driver's
+            # wait futures / stream locks bind to the loop the connection was
+            # opened on, so the connection cannot be shared with a different
+            # loop without RuntimeError: got Future attached to a different
+            # loop. Main-loop work here is limited to orchestration.
+            with ThreadPoolExecutor() as executor:
+                try:
+                    futures = [
+                        executor.submit(
+                            self._stop_network_thread, test_environment, sleep_delay_sec, downtime),
+                        executor.submit(
+                            self._execute_async_in_thread,
+                            test_driver, proxy_connect_params, props, query,
+                            downtime, elapsed_times),
+                    ]
 
-                        for future in as_completed(futures):
-                            future.result()
+                    for future in as_completed(futures):
+                        future.result()
 
-                    except Exception:
-                        traceback.print_exc()
-                        pytest.fail()
-                    finally:
-                        executor.shutdown(wait=False)
-                        ProxyHelper.enable_connectivity(
-                            test_environment.get_proxy_writer().get_instance_id())
-            finally:
-                await aws_conn.close()
+                except Exception:
+                    traceback.print_exc()
+                    pytest.fail()
+                finally:
+                    executor.shutdown(wait=False)
+                    ProxyHelper.enable_connectivity(
+                        test_environment.get_proxy_writer().get_instance_id())
 
         min_val: int = min(elapsed_times)
         max_val: int = max(elapsed_times)
@@ -302,18 +303,52 @@ class TestPerformanceAsync:
 
     def _execute_async_in_thread(
             self,
-            aws_conn: AsyncAwsWrapperConnection,
+            test_driver: TestDriver,
+            connect_params: Dict[str, int],
+            props: Properties,
             query: str,
             downtime: AtomicInt,
             elapsed_times: List[int]) -> None:
-        """Run an async cursor.execute inside a new event loop (called from a ThreadPoolExecutor thread)."""
-        async def _run() -> None:
+        """Open + execute on a persistent per-thread event loop.
+
+        Driver connection state binds to the event loop it was created on
+        (psycopg AsyncConnection wait futures, aiomysql stream locks), so
+        the connection must be opened and used on the SAME loop for the
+        thread's entire lifetime. Repeatedly calling ``asyncio.run`` (as
+        the earlier port did) creates a fresh loop per call and triggers
+        ``RuntimeError: got Future attached to a different loop`` or
+        silent hangs. Teardown closes the connection and calls
+        ``cleanup_async()`` on the same loop.
+        """
+        async def _open() -> AsyncAwsWrapperConnection:
+            return await self._open_connect_with_retry_async(test_driver, connect_params, props)
+
+        async def _run(aws_conn: AsyncAwsWrapperConnection) -> None:
             async with aws_conn.cursor() as cursor:
                 try:
                     await cursor.execute(query)
-                    pytest.fail("Sleep query finished, should not be possible with connectivity disabled")
+                    pytest.fail(
+                        "Sleep query finished, should not be possible with connectivity disabled")
                 except Exception:
                     failure_time: int = perf_counter_ns() - downtime.get()
                     elapsed_times.append(failure_time)
 
-        asyncio.run(_run())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            aws_conn: Optional[AsyncAwsWrapperConnection] = None
+            try:
+                aws_conn = loop.run_until_complete(_open())
+                loop.run_until_complete(_run(aws_conn))
+            finally:
+                if aws_conn is not None:
+                    try:
+                        loop.run_until_complete(aws_conn.close())
+                    except Exception:
+                        pass
+                try:
+                    loop.run_until_complete(cleanup_async())
+                except Exception:
+                    pass
+        finally:
+            loop.close()
