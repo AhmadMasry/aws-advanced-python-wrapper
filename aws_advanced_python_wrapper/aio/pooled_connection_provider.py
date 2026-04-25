@@ -121,3 +121,41 @@ class _AsyncPool:
                 await conn.close()
             except Exception:  # noqa: BLE001 - best-effort close
                 pass
+
+
+class _PooledAsyncConnectionProxy:
+    """Wraps a raw async connection acquired from a :class:`_AsyncPool`.
+
+    ``close()`` and ``__aexit__`` route to ``pool.release(...)`` instead
+    of closing the underlying connection. Use :meth:`invalidate` before
+    closing to force an actual close (e.g., after a SQL error left the
+    connection in a bad state).
+
+    All other attributes are delegated to the underlying connection via
+    ``__getattr__``, so cursor / transaction / driver-specific methods
+    work transparently.
+    """
+
+    def __init__(self, raw_conn: Any, pool: _AsyncPool):
+        # Set as instance attributes so __getattr__ doesn't fall through to raw_conn.
+        self._raw = raw_conn
+        self._pool = pool
+        self._invalidated = False
+
+    def invalidate(self) -> None:
+        self._invalidated = True
+
+    async def close(self) -> None:
+        await self._pool.release(self._raw, invalidated=self._invalidated)
+
+    async def __aenter__(self) -> _PooledAsyncConnectionProxy:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        # Only fires for attributes not on `self`. The `_raw` / `_pool` /
+        # `_invalidated` attributes set in __init__ shadow any equivalents
+        # on the underlying conn.
+        return getattr(self._raw, name)
