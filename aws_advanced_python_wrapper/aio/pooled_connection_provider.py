@@ -26,14 +26,31 @@ underlying pool (:class:`_AsyncPool`) holds raw async connections
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict,
+                    List, Optional, Set, Tuple)
 
+from aws_advanced_python_wrapper.aio.plugin import AsyncCanReleaseResources
+from aws_advanced_python_wrapper.aio.storage.sliding_expiration_cache_async import \
+    AsyncSlidingExpirationCache
 from aws_advanced_python_wrapper.errors import AwsWrapperError
+from aws_advanced_python_wrapper.host_selector import (
+    HighestWeightHostSelector, HostSelector, RandomHostSelector,
+    RoundRobinHostSelector, WeightedRandomHostSelector)
+from aws_advanced_python_wrapper.sql_alchemy_connection_provider import PoolKey
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
+from aws_advanced_python_wrapper.utils.properties import (Properties,
+                                                          WrapperProperties)
+from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
+from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
 
-if TYPE_CHECKING:  # noqa: TC005
-    pass
+if TYPE_CHECKING:
+    from aws_advanced_python_wrapper.aio.connection_provider import \
+        AsyncConnectionProvider  # noqa: F401  (Protocol the class satisfies)
+    from aws_advanced_python_wrapper.aio.driver_dialect.base import \
+        AsyncDriverDialect
+    from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
+    from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 
 logger = Logger(__name__)
 
@@ -159,3 +176,181 @@ class _PooledAsyncConnectionProxy:
         # `_invalidated` attributes set in __init__ shadow any equivalents
         # on the underlying conn.
         return getattr(self._raw, name)
+
+
+class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
+    """Async counterpart of :class:`SqlAlchemyPooledConnectionProvider`.
+
+    Per-host pooling keyed by ``PoolKey(host.url, extra_key)``. Pools
+    expire after a sliding window of inactivity (default 30 minutes).
+
+    Configuration callables mirror the sync class:
+
+      * ``pool_configurator(host_info, props) -> dict`` -- kwargs forwarded
+        to ``_AsyncPool.__init__`` (``max_size``, ``max_overflow``,
+        ``timeout_seconds``). Defaults if omitted.
+      * ``pool_mapping(host_info, props) -> str`` -- override the default
+        "user" extra-key for pool-cache lookup.
+      * ``accept_url_func(host_info, props) -> bool`` -- override the
+        default RDS-instance-only filter.
+
+    Five host-selector strategies supported: ``random``, ``round_robin``,
+    ``weighted_random``, ``highest_weight``, and ``least_connections``
+    (which counts active checked-out conns per host).
+    """
+
+    _POOL_EXPIRATION_CHECK_NS: ClassVar[int] = 30 * 60_000_000_000  # 30 minutes
+    _LEAST_CONNECTIONS: ClassVar[str] = "least_connections"
+
+    _accepted_strategies: ClassVar[Dict[str, HostSelector]] = {
+        "random": RandomHostSelector(),
+        "round_robin": RoundRobinHostSelector(),
+        "weighted_random": WeightedRandomHostSelector(),
+        "highest_weight": HighestWeightHostSelector(),
+    }
+    _rds_utils: ClassVar[RdsUtils] = RdsUtils()
+    _database_pools: ClassVar[AsyncSlidingExpirationCache] = (
+        AsyncSlidingExpirationCache(
+            should_dispose_func=lambda pool: pool.checkedout() == 0,
+            item_disposal_func=lambda pool: pool.dispose(),
+        )
+    )
+
+    def __init__(
+            self,
+            pool_configurator: Optional[Callable[[Any, Properties], Dict[str, Any]]] = None,
+            pool_mapping: Optional[Callable[[Any, Properties], str]] = None,
+            accept_url_func: Optional[Callable[[Any, Properties], bool]] = None,
+            pool_expiration_check_ns: int = -1,
+            pool_cleanup_interval_ns: int = -1,
+    ):
+        self._pool_configurator = pool_configurator
+        self._pool_mapping = pool_mapping
+        self._accept_url_func = accept_url_func
+
+        if pool_expiration_check_ns > -1:
+            AsyncPooledConnectionProvider._POOL_EXPIRATION_CHECK_NS = pool_expiration_check_ns
+        if pool_cleanup_interval_ns > -1:
+            AsyncPooledConnectionProvider._database_pools.set_cleanup_interval_ns(
+                pool_cleanup_interval_ns)
+
+    @property
+    def num_pools(self) -> int:
+        return len(AsyncPooledConnectionProvider._database_pools)
+
+    @property
+    def pool_urls(self) -> Set[str]:
+        return {pool_key.url for pool_key, _ in AsyncPooledConnectionProvider._database_pools.items()}
+
+    def keys(self) -> List[PoolKey]:
+        return AsyncPooledConnectionProvider._database_pools.keys()
+
+    def accepts_host_info(self, host_info: HostInfo, props: Properties) -> bool:
+        if self._accept_url_func is not None:
+            return self._accept_url_func(host_info, props)
+        url_type = AsyncPooledConnectionProvider._rds_utils.identify_rds_type(host_info.host)
+        return url_type == RdsUrlType.RDS_INSTANCE
+
+    def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
+        return (strategy == AsyncPooledConnectionProvider._LEAST_CONNECTIONS
+                or strategy in self._accepted_strategies)
+
+    def get_host_info_by_strategy(
+            self,
+            hosts: Tuple[HostInfo, ...],
+            role: HostRole,
+            strategy: str,
+            props: Optional[Properties],
+    ) -> HostInfo:
+        if not self.accepts_strategy(role, strategy):
+            raise AwsWrapperError(Messages.get_formatted(
+                "ConnectionProvider.UnsupportedHostSelectorStrategy",
+                strategy, type(self).__name__))
+
+        if strategy == AsyncPooledConnectionProvider._LEAST_CONNECTIONS:
+            valid_hosts = [host for host in hosts if host.role == role]
+            valid_hosts.sort(key=lambda host: self._num_connections(host))
+            if len(valid_hosts) == 0:
+                raise AwsWrapperError(Messages.get_formatted("HostSelector.NoHostsMatchingRole", role))
+            return valid_hosts[0]
+
+        return self._accepted_strategies[strategy].get_host(hosts, role, props)
+
+    def _num_connections(self, host_info: HostInfo) -> int:
+        total = 0
+        for pool_key, cache_item in AsyncPooledConnectionProvider._database_pools.items():
+            if pool_key.url == host_info.url:
+                total += cache_item.item.checkedout()
+        return total
+
+    async def connect(
+            self,
+            target_func: Callable[..., Awaitable[Any]],
+            driver_dialect: AsyncDriverDialect,
+            database_dialect: DatabaseDialect,
+            host_info: HostInfo,
+            props: Properties,
+    ) -> _PooledAsyncConnectionProxy:
+        pool_key = PoolKey(host_info.url, self._get_extra_key(host_info, props))
+
+        async def _create(_key: PoolKey) -> _AsyncPool:
+            return await self._create_pool(target_func, driver_dialect, database_dialect, host_info, props)
+
+        pool: Optional[_AsyncPool] = await AsyncPooledConnectionProvider._database_pools.compute_if_absent(
+            pool_key, _create, AsyncPooledConnectionProvider._POOL_EXPIRATION_CHECK_NS)
+        if pool is None:
+            raise AwsWrapperError(
+                Messages.get_formatted("AsyncPooledConnectionProvider.PoolNone", host_info.url))
+
+        raw_conn = await pool.acquire()
+        return _PooledAsyncConnectionProxy(raw_conn, pool)
+
+    def _get_extra_key(self, host_info: HostInfo, props: Properties) -> str:
+        if self._pool_mapping is not None:
+            return self._pool_mapping(host_info, props)
+        user = props.get(WrapperProperties.USER.name, None)
+        if user is None or user == "":
+            raise AwsWrapperError(Messages.get("AsyncPooledConnectionProvider.UnableToCreateDefaultKey"))
+        return user
+
+    async def _create_pool(
+            self,
+            target_func: Callable[..., Awaitable[Any]],
+            driver_dialect: AsyncDriverDialect,
+            database_dialect: DatabaseDialect,
+            host_info: HostInfo,
+            props: Properties,
+    ) -> _AsyncPool:
+        kwargs: Dict[str, Any] = (
+            {} if self._pool_configurator is None else self._pool_configurator(host_info, props))
+        prepared = driver_dialect.prepare_connect_info(host_info, props)
+        database_dialect.prepare_conn_props(prepared)
+        creator = self._get_connection_func(target_func, prepared)
+        return _AsyncPool(creator=creator, **kwargs)
+
+    def _get_connection_func(
+            self,
+            target_connect_func: Callable[..., Awaitable[Any]],
+            props: Properties,
+    ) -> Callable[[], Awaitable[Any]]:
+        async def _creator() -> Any:
+            return await target_connect_func(**props)
+        return _creator
+
+    async def release_resources(self) -> None:
+        items = list(AsyncPooledConnectionProvider._database_pools.items())
+        for _, cache_item in items:
+            try:
+                await cache_item.item.dispose()
+            except Exception:  # noqa: BLE001 - best-effort teardown; conns may already be dead
+                pass
+        await AsyncPooledConnectionProvider._database_pools.clear()
+
+
+__all__ = [
+    "AsyncPooledConnectionProvider",
+    "PoolKey",
+    # Private but re-exported for tests:
+    "_AsyncPool",
+    "_PooledAsyncConnectionProxy",
+]
