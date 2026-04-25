@@ -19,6 +19,8 @@ Structure:
   - ``aio.plugin`` -- ``AsyncPlugin`` / ``AsyncConnectionProvider`` ABCs
   - ``aio.driver_dialect`` -- the sole driver-specific interface
     (``AsyncDriverDialect`` ABC + per-driver concrete dialects)
+  - ``aio.pooled_connection_provider`` -- ``AsyncPooledConnectionProvider``
+    (per-host, per-user async pool with sliding expiration)
 
 Typical usage (once SP-2 lands the implementation)::
 
@@ -31,10 +33,13 @@ See the F3-B master spec for the overall design.
 
 from aws_advanced_python_wrapper.aio.cleanup import (register_shutdown_hook,
                                                      release_resources_async)
+from aws_advanced_python_wrapper.aio.pooled_connection_provider import \
+    AsyncPooledConnectionProvider
 from aws_advanced_python_wrapper.aio.wrapper import AsyncAwsWrapperConnection
 
 __all__ = [
     "AsyncAwsWrapperConnection",
+    "AsyncPooledConnectionProvider",
     "release_resources_async",
     "register_shutdown_hook",
 ]
