@@ -19,8 +19,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from aws_advanced_python_wrapper.aio.pooled_connection_provider import \
-    _AsyncPool
+from aws_advanced_python_wrapper.aio.pooled_connection_provider import (
+    _AsyncPool, _PooledAsyncConnectionProxy)
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 
 # ---------- _AsyncPool tests ----------
@@ -158,5 +158,75 @@ def test_pool_concurrent_acquire_release_keeps_checkedout_correct():
 
         await asyncio.gather(*(worker() for _ in range(n)))
         assert pool.checkedout() == 0
+
+    asyncio.run(inner())
+
+
+# ---------- _PooledAsyncConnectionProxy tests ----------
+
+
+def test_proxy_close_returns_to_pool_not_actual_close():
+    async def inner():
+        raw = AsyncMock()
+        raw.close = AsyncMock()
+        creator = AsyncMock(return_value=raw)
+        pool = _AsyncPool(creator=creator, max_size=2, max_overflow=0)
+        conn = await pool.acquire()
+        proxy = _PooledAsyncConnectionProxy(conn, pool)
+        await proxy.close()
+        # raw conn was NOT actually closed — returned to pool
+        raw.close.assert_not_awaited()
+        assert pool.checkedout() == 0
+        # Re-acquire returns the same raw
+        again = await pool.acquire()
+        assert again is raw
+
+    asyncio.run(inner())
+
+
+def test_proxy_aexit_returns_to_pool():
+    async def inner():
+        raw = AsyncMock()
+        raw.close = AsyncMock()
+        creator = AsyncMock(return_value=raw)
+        pool = _AsyncPool(creator=creator, max_size=2, max_overflow=0)
+        conn = await pool.acquire()
+        proxy = _PooledAsyncConnectionProxy(conn, pool)
+        async with proxy:
+            pass  # __aexit__ should release
+        raw.close.assert_not_awaited()
+        assert pool.checkedout() == 0
+
+    asyncio.run(inner())
+
+
+def test_proxy_invalidate_forces_actual_close_on_release():
+    async def inner():
+        raw = AsyncMock()
+        raw.close = AsyncMock()
+        creator = AsyncMock(return_value=raw)
+        pool = _AsyncPool(creator=creator, max_size=2, max_overflow=0)
+        conn = await pool.acquire()
+        proxy = _PooledAsyncConnectionProxy(conn, pool)
+        proxy.invalidate()
+        await proxy.close()
+        raw.close.assert_awaited_once()
+        assert pool.checkedout() == 0
+
+    asyncio.run(inner())
+
+
+def test_proxy_delegates_unknown_attrs_to_raw_conn():
+    async def inner():
+        raw = AsyncMock()
+        raw.cursor = AsyncMock(return_value="cursor-obj")
+        creator = AsyncMock(return_value=raw)
+        pool = _AsyncPool(creator=creator, max_size=2, max_overflow=0)
+        conn = await pool.acquire()
+        proxy = _PooledAsyncConnectionProxy(conn, pool)
+        # Access an attribute not defined on the proxy itself
+        result = await proxy.cursor()
+        assert result == "cursor-obj"
+        await proxy.close()
 
     asyncio.run(inner())
