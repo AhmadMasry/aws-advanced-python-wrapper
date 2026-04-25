@@ -32,9 +32,9 @@ if TYPE_CHECKING:
 
 from aws_advanced_python_wrapper.aio.connection_provider import \
     AsyncConnectionProviderManager
+from aws_advanced_python_wrapper.aio.pooled_connection_provider import \
+    AsyncPooledConnectionProvider
 from aws_advanced_python_wrapper.errors import FailoverSuccessError
-from aws_advanced_python_wrapper.sql_alchemy_connection_provider import \
-    SqlAlchemyPooledConnectionProvider
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.conditions import (
@@ -110,13 +110,13 @@ class TestAutoScalingAsync:
         instances: List[TestInstanceInfo] = TestEnvironment.get_current().get_info().get_database_info().get_instances()
         original_cluster_size = len(instances)
 
-        provider = SqlAlchemyPooledConnectionProvider(
+        provider = AsyncPooledConnectionProvider(
             lambda _, __: {"pool_size": original_cluster_size},
             None,
             None,
             120000000000,  # 2 minutes
             180000000000)  # 3 minutes
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             connections: List[AsyncAwsWrapperConnection] = []
@@ -183,13 +183,13 @@ class TestAutoScalingAsync:
 
         instances: List[TestInstanceInfo] = TestEnvironment.get_current().get_info().get_database_info().get_instances()
 
-        provider = SqlAlchemyPooledConnectionProvider(
+        provider = AsyncPooledConnectionProvider(
             lambda _, __: {"pool_size": len(instances) * 5},
             None,
             None,
             120000000000,  # 2 minutes
             180000000000)  # 3 minutes
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             connections: List[AsyncAwsWrapperConnection] = []
