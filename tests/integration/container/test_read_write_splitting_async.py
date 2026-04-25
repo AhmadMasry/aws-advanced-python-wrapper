@@ -25,11 +25,8 @@ Translation notes vs the sync file:
 - ``rds_utils.query_instance_id(conn)`` → ``await query_instance_id_async(conn, rds_utils)``
 - ``rds_utils.assert_first_query_throws(conn, exc)`` → ``await assert_first_query_throws_async(conn, rds_utils, exc)``
 - ``rds_utils.create_user(conn, ...)`` → ``await _create_user_async(conn, ...)``
-- Pooled-connection tests use ``AsyncConnectionProviderManager`` in place of
-  ``ConnectionProviderManager``; ``SqlAlchemyPooledConnectionProvider``
-  satisfies the duck-typed ``AsyncConnectionProvider`` protocol for the
-  strategy/host-filter calls but its ``connect`` is sync, so those tests
-  document the gap until an async pool provider is available.
+- Pooled-connection tests use ``AsyncConnectionProviderManager`` and
+  ``AsyncPooledConnectionProvider`` (the real async pool provider).
 """
 
 from __future__ import annotations
@@ -44,11 +41,11 @@ from sqlalchemy import PoolProxiedConnection
 from aws_advanced_python_wrapper import release_resources
 from aws_advanced_python_wrapper.aio.connection_provider import \
     AsyncConnectionProviderManager
+from aws_advanced_python_wrapper.aio.pooled_connection_provider import \
+    AsyncPooledConnectionProvider
 from aws_advanced_python_wrapper.errors import (
     AwsWrapperError, FailoverFailedError, FailoverSuccessError,
     ReadWriteSplittingError, TransactionResolutionUnknownError)
-from aws_advanced_python_wrapper.sql_alchemy_connection_provider import \
-    SqlAlchemyPooledConnectionProvider
 from aws_advanced_python_wrapper.utils import services_container
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import (Properties,
@@ -888,8 +885,8 @@ class TestReadWriteSplittingAsync:
     def test_pooled_connection__reuses_cached_connection_async(
         self, test_driver: TestDriver, conn_utils, props
     ):
-        provider = SqlAlchemyPooledConnectionProvider(lambda _, __: {"pool_size": 1})
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        provider = AsyncPooledConnectionProvider(lambda _, __: {"pool_size": 1})
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             try:
@@ -922,8 +919,8 @@ class TestReadWriteSplittingAsync:
     def test_pooled_connection__failover_async(
         self, test_driver: TestDriver, rds_utils, conn_utils, failover_props
     ):
-        provider = SqlAlchemyPooledConnectionProvider(lambda _, __: {"pool_size": 1})
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        provider = AsyncPooledConnectionProvider(lambda _, __: {"pool_size": 1})
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             try:
@@ -972,8 +969,8 @@ class TestReadWriteSplittingAsync:
     def test_pooled_connection__cluster_url_failover_async(
         self, test_driver: TestDriver, rds_utils, conn_utils, failover_props
     ):
-        provider = SqlAlchemyPooledConnectionProvider(lambda _, __: {"pool_size": 1})
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        provider = AsyncPooledConnectionProvider(lambda _, __: {"pool_size": 1})
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             try:
@@ -983,7 +980,7 @@ class TestReadWriteSplittingAsync:
                     **dict(failover_props),
                 )
                 # The internal connection pool should not be used if the connection is established via a cluster URL.
-                assert 0 == len(SqlAlchemyPooledConnectionProvider._database_pools)
+                assert 0 == len(AsyncPooledConnectionProvider._database_pools)
 
                 initial_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert not isinstance(conn.target_connection, PoolProxiedConnection)
@@ -995,7 +992,7 @@ class TestReadWriteSplittingAsync:
 
                 new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert initial_writer_id != new_writer_id
-                assert 0 == len(SqlAlchemyPooledConnectionProvider._database_pools)
+                assert 0 == len(AsyncPooledConnectionProvider._database_pools)
 
                 assert not isinstance(conn.target_connection, PoolProxiedConnection)
                 new_driver_conn = conn.target_connection
@@ -1024,12 +1021,12 @@ class TestReadWriteSplittingAsync:
     ):
         plugin_name, _ = plugin_config
         writer_host = test_environment.get_writer().get_host()
-        provider = SqlAlchemyPooledConnectionProvider(
+        provider = AsyncPooledConnectionProvider(
             lambda _, __: {"pool_size": 1},
             None,
             lambda host_info, props: writer_host in host_info.host,
         )
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         WrapperProperties.FAILOVER_TIMEOUT_SEC.set(proxied_failover_props, "1")
         WrapperProperties.FAILURE_DETECTION_TIME_MS.set(proxied_failover_props, "1000")
@@ -1076,8 +1073,8 @@ class TestReadWriteSplittingAsync:
     def test_pooled_connection__failover_in_transaction_async(
         self, test_driver: TestDriver, rds_utils, conn_utils, failover_props
     ):
-        provider = SqlAlchemyPooledConnectionProvider(lambda _, __: {"pool_size": 1})
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        provider = AsyncPooledConnectionProvider(lambda _, __: {"pool_size": 1})
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             try:
@@ -1137,8 +1134,8 @@ class TestReadWriteSplittingAsync:
         conn_utils,
         props,
     ):
-        provider = SqlAlchemyPooledConnectionProvider(lambda _, __: {"pool_size": 1})
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        provider = AsyncPooledConnectionProvider(lambda _, __: {"pool_size": 1})
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             privileged_user_props = conn_utils.get_connect_params().copy()
@@ -1231,10 +1228,10 @@ class TestReadWriteSplittingAsync:
         WrapperProperties.READER_HOST_SELECTOR_STRATEGY.set(props, "least_connections")
 
         instances = test_environment.get_instances()
-        provider = SqlAlchemyPooledConnectionProvider(
+        provider = AsyncPooledConnectionProvider(
             lambda _, __: {"pool_size": len(instances)}
         )
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             connections = []
@@ -1290,12 +1287,12 @@ class TestReadWriteSplittingAsync:
         instances = test_environment.get_instances()
         overloaded_reader_connection_count = 3
         num_test_connections = (len(instances) - 2) * overloaded_reader_connection_count
-        provider = SqlAlchemyPooledConnectionProvider(
+        provider = AsyncPooledConnectionProvider(
             lambda _, __: {"pool_size": num_test_connections},
             # Create a new pool for each instance-arbitrary_prop combination
-            lambda host_info, conn_props: f"{host_info.url}-{len(SqlAlchemyPooledConnectionProvider._database_pools)}",
+            lambda host_info, conn_props: f"{host_info.url}-{len(AsyncPooledConnectionProvider._database_pools)}",
         )
-        AsyncConnectionProviderManager.set_connection_provider(provider)  # type: ignore[arg-type]
+        AsyncConnectionProviderManager.set_connection_provider(provider)
 
         async def inner():
             connections = []
@@ -1313,7 +1310,7 @@ class TestReadWriteSplittingAsync:
                     )
                     connections.append(conn)
                 assert overloaded_reader_connection_count == len(
-                    SqlAlchemyPooledConnectionProvider._database_pools
+                    AsyncPooledConnectionProvider._database_pools
                 )
 
                 for _ in range(num_test_connections):
