@@ -1,3 +1,6 @@
+.claude/**
+CLAUDE.local.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -158,4 +161,6 @@ cython_debug/
 .vs/
 .gradle/
 **/.gradle
+.gradle-home/
+**/.gradle-home
 

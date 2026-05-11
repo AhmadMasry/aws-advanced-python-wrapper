@@ -1146,6 +1146,8 @@ public class TestEnvironment implements AutoCloseable {
         return "python:3.12";
       case PYTHON_3_13:
         return "python:3.13";
+      case PYTHON_3_14:
+        return "python:3.14";
       default:
         throw new UnsupportedOperationException(request.getTargetPythonVersion().toString());
     }
