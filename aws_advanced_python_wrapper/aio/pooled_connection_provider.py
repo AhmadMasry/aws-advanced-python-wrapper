@@ -202,6 +202,39 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
     _POOL_EXPIRATION_CHECK_NS: ClassVar[int] = 30 * 60_000_000_000  # 30 minutes
     _LEAST_CONNECTIONS: ClassVar[str] = "least_connections"
 
+    # See sync ``SqlAlchemyPooledConnectionProvider._TRANSIENT_CONNECT_SQLSTATES``
+    # for the full rationale. Aurora's promoted writer can spend 15-60s
+    # rejecting connections with ``57P03`` ("the database system is
+    # starting up") right after a failover; the async pool's creator
+    # (``_creator`` below) bypasses the wrapper's plugin chain when it
+    # refills, so this layer must do its own retry.
+    _TRANSIENT_CONNECT_SQLSTATES: ClassVar[frozenset] = frozenset({
+        "57P01",  # admin_shutdown
+        "57P02",  # crash_shutdown
+        "57P03",  # cannot_connect_now ("the database system is starting up")
+        "08006",  # connection_failure (also covers MySQL transient connect errors)
+    })
+    # See sync counterpart for rationale: libpq wire-level errors carry no
+    # SQLSTATE; classify by message prefix the same way
+    # ``pg_exception_handler._NETWORK_ERROR_MESSAGES`` does so we retry on
+    # the same surface the wrapper already considers network-transient.
+    _TRANSIENT_CONNECT_MESSAGE_PREFIXES: ClassVar[Tuple[str, ...]] = (
+        "connection failed",
+        "consuming input failed",
+        "connection socket closed",
+        "the connection is closed",
+    )
+    _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = 6
+    _TRANSIENT_CONNECT_BACKOFF_S: ClassVar[float] = 5.0
+
+    @classmethod
+    def _is_transient_connect_error(cls, exc: BaseException) -> bool:
+        sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+        if sqlstate in cls._TRANSIENT_CONNECT_SQLSTATES:
+            return True
+        msg = str(exc.args[0]) if exc.args else str(exc)
+        return any(msg.startswith(p) for p in cls._TRANSIENT_CONNECT_MESSAGE_PREFIXES)
+
     _accepted_strategies: ClassVar[Dict[str, HostSelector]] = {
         "random": RandomHostSelector(),
         "round_robin": RoundRobinHostSelector(),
@@ -211,8 +244,8 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
     _rds_utils: ClassVar[RdsUtils] = RdsUtils()
     _database_pools: ClassVar[AsyncSlidingExpirationCache] = (
         AsyncSlidingExpirationCache(
-            should_dispose_func=lambda pool: pool.checkedout() == 0,
-            item_disposal_func=lambda pool: pool.dispose(),
+            should_dispose_func=lambda pool_pair: pool_pair[0].checkedout() == 0,
+            item_disposal_func=lambda pool_pair: pool_pair[0].dispose(),
         )
     )
 
@@ -280,7 +313,8 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
         total = 0
         for pool_key, cache_item in AsyncPooledConnectionProvider._database_pools.items():
             if pool_key.url == host_info.url:
-                total += cache_item.item.checkedout()
+                pool, _ = cache_item.item
+                total += pool.checkedout()
         return total
 
     async def connect(
@@ -293,14 +327,21 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
     ) -> _PooledAsyncConnectionProxy:
         pool_key = PoolKey(host_info.url, self._get_extra_key(host_info, props))
 
-        async def _create(_key: PoolKey) -> _AsyncPool:
+        async def _create(_key: PoolKey) -> Tuple[_AsyncPool, Properties]:
             return await self._create_pool(target_func, driver_dialect, database_dialect, host_info, props)
 
-        pool: Optional[_AsyncPool] = await AsyncPooledConnectionProvider._database_pools.compute_if_absent(
+        db_pool: Optional[Tuple[_AsyncPool, Properties]] = await AsyncPooledConnectionProvider._database_pools.compute_if_absent(
             pool_key, _create, AsyncPooledConnectionProvider._POOL_EXPIRATION_CHECK_NS)
-        if pool is None:
+        if db_pool is None:
             raise AwsWrapperError(
                 Messages.get_formatted("AsyncPooledConnectionProvider.PoolNone", host_info.url))
+
+        pool, creator_props = db_pool
+        # Refresh the password held by the pool's creator closure so subsequent new
+        # connections use the latest credential (e.g. a freshly minted IAM token).
+        password = WrapperProperties.PASSWORD.get(props)
+        if password is not None:
+            creator_props[WrapperProperties.PASSWORD.name] = password
 
         raw_conn = await pool.acquire()
         return _PooledAsyncConnectionProxy(raw_conn, pool)
@@ -320,13 +361,13 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
             database_dialect: DatabaseDialect,
             host_info: HostInfo,
             props: Properties,
-    ) -> _AsyncPool:
+    ) -> Tuple[_AsyncPool, Properties]:
         kwargs: Dict[str, Any] = (
             {} if self._pool_configurator is None else self._pool_configurator(host_info, props))
         prepared = driver_dialect.prepare_connect_info(host_info, props)
         database_dialect.prepare_conn_props(prepared)
         creator = self._get_connection_func(target_func, prepared)
-        return _AsyncPool(creator=creator, **kwargs)
+        return _AsyncPool(creator=creator, **kwargs), prepared
 
     def _get_connection_func(
             self,
@@ -334,14 +375,29 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
             props: Properties,
     ) -> Callable[[], Awaitable[Any]]:
         async def _creator() -> Any:
-            return await target_connect_func(**props)
+            last_exc: Optional[BaseException] = None
+            for attempt in range(self._TRANSIENT_CONNECT_MAX_ATTEMPTS):
+                try:
+                    return await target_connect_func(**props)
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    if self._is_transient_connect_error(exc) \
+                            and attempt < self._TRANSIENT_CONNECT_MAX_ATTEMPTS - 1:
+                        await asyncio.sleep(self._TRANSIENT_CONNECT_BACKOFF_S)
+                        continue
+                    raise
+            # Defensive: loop exits via return or raise above; keeps mypy
+            # from inferring an implicit ``None`` return.
+            assert last_exc is not None
+            raise last_exc
         return _creator
 
     async def release_resources(self) -> None:
         items = list(AsyncPooledConnectionProvider._database_pools.items())
         for _, cache_item in items:
             try:
-                await cache_item.item.dispose()
+                pool, _ = cache_item.item
+                await pool.dispose()
             except Exception:  # noqa: BLE001 - best-effort teardown; conns may already be dead
                 pass
         await AsyncPooledConnectionProvider._database_pools.clear()

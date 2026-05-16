@@ -168,6 +168,18 @@ class AsyncOpenedConnectionTracker:
 
         for conn in to_close:
             try:
+                # Prefer .invalidate() for pool-proxied connections (e.g.
+                # SQLAlchemy's ``_AsyncConnectionFairy``) so the underlying
+                # driver conn is closed AND removed from the pool's tracking.
+                # Plain close() on a pool fairy returns it to the pool, which
+                # would later hand a broken connection back to the next caller
+                # after writer failover.
+                inv = getattr(conn, "invalidate", None)
+                if callable(inv):
+                    result = inv()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    continue
                 close = getattr(conn, "close", None)
                 if close is None:
                     continue

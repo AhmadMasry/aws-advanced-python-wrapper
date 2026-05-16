@@ -160,6 +160,21 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("test_driver", allowed_drivers)
 
 
+def pytest_collection_modifyitems(config, items):
+    # When the env feature SKIP_ASYNC_DRIVER_TESTS is set, skip every test in a
+    # *_async.py file. These tests call connect_async / create_async_engine_for_driver,
+    # which only support PG_ASYNC / MYSQL_ASYNC; passing the sync driver raises
+    # UnsupportedOperationError. Several async test classes lack the class-level
+    # @disable_on_features guard and otherwise leak through in aurora envs that have
+    # FAILOVER_SUPPORTED / IAM / SECRETS_MANAGER / ABORT_CONNECTION_SUPPORTED set.
+    if TestEnvironmentFeatures.SKIP_ASYNC_DRIVER_TESTS not in TestEnvironment.get_current().get_features():
+        return
+    skip_marker = pytest.mark.skip(reason="async test excluded by SKIP_ASYNC_DRIVER_TESTS env feature")
+    for item in items:
+        if "_async.py" in str(item.fspath):
+            item.add_marker(skip_marker)
+
+
 def pytest_sessionstart(session):
     TestEnvironment.get_current()
 

@@ -34,13 +34,14 @@ if TYPE_CHECKING:
 
 @disable_on_features([TestEnvironmentFeatures.RUN_AUTOSCALING_TESTS_ONLY,
                       TestEnvironmentFeatures.BLUE_GREEN_DEPLOYMENT,
-                      TestEnvironmentFeatures.PERFORMANCE])
+                      TestEnvironmentFeatures.PERFORMANCE,
+                      TestEnvironmentFeatures.SKIP_ASYNC_DRIVER_TESTS])
 class TestBasicFunctionalityAsync:
 
     @pytest.fixture(scope='class')
     def props(self):
         p: Properties = Properties({
-            "plugins": "aurora_connection_tracker,failover",
+            "plugins": "aurora_connection_tracker,failover_v2",
             "connect_timeout": 10,
             "autocommit": True,
             "cluster_id": "cluster1"})

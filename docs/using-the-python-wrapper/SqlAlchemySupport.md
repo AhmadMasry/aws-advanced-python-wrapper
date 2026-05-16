@@ -24,7 +24,7 @@ engine = create_engine(
         "host=database.cluster-xyz.us-east-1.rds.amazonaws.com "
         "dbname=db user=john password=pwd",
         wrapper_dialect="aurora-pg",
-        plugins="failover,efm",
+        plugins="failover,host_monitoring_v2",
     ),
 )
 
@@ -53,7 +53,7 @@ engine = create_engine(
         "host=database.cluster-xyz.us-east-1.rds.amazonaws.com "
         "database=db user=john password=pwd",
         wrapper_dialect="aurora-mysql",
-        plugins="failover,efm",
+        plugins="failover,host_monitoring_v2",
         use_pure=True,
     ),
 )
@@ -81,7 +81,7 @@ from sqlalchemy import create_engine
 engine = create_engine(
     "aws_wrapper_postgresql+psycopg://john:pwd@"
     "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
-    "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm"
+    "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2"
 )
 ```
 
@@ -93,7 +93,7 @@ from sqlalchemy import create_engine
 engine = create_engine(
     "aws_wrapper_mysql+mysqlconnector://john:pwd@"
     "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
-    "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,efm&use_pure=True"
+    "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,host_monitoring_v2&use_pure=True"
 )
 ```
 
@@ -160,7 +160,7 @@ async def main() -> None:
     engine = create_async_engine(
         "aws_wrapper_postgresql+psycopg_async://john:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
-        "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm"
+        "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2"
     )
     try:
         async with engine.connect() as conn:
@@ -179,7 +179,7 @@ asyncio.run(main())
 The async path:
 
 - Drives `psycopg.AsyncConnection` (PG) or `aiomysql` (MySQL) end-to-end. No greenlet hops through the wrapper's own pipeline — only SA's engine itself uses greenlet to adapt async DBAPI results.
-- Supports the same wrapper plugins via `wrapper_plugins`: `failover`, `efm` (host monitoring), `read_write_splitting`, `iam`, `aws_secrets_manager`, plus the minor/observability plugins.
+- Supports the same wrapper plugins via `wrapper_plugins`: `failover`, `host_monitoring_v2`, `read_write_splitting`, `iam`, `aws_secrets_manager`, plus the minor/observability plugins.
 
 Async MySQL usage (via aiomysql):
 
@@ -188,7 +188,7 @@ async def main() -> None:
     engine = create_async_engine(
         "aws_wrapper_mysql+aiomysql_async://john:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
-        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,efm"
+        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,host_monitoring_v2"
     )
     try:
         async with engine.connect() as conn:

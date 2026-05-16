@@ -38,14 +38,15 @@ if TYPE_CHECKING:
 
 @disable_on_features([TestEnvironmentFeatures.RUN_AUTOSCALING_TESTS_ONLY,
                       TestEnvironmentFeatures.BLUE_GREEN_DEPLOYMENT,
-                      TestEnvironmentFeatures.PERFORMANCE])
+                      TestEnvironmentFeatures.PERFORMANCE,
+                      TestEnvironmentFeatures.SKIP_ASYNC_DRIVER_TESTS])
 class TestBasicConnectivityAsync:
 
     @pytest.fixture(scope='class')
     def props(self):
         # By default, don't load the host_monitoring plugin so that the test doesn't require abort connection support
         p: Properties = Properties({
-            WrapperProperties.PLUGINS.name: "aurora_connection_tracker,failover",
+            WrapperProperties.PLUGINS.name: "aurora_connection_tracker,failover_v2",
             "connect_timeout": 3,
             "autocommit": True,
             "cluster_id": "cluster1"})

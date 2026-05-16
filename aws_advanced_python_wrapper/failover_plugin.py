@@ -377,6 +377,42 @@ class FailoverPlugin(Plugin):
             except Exception:
                 pass
 
+        # For pool-proxied connections (e.g. SQLAlchemy's _ConnectionFairy),
+        # mark the pool record as invalidated so the next checkout creates
+        # a fresh connection instead of handing back this (likely broken)
+        # one. We do this in two steps:
+        #
+        # 1) Null out the pool record's ``dbapi_connection`` reference
+        #    *before* invalidating. With ``soft=True``, SA leaves the
+        #    dbapi_connection attached and on the next checkout calls
+        #    ``__close(terminate=False)`` on it -- which on a connection
+        #    whose libpq socket died during failover blows up inside
+        #    ``do_rollback`` with "the connection is lost" and propagates
+        #    back out as the next user's connect failure. Clearing the
+        #    reference here makes SA take the "create new" branch on
+        #    next checkout instead of the "try to close existing" branch.
+        #
+        # 2) Use ``inv(soft=True)`` rather than ``inv()`` to skip libpq
+        #    teardown on the failover-trigger thread; tearing down libpq
+        #    here would contend with the parallel libpq+TLS connects the
+        #    ReaderFailoverHandler is launching concurrently and has
+        #    historically produced SIGSEGV/SIGBUS on multi-instance
+        #    Aurora topologies.
+        inv = getattr(conn, "invalidate", None)
+        if callable(inv):
+            try:
+                record = getattr(conn, "_connection_record", None)
+                if record is not None and getattr(record, "dbapi_connection", None) is not None:
+                    record.dbapi_connection = None
+                inv(soft=True)
+            except TypeError:
+                # ``invalidate`` exists but doesn't accept ``soft=`` --
+                # fall through to ``.close()`` rather than calling
+                # ``inv()`` with synchronous libpq teardown.
+                pass
+            except Exception:
+                pass
+
         try:
             return driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close())
         except Exception:

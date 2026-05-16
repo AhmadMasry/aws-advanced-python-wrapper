@@ -184,6 +184,30 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
                                      lambda: self.target_connection.close())
         self.release_resources()
 
+    def invalidate(self) -> None:
+        """Mark this connection as invalid and evict it from any owning pool.
+
+        For pool-proxied targets (e.g. SQLAlchemy's ``_ConnectionFairy``),
+        calls the underlying ``.invalidate()`` which closes the driver
+        connection AND removes it from the pool's tracking, so the next
+        pool checkout creates a fresh connection. For raw driver
+        connections (no ``invalidate`` method), falls back to ``close()``.
+
+        Use ``invalidate()`` when the connection is known to be in a
+        broken state (e.g. after a failover-eligible exception); use
+        ``close()`` when the connection was used normally and you intend
+        the pool to keep the underlying socket for reuse.
+        """
+        inv = getattr(self.target_connection, "invalidate", None)
+        if callable(inv):
+            try:
+                inv()
+                self.release_resources()
+                return
+            except Exception:  # noqa: BLE001 - fall through to close
+                pass
+        self.close()
+
     def cursor(self, *args: Any, **kwargs: Any) -> AwsWrapperCursor:
         _cursor = self._plugin_manager.execute(self.target_connection, DbApiMethod.CONNECTION_CURSOR,
                                                lambda: self.target_connection.cursor(*args, **kwargs),
@@ -269,6 +293,20 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
         return self.target_connection.adapters
 
     @property
+    def closed(self) -> bool:
+        """Whether the underlying driver connection is closed.
+
+        psycopg3 exposes ``closed`` as a sync bool property; SA's psycopg
+        dialect reads it during pool-invalidation paths
+        (``sqlalchemy/dialects/postgresql/psycopg.py:595``) after a DBAPI
+        exception is classified. The wrapper has the plugin-aware sync
+        ``is_closed`` property, but SA's dialect probes the unprefixed
+        ``closed`` attribute directly. Without this passthrough, SA's
+        post-exception cleanup raises AttributeError on our proxy.
+        """
+        return bool(getattr(self.target_connection, "closed", False))
+
+    @property
     def prepare_threshold(self) -> Any:
         return self.target_connection.prepare_threshold
 
@@ -319,13 +357,14 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
             *,
             prepare: Any = None,
             binary: bool = False) -> Any:
-        # psycopg3's Connection.execute() opens an internal cursor and
-        # issues the query as a shortcut. The returned cursor is the
-        # driver's raw cursor, NOT our plugin-intercepting
-        # AwsWrapperCursor -- callers who need failover/RWS interception
-        # on the query should use conn.cursor().execute(...) instead.
-        return self.target_connection.execute(
-            query, params, prepare=prepare, binary=binary)
+        # psycopg3's Connection.execute() is a shortcut that opens a cursor
+        # and runs the query in one call. Route via our cursor so the query
+        # goes through the plugin chain (failover, RWS, etc.) instead of
+        # bypassing it -- otherwise SQLAlchemy and other psycopg-aware
+        # callers can issue SQL that's invisible to plugins.
+        cursor = self.cursor()
+        cursor.execute(query, params, prepare=prepare, binary=binary)
+        return cursor
 
     def pipeline(self) -> Any:
         return self.target_connection.pipeline()
@@ -404,18 +443,19 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def run_async(self, fn: Callable[[Any], Awaitable[Any]]) -> Any:
         """Match ``sqlalchemy.engine.interfaces.AdaptedConnection.run_async``.
 
-        SA docs: "Run the awaitable returned by the given function,
-        which is passed the raw asyncio driver connection. Used to
-        invoke awaitable-only methods on the driver connection within
-        the context of a synchronous method, like a connection pool
-        event handler."
-
-        Calling this from an already-running event loop will raise
-        through ``await_only`` -- same behavior as SA's built-in
-        implementation.
+        SA's contract is "pass the raw asyncio driver connection to fn,
+        then await its result". On this sync wrapper ``target_connection``
+        is a *sync* DBAPI connection -- there is no asyncio driver conn
+        to hand to ``fn``. Honoring the call here would either error
+        inside ``fn`` or silently misbehave. Surface the misuse instead:
+        sync engines should not be invoking ``run_async`` on their pool
+        connections in the first place.
         """
-        from sqlalchemy.util.concurrency import await_only
-        return await_only(fn(self.target_connection))
+        raise NotImplementedError(
+            "run_async is not supported on the sync AwsWrapperConnection; "
+            "the target connection is sync, not asyncio. Use the async "
+            "wrapper if you need run_async semantics."
+        )
 
     def release_resources(self):
         self._plugin_manager.release_resources()

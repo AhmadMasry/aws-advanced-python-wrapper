@@ -55,7 +55,7 @@ class AsyncPluginManager:
         self._plugin_service = plugin_service
         self._props = props
         # Explicit list of plugins is what SP-1 accepts. SP-4+ will add a
-        # factory-registry-based constructor overload so `plugins="failover,efm"`
+        # factory-registry-based constructor overload so `plugins="failover,host_monitoring_v2"`
         # in connection props can build the list.
         user_plugins: List[AsyncPlugin] = list(plugins) if plugins else []
         self._plugins: List[AsyncPlugin] = [

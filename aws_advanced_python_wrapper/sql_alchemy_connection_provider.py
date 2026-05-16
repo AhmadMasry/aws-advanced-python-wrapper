@@ -14,7 +14,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional, Tuple
+import time
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
@@ -51,9 +52,9 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
                                                      "weighted_random": WeightedRandomHostSelector(),
                                                      "highest_weight": HighestWeightHostSelector()}
     _rds_utils: ClassVar[RdsUtils] = RdsUtils()
-    _database_pools: ClassVar[SlidingExpirationCache[PoolKey, QueuePool]] = SlidingExpirationCache(
-        should_dispose_func=lambda queue_pool: queue_pool.checkedout() == 0,
-        item_disposal_func=lambda queue_pool: queue_pool.dispose()
+    _database_pools: ClassVar[SlidingExpirationCache[PoolKey, Tuple[QueuePool, Properties]]] = SlidingExpirationCache(
+        should_dispose_func=lambda pool_pair: pool_pair[0].checkedout() == 0,
+        item_disposal_func=lambda pool_pair: pool_pair[0].dispose()
     )
 
     def __init__(
@@ -119,7 +120,8 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
         num_connections = 0
         for pool_key, cache_item in SqlAlchemyPooledConnectionProvider._database_pools.items():
             if pool_key.url == host_info.url:
-                num_connections += cache_item.item.checkedout()
+                queue_pool, _ = cache_item.item
+                num_connections += queue_pool.checkedout()
         return num_connections
 
     def connect(
@@ -129,14 +131,21 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
             database_dialect: DatabaseDialect,
             host_info: HostInfo,
             props: Properties):
-        queue_pool: Optional[QueuePool] = SqlAlchemyPooledConnectionProvider._database_pools.compute_if_absent(
+        db_pool: Optional[Tuple[QueuePool, Properties]] = SqlAlchemyPooledConnectionProvider._database_pools.compute_if_absent(
             PoolKey(host_info.url, self._get_extra_key(host_info, props)),
             lambda _: self._create_pool(target_func, driver_dialect, database_dialect, host_info, props),
             SqlAlchemyPooledConnectionProvider._POOL_EXPIRATION_CHECK_NS
         )
 
-        if queue_pool is None:
+        if db_pool is None:
             raise AwsWrapperError(Messages.get_formatted("SqlAlchemyPooledConnectionProvider.PoolNone", host_info.url))
+
+        queue_pool, creator_props = db_pool
+        # Refresh the password held by the pool's creator closure so subsequent new
+        # connections use the latest credential (e.g. a freshly minted IAM token).
+        password = WrapperProperties.PASSWORD.get(props)
+        if password is not None:
+            creator_props[WrapperProperties.PASSWORD.name] = password
 
         return queue_pool.connect()
 
@@ -163,10 +172,61 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
         prepared_properties = driver_dialect.prepare_connect_info(host_info, props)
         database_dialect.prepare_conn_props(prepared_properties)
         kwargs["creator"] = self._get_connection_func(target_func, prepared_properties)
-        return self._create_sql_alchemy_pool(**kwargs)
+        return self._create_sql_alchemy_pool(**kwargs), prepared_properties
+
+    # PostgreSQL SQLSTATEs (and a MySQL-side equivalent) signaling that a
+    # connection failed because the server is not yet accepting connections,
+    # not because the network/host is broken. Aurora's promoted writer can
+    # spend 15-60s in this state right after a failover, and SA's pool
+    # refill goes straight through ``target_connect_func`` and bypasses
+    # the wrapper's plugin chain — so this layer must do its own retry.
+    _TRANSIENT_CONNECT_SQLSTATES: ClassVar[frozenset] = frozenset({
+        "57P01",  # admin_shutdown
+        "57P02",  # crash_shutdown
+        "57P03",  # cannot_connect_now ("the database system is starting up")
+        "08006",  # connection_failure (also covers MySQL's transient connect errors)
+    })
+    # libpq-level errors that come back WITHOUT a SQLSTATE (the server
+    # closed the TCP/SSL socket before sending a protocol-level error
+    # response). Aurora emits these during the rotation window. Patterns
+    # mirror ``pg_exception_handler._NETWORK_ERROR_MESSAGES`` so we
+    # retry on the same surface the wrapper already classifies as
+    # network-transient.
+    _TRANSIENT_CONNECT_MESSAGE_PREFIXES: ClassVar[Tuple[str, ...]] = (
+        "connection failed",
+        "consuming input failed",
+        "connection socket closed",
+        "the connection is closed",
+    )
+    _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = 6
+    _TRANSIENT_CONNECT_BACKOFF_S: ClassVar[float] = 5.0
+
+    @classmethod
+    def _is_transient_connect_error(cls, exc: BaseException) -> bool:
+        sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+        if sqlstate in cls._TRANSIENT_CONNECT_SQLSTATES:
+            return True
+        msg = str(exc.args[0]) if exc.args else str(exc)
+        return any(msg.startswith(p) for p in cls._TRANSIENT_CONNECT_MESSAGE_PREFIXES)
 
     def _get_connection_func(self, target_connect_func: Callable, props: Properties):
-        return lambda: target_connect_func(**props)
+        def _connect_with_transient_retry() -> Any:
+            last_exc: Optional[BaseException] = None
+            for attempt in range(self._TRANSIENT_CONNECT_MAX_ATTEMPTS):
+                try:
+                    return target_connect_func(**props)
+                except Exception as exc:
+                    last_exc = exc
+                    if self._is_transient_connect_error(exc) \
+                            and attempt < self._TRANSIENT_CONNECT_MAX_ATTEMPTS - 1:
+                        time.sleep(self._TRANSIENT_CONNECT_BACKOFF_S)
+                        continue
+                    raise
+            # Defensive: loop exits via return or raise above; this is
+            # unreachable but keeps mypy from inferring an implicit None.
+            assert last_exc is not None
+            raise last_exc
+        return _connect_with_transient_retry
 
     def _create_sql_alchemy_pool(self, **kwargs):
         return pool.QueuePool(**kwargs)
@@ -174,7 +234,8 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
     def release_resources(self):
         for _, cache_item in SqlAlchemyPooledConnectionProvider._database_pools.items():
             try:
-                cache_item.item.dispose()
+                queue_pool, _ = cache_item.item
+                queue_pool.dispose()
             except Exception:
                 # Swallow exception, connections may already be dead
                 pass

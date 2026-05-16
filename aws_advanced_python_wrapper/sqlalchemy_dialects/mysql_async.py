@@ -28,7 +28,7 @@ Example::
     engine = create_async_engine(
         "aws_wrapper_mysql+aiomysql_async://user:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
-        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,efm"
+        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,host_monitoring_v2"
     )
 """
 
@@ -39,6 +39,11 @@ from typing import Any
 from sqlalchemy.dialects.mysql.aiomysql import (AsyncAdapt_aiomysql_connection,
                                                 MySQLDialect_aiomysql)
 from sqlalchemy.util.concurrency import await_only
+
+from aws_advanced_python_wrapper.pep249 import \
+    OperationalError as _PEP249OperationalError
+from aws_advanced_python_wrapper.sqlalchemy_dialects._exception_handling import \
+    _AsyncFailoverSuccessRewrapMixin
 
 
 class AwsWrapperAsyncAiomysqlAdaptDBAPI:
@@ -84,12 +89,20 @@ class AwsWrapperAsyncAiomysqlAdaptDBAPI:
         )
 
 
-class AwsWrapperMySQLAiomysqlAsyncDialect(MySQLDialect_aiomysql):
+class AwsWrapperMySQLAiomysqlAsyncDialect(
+        _AsyncFailoverSuccessRewrapMixin, MySQLDialect_aiomysql):
     """Async SQLAlchemy dialect that uses the AWS Advanced Python Wrapper as its DBAPI."""
 
     driver = "aiomysql_async"
     supports_statement_cache = True
     is_async = True
+
+    # See _AsyncFailoverSuccessRewrapMixin / sqlalchemy_dialects/pg.py.
+    # ``dialect.dbapi.OperationalError`` resolves to the wrapper's PEP-249
+    # ``OperationalError`` via the shim's ``_dbapi.install`` — rewrap
+    # target must be that class for SA's classifier to wrap us to
+    # ``sqlalchemy.exc.OperationalError``.
+    _failover_success_target_cls = _PEP249OperationalError
 
     @classmethod
     def import_dbapi(cls) -> Any:  # type: ignore[override]

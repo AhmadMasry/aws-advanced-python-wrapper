@@ -445,6 +445,16 @@ class AsyncAwsWrapperConnection:
         return self._target_conn.adapters
 
     @property
+    def closed(self) -> bool:
+        """Whether the underlying driver connection is closed.
+
+        SA's psycopg(-async) dialect reads ``closed`` directly during
+        pool-invalidation paths after a DBAPI exception is classified.
+        Mirrors the sync wrapper's ``closed`` passthrough.
+        """
+        return bool(getattr(self._target_conn, "closed", False))
+
+    @property
     def prepare_threshold(self) -> Any:
         return self._target_conn.prepare_threshold
 
@@ -490,14 +500,15 @@ class AsyncAwsWrapperConnection:
             *,
             prepare: Any = None,
             binary: bool = False) -> Any:
-        # psycopg3's AsyncConnection.execute() opens an internal
-        # cursor and awaits the query as a shortcut. The returned
-        # cursor is the driver's raw async cursor, NOT our
-        # plugin-intercepting AsyncAwsWrapperCursor -- callers who
-        # need failover/RWS interception on the query should use
-        # conn.cursor().execute(...) instead.
-        return await self._target_conn.execute(
-            query, params, prepare=prepare, binary=binary)
+        # psycopg3's AsyncConnection.execute() is a shortcut that opens
+        # a cursor and runs the query in one call. Route via our cursor
+        # so the query goes through the plugin chain (failover, RWS,
+        # etc.) instead of bypassing it -- otherwise SQLAlchemy and
+        # other psycopg-aware callers can issue SQL that's invisible
+        # to plugins.
+        cursor = self.cursor()
+        await cursor.execute(query, params, prepare=prepare, binary=binary)
+        return cursor
 
     def pipeline(self) -> Any:
         return self._target_conn.pipeline()
@@ -584,7 +595,7 @@ class AsyncAwsWrapperConnection:
             * ``list[AsyncPlugin]`` -- explicit plugin instances; takes
               precedence over any ``plugins`` connection-property string.
             * ``str`` -- comma-separated plugin codes (e.g.,
-              ``"failover,efm"``); routed into the props dict and
+              ``"failover,host_monitoring_v2"``); routed into the props dict and
               resolved via :mod:`plugin_factory`.
             * ``None`` -- defer to the ``plugins`` connection-property
               string (if present); when absent, no plugins load.
@@ -693,6 +704,24 @@ class AsyncAwsWrapperConnection:
         await self._plugin_manager.execute(
             self, DbApiMethod.CONNECTION_CLOSE, _call,
         )
+
+    async def invalidate(self) -> None:
+        """Async equivalent of :meth:`AwsWrapperConnection.invalidate`.
+
+        Prefers the target's ``invalidate()`` (sync or async) when the
+        target is a pool fairy, so the pool evicts the entry; falls back
+        to ``close()`` for raw driver connections.
+        """
+        inv = getattr(self._target_conn, "invalidate", None)
+        if callable(inv):
+            try:
+                result = inv()
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception:  # noqa: BLE001 - fall through to close
+                pass
+        await self.close()
 
     async def commit(self) -> None:
         async def _call() -> Any:

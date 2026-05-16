@@ -16,7 +16,7 @@
 
 URL-based async engine usage (SP-9). The dialect `aws_wrapper_postgresql+psycopg_async`
 routes `create_async_engine` through `AsyncAwsWrapperConnection`, so all wrapper
-plugins (failover, EFM, etc. -- landing in later sub-projects) are available in
+plugins (failover, host_monitoring_v2, etc. -- landing in later sub-projects) are available in
 async apps.
 
 The wrapper's `plugins` connection property is spelled `wrapper_plugins` in the
@@ -42,7 +42,7 @@ def build_engine():
     return create_async_engine(
         f"aws_wrapper_postgresql+psycopg_async://{USER}:{PASSWORD}@"
         f"{CLUSTER_ENDPOINT}:5432/{DB_NAME}"
-        "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm",
+        "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2",
     )
 
 

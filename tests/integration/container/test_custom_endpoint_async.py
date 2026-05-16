@@ -498,10 +498,16 @@ class TestCustomEndpointAsync:
                 writer_id = str(rds_utils.get_cluster_writer_instance_id())
 
                 reader_id_to_add = ""
-                # Get any reader id
+                # Get any reader id that is neither the AWS-truth writer nor the
+                # wrapper's currently-observed writer. After a failover, the
+                # wrapper's SQL-queried ``original_writer_id`` may briefly lag
+                # AWS's view (cluster topology refresh hasn't completed), so we
+                # must exclude both to avoid emitting a duplicate-id StaticMembers
+                # list which RDS rejects with InvalidParameterValueException.
                 for instance in instances:
-                    if instance.get_instance_id() != writer_id:
-                        reader_id_to_add = instance.get_instance_id()
+                    instance_id = instance.get_instance_id()
+                    if instance_id != writer_id and instance_id != original_writer_id:
+                        reader_id_to_add = instance_id
                         break
 
                 rds_client = client('rds', region_name=TestEnvironment.get_current().get_aurora_region())

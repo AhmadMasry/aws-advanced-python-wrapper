@@ -400,6 +400,25 @@ class FailoverV2Plugin(Plugin):
             except Exception:
                 pass
 
+        # See failover_plugin.py:_invalidate_current_connection for the full
+        # rationale. Short version: clearing the pool record's
+        # ``dbapi_connection`` reference before ``inv(soft=True)`` keeps
+        # SA's next checkout on the "create new" branch instead of
+        # rolling back the dead libpq socket, and ``soft=True`` keeps
+        # libpq teardown off the failover-trigger thread to avoid
+        # contention with the parallel reader-probe connects.
+        inv = getattr(conn, "invalidate", None)
+        if callable(inv):
+            try:
+                record = getattr(conn, "_connection_record", None)
+                if record is not None and getattr(record, "dbapi_connection", None) is not None:
+                    record.dbapi_connection = None
+                inv(soft=True)
+            except TypeError:
+                pass
+            except Exception:
+                pass
+
         try:
             self._plugin_service.driver_dialect.execute(
                         DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close())

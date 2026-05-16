@@ -55,7 +55,12 @@ def _is_mysql(test_driver: TestDriver) -> bool:
 
 
 def _sa_url(test_driver: TestDriver) -> str:
-    return "mysql+mysqlconnector://" if _is_mysql(test_driver) else "postgresql+psycopg://"
+    # Use the wrapper-aware SA dialects (registered via pyproject entry points)
+    # so SA's internal isinstance(...psycopg.Connection) checks see the native
+    # connection via the wrapper's _type_info_fetch override. The built-in
+    # ``postgresql+psycopg``/``mysql+mysqlconnector`` dialects do not unwrap
+    # AwsWrapperConnection and raise TypeError on lazy type fetches.
+    return "aws_wrapper_mysql+mysqlconnector://" if _is_mysql(test_driver) else "aws_wrapper_postgresql+psycopg://"
 
 
 def _wrapper_dialect(test_driver: TestDriver) -> str:
@@ -118,7 +123,7 @@ class TestSqlAlchemy:
         initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
 
         engine = _build_engine(
-            test_driver, conn_utils.get_connect_params(), plugins="failover,efm",
+            test_driver, conn_utils.get_connect_params(), plugins="failover,host_monitoring_v2",
         )
         try:
             with engine.connect() as conn:

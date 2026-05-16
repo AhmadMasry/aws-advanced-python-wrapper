@@ -26,12 +26,25 @@ from __future__ import annotations
 from sqlalchemy.dialects.mysql.mysqlconnector import \
     MySQLDialect_mysqlconnector
 
+from aws_advanced_python_wrapper.pep249 import \
+    OperationalError as _PEP249OperationalError
+from aws_advanced_python_wrapper.sqlalchemy_dialects._exception_handling import \
+    _FailoverSuccessRewrapMixin
 
-class AwsWrapperMySQLConnectorDialect(MySQLDialect_mysqlconnector):
+
+class AwsWrapperMySQLConnectorDialect(
+        _FailoverSuccessRewrapMixin, MySQLDialect_mysqlconnector):
     """SQLAlchemy dialect that uses the AWS Advanced Python Wrapper as its DBAPI."""
 
     driver = "mysqlconnector"
     supports_statement_cache = True
+
+    # See _FailoverSuccessRewrapMixin / sqlalchemy_dialects/pg.py for the
+    # full rationale. The shim's ``dialect.dbapi.OperationalError`` resolves
+    # to the wrapper's PEP-249 ``OperationalError`` via ``_dbapi.install``,
+    # so the rewrap target must be that class for SA's classifier to wrap
+    # us to ``sqlalchemy.exc.OperationalError``.
+    _failover_success_target_cls = _PEP249OperationalError
 
     @classmethod
     def import_dbapi(cls):

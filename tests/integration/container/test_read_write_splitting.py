@@ -828,7 +828,7 @@ class TestReadWriteSplitting:
                          TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
     @disable_on_engines([DatabaseEngine.MYSQL])
-    @pytest.mark.repeat(10)  # Run this test case a few more times since it is a flakey test
+    @pytest.mark.repeat(3)
     def test_pooled_connection__failover_failed(
         self,
         test_environment: TestEnvironment,
@@ -848,9 +848,12 @@ class TestReadWriteSplitting:
         )
         ConnectionProviderManager.set_connection_provider(provider)
 
-        WrapperProperties.FAILOVER_TIMEOUT_SEC.set(proxied_failover_props, "1")
-        WrapperProperties.FAILURE_DETECTION_TIME_MS.set(proxied_failover_props, "1000")
-        WrapperProperties.FAILURE_DETECTION_COUNT.set(proxied_failover_props, "1")
+        WrapperProperties.FAILOVER_TIMEOUT_SEC.set(proxied_failover_props, "10")
+        WrapperProperties.FAILURE_DETECTION_TIME_MS.set(proxied_failover_props, "5000")
+        WrapperProperties.FAILURE_DETECTION_INTERVAL_MS.set(proxied_failover_props, "2000")
+        WrapperProperties.FAILURE_DETECTION_COUNT.set(proxied_failover_props, "2")
+        WrapperProperties.CLUSTER_TOPOLOGY_HIGH_REFRESH_RATE_MS.set(proxied_failover_props, "1000")
+        WrapperProperties.FAILOVER_READER_CONNECT_TIMEOUT_SEC.set(proxied_failover_props, "5")
         WrapperProperties.PLUGINS.set(proxied_failover_props, plugin_name + "," + plugins)
 
         target_driver_connect = DriverHelper.get_connect_func(test_driver)

@@ -16,7 +16,7 @@
 
 Mirrors sync :class:`PluginFactory` / `PluginManager.PLUGIN_FACTORIES`. Lets
 users configure the async plugin list via a connection-property string
-(``plugins="failover,efm,iam"``) instead of instantiating plugin classes in
+(``plugins="failover,host_monitoring_v2,iam"``) instead of instantiating plugin classes in
 code.
 """
 
@@ -267,7 +267,6 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "failover_v2": _FailoverFactory(),  # alias -- sync has two failover
                                         # plugins; async ships one with
                                         # failover_v2's semantics.
-    "efm": _HostMonitoringFactory(),
     "host_monitoring": _HostMonitoringFactory(),
     "host_monitoring_v2": _HostMonitoringFactory(),
     "read_write_splitting": _ReadWriteSplittingFactory(),

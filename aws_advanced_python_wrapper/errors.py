@@ -16,6 +16,40 @@ from typing import Optional
 
 from .pep249 import Error, InterfaceError, NotSupportedError, OperationalError
 
+# Driver-native OperationalError classes — used as additional bases on
+# FailoverSuccessError so SQLAlchemy's exception classifier reclassifies
+# it to ``sqlalchemy.exc.OperationalError`` (SA checks
+# ``isinstance(exc, dialect.dbapi.OperationalError)`` where the right-hand
+# side is the driver's *own* class, not the wrapper's PEP-249 class).
+#
+# Each is conditionally imported so the wrapper still works when only one
+# driver is installed. The stand-in classes (``class _NoXOpError(Exception)``)
+# never get matched at runtime because the corresponding driver isn't
+# installed -- they exist only to keep the multiple-inheritance declaration
+# valid.
+#
+# All three drivers' OperationalError classes share ``Exception`` as their
+# common ancestor (psycopg.errors.Error / mysql.connector.errors.Error /
+# aiomysql.OperationalError-via-pymysql.err.MySQLError each inherit directly
+# from Exception), so Python's C3 linearization produces a well-defined MRO.
+try:
+    from psycopg import OperationalError as _PsycopgOpError
+except ImportError:
+    class _PsycopgOpError(Exception):  # type: ignore[no-redef]
+        pass
+
+try:
+    from mysql.connector.errors import OperationalError as _MCOpError
+except ImportError:
+    class _MCOpError(Exception):  # type: ignore[no-redef]
+        pass
+
+try:
+    from aiomysql import OperationalError as _AiomysqlOpError
+except ImportError:
+    class _AiomysqlOpError(Exception):  # type: ignore[no-redef]
+        pass
+
 
 class AwsWrapperError(Error):
     __module__ = "aws_advanced_python_wrapper"
@@ -50,7 +84,15 @@ class FailoverFailedError(FailoverError):
     __module__ = "aws_advanced_python_wrapper"
 
 
-class FailoverSuccessError(FailoverError):
+class FailoverSuccessError(FailoverError, _PsycopgOpError, _MCOpError, _AiomysqlOpError):
+    # Inheriting from the driver-native OperationalError classes makes
+    # ``isinstance(exc, dialect.dbapi.OperationalError)`` return True for
+    # SA's classifier, so a successful failover surfaces to SA users as
+    # ``sqlalchemy.exc.OperationalError`` (retryable by SA's standard
+    # idioms). For non-SA users, ``except FailoverSuccessError:`` and
+    # ``except psycopg.OperationalError:`` (or mysql/aiomysql equivalents)
+    # both work -- and that's the correct semantic: a failover *is* a
+    # connection-level operational error from the DBAPI's perspective.
     __module__ = "aws_advanced_python_wrapper"
 
 

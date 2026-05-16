@@ -106,7 +106,7 @@ class TestSqlAlchemyAsync:
                 port=conn_utils.port,
                 dbname=conn_utils.dbname,
                 wrapper_dialect=_wrapper_dialect_async(test_driver),
-                wrapper_plugins="failover,efm",
+                wrapper_plugins="failover,host_monitoring_v2",
             )
             try:
                 async with engine.connect() as conn:

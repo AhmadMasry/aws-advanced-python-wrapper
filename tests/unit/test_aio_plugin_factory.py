@@ -56,7 +56,7 @@ def test_registry_covers_every_shipped_async_plugin():
     """Every F3-B async plugin must be resolvable by a plugin code."""
     expected_codes = {
         "failover", "failover_v2",
-        "efm", "host_monitoring", "host_monitoring_v2",
+        "host_monitoring", "host_monitoring_v2",
         "read_write_splitting",
         "iam", "aws_secrets_manager",
         "aurora_connection_tracker",
@@ -72,14 +72,14 @@ def test_registry_covers_every_shipped_async_plugin():
 
 
 def test_parse_plugins_property_returns_list_from_comma_string():
-    props = Properties({"plugins": "failover,efm,iam"})
-    assert parse_plugins_property(props) == ["failover", "efm", "iam"]
+    props = Properties({"plugins": "failover,host_monitoring_v2,iam"})
+    assert parse_plugins_property(props) == ["failover", "host_monitoring_v2", "iam"]
 
 
 def test_parse_plugins_property_trims_whitespace_and_drops_empties():
-    props = Properties({"plugins": " failover , , efm "})
+    props = Properties({"plugins": " failover , , host_monitoring_v2 "})
     # Entries trimmed; empty entries (" , ") dropped.
-    assert parse_plugins_property(props) == ["failover", "efm"]
+    assert parse_plugins_property(props) == ["failover", "host_monitoring_v2"]
 
 
 def test_parse_plugins_property_returns_none_when_unset():
@@ -97,7 +97,7 @@ def test_parse_plugins_property_returns_empty_when_blank_string():
 
 
 def test_resolve_factories_maps_codes_to_instances():
-    factories = resolve_plugin_factories(["failover", "efm", "iam"])
+    factories = resolve_plugin_factories(["failover", "host_monitoring_v2", "iam"])
     assert len(factories) == 3
     assert isinstance(factories[0], _FailoverFactory)
     assert isinstance(factories[1], _HostMonitoringFactory)

@@ -40,6 +40,8 @@ from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.failover_mode import (FailoverMode,
                                                              get_failover_mode)
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
+from aws_advanced_python_wrapper.utils.telemetry.telemetry import \
+    TelemetryTraceLevel
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -75,6 +77,23 @@ class AsyncFailoverPlugin(AsyncPlugin):
         self._host_list_provider = host_list_provider
         self._props = props
         self._enabled = WrapperProperties.ENABLE_FAILOVER.get_bool(props)
+        # API parity with sync ``failover_v2_plugin.py``: accept the v2-style
+        # ``enable_connect_failover`` toggle alongside the v1-style
+        # ``enable_failover``. Sync v2 uses this to gate connect-time failover
+        # behavior (see failover_v2_plugin.py:140-150). Async failover
+        # currently only triggers on the execute path, not the connect path,
+        # so this flag is recognized but only takes effect once async grows
+        # connect-time failover. The flag must be true (the default) AND
+        # ``enable_failover`` must be true for any failover (connect or
+        # execute) to occur, matching sync v2's gating.
+        self._enable_connect_failover = (
+            WrapperProperties.ENABLE_CONNECT_FAILOVER.get_bool(props))
+        # When set, async failover emits a top-level copy of the per-failover
+        # telemetry span at FORCE_TOP_LEVEL trace level. Mirrors sync v2
+        # behavior at ``failover_v2_plugin.py:81-82,248-252,386-390`` so
+        # users with X-Ray/OTLP sampling-by-top-level see failover events.
+        self._telemetry_failover_additional_top_trace = (
+            WrapperProperties.TELEMETRY_FAILOVER_ADDITIONAL_TOP_TRACE.get_bool(props))
         timeout = WrapperProperties.FAILOVER_TIMEOUT_SEC.get_float(props)
         self._failover_timeout_sec = float(timeout) if timeout is not None else 300.0
         self._mode = self._determine_mode(props)
@@ -115,7 +134,9 @@ class AsyncFailoverPlugin(AsyncPlugin):
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
         # Initial connect just passes through; failover only kicks in on
-        # later errors.
+        # later errors. When async grows connect-time failover, it will be
+        # gated by ``self._enabled and self._enable_connect_failover``,
+        # matching the sync v2 path at ``failover_v2_plugin.py:140``.
         return await connect_func()
 
     async def execute(
@@ -183,6 +204,12 @@ class AsyncFailoverPlugin(AsyncPlugin):
         Mirrors sync v2 _failover_reader / _failover_writer at
         failover_v2_plugin.py:254-310 / :323-390.
         """
+        # Invalidate the current (likely broken) connection before
+        # attempting failover so any pool-proxied target is evicted from
+        # the owning pool. Mirrors sync v2 _invalidate_current_connection
+        # called from _failover at ``failover_v2_plugin.py:201``.
+        await self._invalidate_current_connection()
+
         deadline = asyncio.get_event_loop().time() + self._failover_timeout_sec
         last_error: Optional[BaseException] = None
 
@@ -211,6 +238,28 @@ class AsyncFailoverPlugin(AsyncPlugin):
             last_error: Optional[BaseException]) -> None:
         if self._failover_reader_triggered is not None:
             self._failover_reader_triggered.inc()
+        # Open a telemetry span around the failover-to-reader operation;
+        # mirrors sync v2 at ``failover_v2_plugin.py:218-219``. Closed in
+        # the finally block below.
+        telemetry_factory = self._plugin_service.get_telemetry_factory()
+        telemetry_context = telemetry_factory.open_telemetry_context(
+            "failover to replica", TelemetryTraceLevel.NESTED)
+        try:
+            await self._failover_reader_impl(
+                topology, driver_dialect, deadline, last_error)
+        finally:
+            if telemetry_context is not None:
+                telemetry_context.close_context()
+                if self._telemetry_failover_additional_top_trace:
+                    telemetry_factory.post_copy(
+                        telemetry_context, TelemetryTraceLevel.FORCE_TOP_LEVEL)
+
+    async def _failover_reader_impl(
+            self,
+            topology: Topology,
+            driver_dialect: AsyncDriverDialect,
+            deadline: float,
+            last_error: Optional[BaseException]) -> None:
         reader_candidates = [h for h in topology if h.role == HostRole.READER]
         original_writer = next(
             (h for h in topology if h.role == HostRole.WRITER), None)
@@ -282,6 +331,28 @@ class AsyncFailoverPlugin(AsyncPlugin):
             last_error: Optional[BaseException]) -> None:
         if self._failover_writer_triggered is not None:
             self._failover_writer_triggered.inc()
+        # Open a telemetry span around the failover-to-writer operation;
+        # mirrors sync v2 at ``failover_v2_plugin.py:325-326``. Closed in
+        # the finally block below.
+        telemetry_factory = self._plugin_service.get_telemetry_factory()
+        telemetry_context = telemetry_factory.open_telemetry_context(
+            "failover to writer host", TelemetryTraceLevel.NESTED)
+        try:
+            await self._failover_writer_impl(
+                topology, driver_dialect, deadline, last_error)
+        finally:
+            if telemetry_context is not None:
+                telemetry_context.close_context()
+                if self._telemetry_failover_additional_top_trace:
+                    telemetry_factory.post_copy(
+                        telemetry_context, TelemetryTraceLevel.FORCE_TOP_LEVEL)
+
+    async def _failover_writer_impl(
+            self,
+            topology: Topology,
+            driver_dialect: AsyncDriverDialect,
+            deadline: float,
+            last_error: Optional[BaseException]) -> None:
         while asyncio.get_event_loop().time() < deadline:
             writer = next(
                 (h for h in topology if h.role == HostRole.WRITER), None)
@@ -313,6 +384,57 @@ class AsyncFailoverPlugin(AsyncPlugin):
             "Failover could not establish a new writer within "
             f"{self._failover_timeout_sec}s"
         ) from last_error
+
+    async def _invalidate_current_connection(self) -> None:
+        """Invalidate the current connection prior to attempting failover.
+
+        For pool-proxied targets (SQLAlchemy's async ``_ConnectionFairy``),
+        marks the pool record as invalidated so the next checkout returns
+        a fresh connection instead of handing back this (likely broken)
+        one. Mirrors sync ``failover_plugin._invalidate_current_connection``:
+
+        1) Null out the record's ``dbapi_connection`` BEFORE invalidating.
+           With ``soft=True``, SA leaves the dbapi_connection attached and
+           on the next checkout calls ``__close(terminate=False)`` on it --
+           which on a connection whose libpq socket died during failover
+           raises "the connection is lost" inside do_rollback. Clearing
+           the reference here makes SA take the "create new" branch on
+           next checkout.
+        2) Use ``inv(soft=True)`` rather than ``inv()`` so the underlying
+           driver connection is NOT torn down on this thread. The async
+           event loop doesn't share the sync wrapper's libpq-thread race
+           surface, but the dead-conn rollback issue is the same and the
+           ``soft=True`` keeps the recycle semantics identical to sync.
+        """
+        conn = self._plugin_service.current_connection
+        if conn is None:
+            return
+        inv = getattr(conn, "invalidate", None)
+        if callable(inv):
+            try:
+                record = getattr(conn, "_connection_record", None)
+                if record is not None and getattr(record, "dbapi_connection", None) is not None:
+                    record.dbapi_connection = None
+                result = inv(soft=True)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except TypeError:
+                # ``invalidate`` exists but doesn't accept ``soft=`` --
+                # fall through to ``.close()`` rather than calling
+                # ``inv()`` with synchronous teardown.
+                pass
+            except Exception:  # noqa: BLE001 - fall through to close
+                pass
+        close = getattr(conn, "close", None)
+        if close is None:
+            return
+        try:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
 
     async def _open_connection(
             self,

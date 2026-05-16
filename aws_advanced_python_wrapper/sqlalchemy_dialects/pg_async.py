@@ -28,7 +28,7 @@ Example::
     engine = create_async_engine(
         "aws_wrapper_postgresql+psycopg_async://user:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
-        "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm"
+        "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2"
     )
 """
 
@@ -41,6 +41,11 @@ from sqlalchemy.dialects.postgresql.psycopg import (
     PGDialectAsync_psycopg)
 from sqlalchemy.util import asbool
 from sqlalchemy.util.concurrency import await_fallback, await_only
+
+from aws_advanced_python_wrapper.pep249 import \
+    OperationalError as _PEP249OperationalError
+from aws_advanced_python_wrapper.sqlalchemy_dialects._exception_handling import \
+    _AsyncFailoverSuccessRewrapMixin
 
 
 class AwsWrapperAsyncPsycopgAdaptDBAPI:
@@ -102,7 +107,8 @@ class AwsWrapperAsyncPsycopgAdaptDBAPI:
         return AsyncAdapt_psycopg_connection(await_only(coro))
 
 
-class AwsWrapperPGPsycopgAsyncDialect(PGDialectAsync_psycopg):
+class AwsWrapperPGPsycopgAsyncDialect(
+        _AsyncFailoverSuccessRewrapMixin, PGDialectAsync_psycopg):
     """Async SQLAlchemy dialect that uses the AWS Advanced Python Wrapper as its DBAPI.
 
     Wrapper-specific override pattern
@@ -126,6 +132,13 @@ class AwsWrapperPGPsycopgAsyncDialect(PGDialectAsync_psycopg):
 
     driver = "psycopg_async"
     supports_statement_cache = True
+
+    # See _AsyncFailoverSuccessRewrapMixin / sqlalchemy_dialects/pg.py.
+    # ``dialect.dbapi.OperationalError`` resolves to the wrapper's PEP-249
+    # ``OperationalError`` via the shim's ``_dbapi.install`` — rewrap
+    # target must be that class for SA's classifier to wrap us to
+    # ``sqlalchemy.exc.OperationalError``.
+    _failover_success_target_cls = _PEP249OperationalError
     is_async = True
 
     def _type_info_fetch(self, connection: Any, name: str) -> Any:
