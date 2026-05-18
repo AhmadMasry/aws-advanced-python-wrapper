@@ -33,6 +33,7 @@ from aws_advanced_python_wrapper.plugin import CanReleaseResources
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
+from aws_advanced_python_wrapper.utils import transient_connect
 from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
 from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
 from aws_advanced_python_wrapper.utils.storage.sliding_expiration_cache import \
@@ -174,40 +175,12 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
         kwargs["creator"] = self._get_connection_func(target_func, prepared_properties)
         return self._create_sql_alchemy_pool(**kwargs), prepared_properties
 
-    # PostgreSQL SQLSTATEs (and a MySQL-side equivalent) signaling that a
-    # connection failed because the server is not yet accepting connections,
-    # not because the network/host is broken. Aurora's promoted writer can
-    # spend 15-60s in this state right after a failover, and SA's pool
-    # refill goes straight through ``target_connect_func`` and bypasses
-    # the wrapper's plugin chain — so this layer must do its own retry.
-    _TRANSIENT_CONNECT_SQLSTATES: ClassVar[frozenset] = frozenset({
-        "57P01",  # admin_shutdown
-        "57P02",  # crash_shutdown
-        "57P03",  # cannot_connect_now ("the database system is starting up")
-        "08006",  # connection_failure (also covers MySQL's transient connect errors)
-    })
-    # libpq-level errors that come back WITHOUT a SQLSTATE (the server
-    # closed the TCP/SSL socket before sending a protocol-level error
-    # response). Aurora emits these during the rotation window. Patterns
-    # mirror ``pg_exception_handler._NETWORK_ERROR_MESSAGES`` so we
-    # retry on the same surface the wrapper already classifies as
-    # network-transient.
-    _TRANSIENT_CONNECT_MESSAGE_PREFIXES: ClassVar[Tuple[str, ...]] = (
-        "connection failed",
-        "consuming input failed",
-        "connection socket closed",
-        "the connection is closed",
-    )
-    _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = 6
-    _TRANSIENT_CONNECT_BACKOFF_S: ClassVar[float] = 5.0
-
-    @classmethod
-    def _is_transient_connect_error(cls, exc: BaseException) -> bool:
-        sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
-        if sqlstate in cls._TRANSIENT_CONNECT_SQLSTATES:
-            return True
-        msg = str(exc.args[0]) if exc.args else str(exc)
-        return any(msg.startswith(p) for p in cls._TRANSIENT_CONNECT_MESSAGE_PREFIXES)
+    # SA's pool refill goes straight through ``target_connect_func`` and
+    # bypasses the wrapper's plugin chain, so this layer needs its own
+    # transient-retry. Classification and backoff are centralised in
+    # ``utils.transient_connect`` so all retry sites (sync pool, async
+    # pool, Django backend) stay in sync.
+    _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = transient_connect.DEFAULT_MAX_ATTEMPTS
 
     def _get_connection_func(self, target_connect_func: Callable, props: Properties):
         def _connect_with_transient_retry() -> Any:
@@ -217,9 +190,9 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
                     return target_connect_func(**props)
                 except Exception as exc:
                     last_exc = exc
-                    if self._is_transient_connect_error(exc) \
+                    if transient_connect.is_transient_connect_error(exc) \
                             and attempt < self._TRANSIENT_CONNECT_MAX_ATTEMPTS - 1:
-                        time.sleep(self._TRANSIENT_CONNECT_BACKOFF_S)
+                        time.sleep(transient_connect.compute_backoff(attempt))
                         continue
                     raise
             # Defensive: loop exits via return or raise above; this is

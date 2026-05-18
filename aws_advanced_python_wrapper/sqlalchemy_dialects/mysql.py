@@ -59,3 +59,45 @@ class AwsWrapperMySQLConnectorDialect(
         if wrapper_plugins is not None:
             kwargs["plugins"] = wrapper_plugins
         return args, kwargs
+
+    def _detect_charset(self, connection):
+        # SA's MySQLDialect_mysqlconnector._detect_charset does
+        # ``return connection.connection.charset``. That ``.charset`` walks
+        # _AdhocProxiedConnection.__getattr__ → dbapi_connection, landing
+        # on AwsWrapperConnection which (in the sync wrapper) has no
+        # generic attribute passthrough. Reach the underlying mysql-
+        # connector connection through the wrapper's explicit
+        # ``target_connection`` accessor.
+        proxied = connection.connection
+        dbapi = getattr(proxied, "dbapi_connection", proxied)
+        inner = getattr(dbapi, "target_connection", dbapi)
+        return inner.charset
+
+    def is_disconnect(self, e, connection, cursor):
+        # Two goals:
+        # 1. Prevent the upstream MySQLDialect_mysqlconnector.is_disconnect
+        #    from probing ``e.errno`` on FailoverError subclasses (they
+        #    don't carry the mysql-connector errno attribute, so upstream
+        #    would crash with AttributeError before classifying).
+        # 2. Return the right value for each kind of failover signal:
+        #    - FailoverSuccessError: the wrapper successfully reconnected
+        #      to a new writer; ``AwsWrapperConnection.target_connection``
+        #      is auto-rebound via ``plugin_service.current_connection``
+        #      to the new endpoint. The pool slot IS still valid -- if
+        #      SA invalidates it, the creator lambda re-fires with the
+        #      original (now-demoted) instance hostname and lands on the
+        #      old reader. Returning False keeps the same wrapper, which
+        #      is now on the new writer. (PG passes naturally because
+        #      psycopg's upstream is_disconnect returns False for this.)
+        #    - FailoverFailedError: the wrapper has no working connection;
+        #      pool slot really is dead. Return True so SA invalidates.
+        # _FailoverSuccessRewrapMixin still handles the do_execute path;
+        # this method handles the cursor-creation path which runs before
+        # do_execute reaches the mixin.
+        from aws_advanced_python_wrapper.errors import (FailoverFailedError,
+                                                        FailoverSuccessError)
+        if isinstance(e, FailoverSuccessError):
+            return False
+        if isinstance(e, FailoverFailedError):
+            return True
+        return super().is_disconnect(e, connection, cursor)

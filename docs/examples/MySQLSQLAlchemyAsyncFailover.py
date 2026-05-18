@@ -40,7 +40,7 @@ def build_engine():
     return create_async_engine(
         f"aws_wrapper_mysql+aiomysql_async://{USER}:{PASSWORD}@"
         f"{CLUSTER_ENDPOINT}:3306/{DB_NAME}"
-        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,host_monitoring_v2",
+        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover",
     )
 
 

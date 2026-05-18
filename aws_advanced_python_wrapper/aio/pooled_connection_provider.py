@@ -41,6 +41,7 @@ from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
+from aws_advanced_python_wrapper.utils import transient_connect
 from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
 from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
 
@@ -202,38 +203,12 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
     _POOL_EXPIRATION_CHECK_NS: ClassVar[int] = 30 * 60_000_000_000  # 30 minutes
     _LEAST_CONNECTIONS: ClassVar[str] = "least_connections"
 
-    # See sync ``SqlAlchemyPooledConnectionProvider._TRANSIENT_CONNECT_SQLSTATES``
-    # for the full rationale. Aurora's promoted writer can spend 15-60s
-    # rejecting connections with ``57P03`` ("the database system is
-    # starting up") right after a failover; the async pool's creator
-    # (``_creator`` below) bypasses the wrapper's plugin chain when it
-    # refills, so this layer must do its own retry.
-    _TRANSIENT_CONNECT_SQLSTATES: ClassVar[frozenset] = frozenset({
-        "57P01",  # admin_shutdown
-        "57P02",  # crash_shutdown
-        "57P03",  # cannot_connect_now ("the database system is starting up")
-        "08006",  # connection_failure (also covers MySQL transient connect errors)
-    })
-    # See sync counterpart for rationale: libpq wire-level errors carry no
-    # SQLSTATE; classify by message prefix the same way
-    # ``pg_exception_handler._NETWORK_ERROR_MESSAGES`` does so we retry on
-    # the same surface the wrapper already considers network-transient.
-    _TRANSIENT_CONNECT_MESSAGE_PREFIXES: ClassVar[Tuple[str, ...]] = (
-        "connection failed",
-        "consuming input failed",
-        "connection socket closed",
-        "the connection is closed",
-    )
-    _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = 6
-    _TRANSIENT_CONNECT_BACKOFF_S: ClassVar[float] = 5.0
-
-    @classmethod
-    def _is_transient_connect_error(cls, exc: BaseException) -> bool:
-        sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
-        if sqlstate in cls._TRANSIENT_CONNECT_SQLSTATES:
-            return True
-        msg = str(exc.args[0]) if exc.args else str(exc)
-        return any(msg.startswith(p) for p in cls._TRANSIENT_CONNECT_MESSAGE_PREFIXES)
+    # The async pool's creator (``_creator`` below) bypasses the wrapper's
+    # plugin chain when it refills, so this layer needs its own
+    # transient-retry. Classification and backoff are centralised in
+    # ``utils.transient_connect`` so all retry sites (sync pool, async
+    # pool, Django backend) stay in sync.
+    _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = transient_connect.DEFAULT_MAX_ATTEMPTS
 
     _accepted_strategies: ClassVar[Dict[str, HostSelector]] = {
         "random": RandomHostSelector(),
@@ -381,9 +356,9 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
                     return await target_connect_func(**props)
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
-                    if self._is_transient_connect_error(exc) \
+                    if transient_connect.is_transient_connect_error(exc) \
                             and attempt < self._TRANSIENT_CONNECT_MAX_ATTEMPTS - 1:
-                        await asyncio.sleep(self._TRANSIENT_CONNECT_BACKOFF_S)
+                        await asyncio.sleep(transient_connect.compute_backoff(attempt))
                         continue
                     raise
             # Defensive: loop exits via return or raise above; keeps mypy

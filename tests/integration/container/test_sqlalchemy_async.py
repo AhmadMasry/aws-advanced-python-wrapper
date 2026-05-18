@@ -106,7 +106,14 @@ class TestSqlAlchemyAsync:
                 port=conn_utils.port,
                 dbname=conn_utils.dbname,
                 wrapper_dialect=_wrapper_dialect_async(test_driver),
-                wrapper_plugins="failover,host_monitoring_v2",
+                # Modernize to ``failover_v2`` (the async registry aliases
+                # both names to the same factory; ``failover_v2`` matches
+                # main's DEFAULT_PLUGINS and the sync test conventions in
+                # this file). host_monitoring_v2 works on both engines here
+                # because the async wrapper uses asyncio.Task-based
+                # cooperative cancellation rather than thread-based abort
+                # (aws_advanced_python_wrapper/aio/host_monitoring_plugin.py).
+                wrapper_plugins="failover_v2,host_monitoring_v2",
             )
             try:
                 async with engine.connect() as conn:
@@ -155,7 +162,14 @@ class TestSqlAlchemyAsync:
                 port=conn_utils.port,
                 dbname=conn_utils.dbname,
                 wrapper_dialect=_wrapper_dialect_async(test_driver),
-                wrapper_plugins="read_write_splitting",
+                # Pair ``read_write_splitting`` with ``failover_v2`` so the
+                # cluster topology monitor starts on initial connect; without
+                # it, the host list stays at {writer-only} and the read-only
+                # flip falls back to the writer (see the sync test of the
+                # same name for the detailed root-cause analysis). Async
+                # MySQL can include ``host_monitoring_v2`` because the async
+                # plugin uses asyncio.Task cancellation, not thread abort.
+                wrapper_plugins="read_write_splitting,failover_v2,host_monitoring_v2",
             )
             try:
                 async with engine.connect() as conn:

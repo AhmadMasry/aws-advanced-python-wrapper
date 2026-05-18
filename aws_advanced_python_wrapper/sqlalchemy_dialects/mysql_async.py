@@ -28,7 +28,7 @@ Example::
     engine = create_async_engine(
         "aws_wrapper_mysql+aiomysql_async://user:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
-        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,host_monitoring_v2"
+        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover"
     )
 """
 
@@ -132,3 +132,39 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
         if wrapper_plugins is not None:
             kwargs["plugins"] = wrapper_plugins
         return args, kwargs
+
+    def _detect_charset(self, connection):
+        # Mirror sync mysql.py: walk down to the underlying driver
+        # connection via the wrapper's ``target_connection`` accessor
+        # instead of relying on _AdhocProxiedConnection's __getattr__
+        # to land on a connection that exposes ``.charset``. The async
+        # wrapper already has a generic __getattr__, so this override
+        # is defensive parity rather than a strict fix.
+        proxied = connection.connection
+        dbapi = getattr(proxied, "dbapi_connection", proxied)
+        inner = getattr(dbapi, "target_connection", dbapi)
+        return inner.charset
+
+    def is_disconnect(self, e, connection, cursor):
+        # Mirror sync mysql.py. Two goals:
+        # 1. Avoid the upstream probe of ``e.errno`` / ``e.args[0]`` (in
+        #    tuple form) on FailoverError subclasses — they don't carry
+        #    those attributes and upstream would crash before classifying.
+        # 2. Distinguish success vs failure of wrapper-driven failover:
+        #    - FailoverSuccessError → the wrapper's target_connection is
+        #      now bound to the new writer. The SA pool slot is still
+        #      valid; return False so SA keeps reusing it (next query
+        #      lands on the new writer). Invalidating would force the
+        #      creator lambda to re-fire with the original instance host,
+        #      which is now demoted to a reader.
+        #    - FailoverFailedError → wrapper has no working connection;
+        #      return True so SA invalidates and the creator retries.
+        # _AsyncFailoverSuccessRewrapMixin handles do_execute path;
+        # this handles the cursor-creation path that runs earlier.
+        from aws_advanced_python_wrapper.errors import (FailoverFailedError,
+                                                        FailoverSuccessError)
+        if isinstance(e, FailoverSuccessError):
+            return False
+        if isinstance(e, FailoverFailedError):
+            return True
+        return super().is_disconnect(e, connection, cursor)

@@ -77,16 +77,31 @@ def _readonly_option(test_driver: TestDriver) -> dict:
     return {"mysql_readonly": True} if _is_mysql(test_driver) else {"postgresql_readonly": True}
 
 
-def _build_engine(test_driver: TestDriver, conninfo_kwargs: dict, plugins: str):
+def _build_engine(
+        test_driver: TestDriver,
+        conninfo_kwargs: dict,
+        plugins: str,
+        **extra_props,
+):
+    """Build a SQLAlchemy engine whose creator goes through the wrapper.
+
+    ``**extra_props`` flows straight through to the wrapper's connect()
+    call as additional connection properties (e.g. ``topology_refresh_ms``,
+    ``failover_timeout_sec``). The wrapper picks these up via its
+    ``WrapperProperties`` registry just like the URL-query path does.
+    """
     if _is_mysql(test_driver):
+        # ``conninfo_kwargs`` (from ``DriverHelper.get_connect_params`` for MYSQL)
+        # already includes ``use_pure: True``; don't pass it again here, or
+        # mysql_connect() raises ``TypeError: got multiple values for 'use_pure'``.
         creator = lambda: mysql_connect(  # noqa: E731
             "", wrapper_dialect=_wrapper_dialect(test_driver),
-            plugins=plugins, use_pure=True, **conninfo_kwargs,
+            plugins=plugins, **extra_props, **conninfo_kwargs,
         )
     else:
         creator = lambda: pg_connect(  # noqa: E731
             "", wrapper_dialect=_wrapper_dialect(test_driver),
-            plugins=plugins, **conninfo_kwargs,
+            plugins=plugins, **extra_props, **conninfo_kwargs,
         )
     return create_engine(_sa_url(test_driver), creator=creator)
 
@@ -122,8 +137,14 @@ class TestSqlAlchemy:
 
         initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
 
+        # MySQL Connector/Python doesn't support thread-based connection abort,
+        # which BOTH host_monitoring plugins (v1 and v2) require. Per
+        # docs/using-the-python-wrapper/using-plugins/UsingTheHostMonitoringPlugin.md:
+        # "this plugin is incompatible with the MySQL Connector/Python driver."
+        # Drop EFM entirely on MySQL; PG keeps host_monitoring_v2.
+        plugins = "failover" if _is_mysql(test_driver) else "failover,host_monitoring_v2"
         engine = _build_engine(
-            test_driver, conn_utils.get_connect_params(), plugins="failover,host_monitoring_v2",
+            test_driver, conn_utils.get_connect_params(), plugins=plugins,
         )
         try:
             with engine.connect() as conn:
@@ -161,17 +182,62 @@ class TestSqlAlchemy:
         if engine_kind not in (DatabaseEngine.PG, DatabaseEngine.MYSQL):
             pytest.skip(f"Unsupported engine: {engine_kind}")
 
+        # Pair ``read_write_splitting`` with ``failover_v2`` (and, on PG,
+        # ``host_monitoring_v2``) per the canonical AWS samples:
+        #   * docs/examples/MySQLReadWriteSplitting.py:87 ("…,failover")
+        #   * docs/examples/PGReadWriteSplitting.py:87 ("…,failover,host_monitoring")
+        #   * docs/using-the-python-wrapper/using-plugins/UsingTheReadWriteSplittingPlugin.md:11
+        # ``failover_v2`` is the modern equivalent of ``failover`` and is
+        # in main's DEFAULT_PLUGINS. Its ``connect()`` calls
+        # ``plugin_service.refresh_host_list(conn)`` on the initial
+        # connection (failover_v2_plugin.py:178), which starts the
+        # cluster topology monitor thread; without that, the host list
+        # stays at {writer-only} and the read-only flip falls back to
+        # the writer. MySQL omits host_monitoring_v2 because mysql-
+        # connector-python doesn't support thread-based abort (see the
+        # EFM sweep elsewhere in this file and
+        # docs/.../UsingTheHostMonitoringPlugin.md:19).
+        plugins = (
+            "read_write_splitting,failover_v2"
+            if _is_mysql(test_driver)
+            else "read_write_splitting,failover_v2,host_monitoring_v2"
+        )
         engine = _build_engine(
-            test_driver, conn_utils.get_connect_params(), plugins="read_write_splitting",
+            test_driver, conn_utils.get_connect_params(),
+            plugins=plugins,
         )
         try:
             with engine.connect() as conn:
                 writer_id = conn.execute(text(_instance_id_sql(test_driver))).scalar_one()
                 conn.commit()
 
-            with engine.connect().execution_options(**_readonly_option(test_driver)) as conn:
-                reader_id = conn.execute(text(_instance_id_sql(test_driver))).scalar_one()
-                conn.commit()
+            # SA's PG dialect registers ``postgresql_readonly`` via
+            # ``PGReadOnlyConnectionCharacteristic``
+            # (sqlalchemy/dialects/postgresql/base.py:3263) which routes
+            # through ``dialect.set_readonly`` → the wrapper's
+            # ``AwsWrapperConnection.read_only`` property setter →
+            # ``CONNECTION_SET_READ_ONLY`` plugin dispatch. SA's MySQL
+            # dialect has no analogous characteristic — ``mysql_readonly``
+            # passed to ``execution_options`` is silently ignored — so on
+            # MySQL we reach the wrapper's read_only setter directly via
+            # the DBAPI connection (mirrors what wrapper-aware MySQL users
+            # would do today). Reset to ``False`` before pool checkin so a
+            # later ``engine.connect()`` isn't stuck read-only.
+            if _is_mysql(test_driver):
+                with engine.connect() as conn:
+                    raw = conn.connection.dbapi_connection
+                    raw.read_only = True
+                    try:
+                        reader_id = conn.execute(
+                            text(_instance_id_sql(test_driver))
+                        ).scalar_one()
+                        conn.commit()
+                    finally:
+                        raw.read_only = False
+            else:
+                with engine.connect().execution_options(**_readonly_option(test_driver)) as conn:
+                    reader_id = conn.execute(text(_instance_id_sql(test_driver))).scalar_one()
+                    conn.commit()
 
             assert reader_id != writer_id, (
                 f"read-only connection should route to a reader, got {reader_id}"

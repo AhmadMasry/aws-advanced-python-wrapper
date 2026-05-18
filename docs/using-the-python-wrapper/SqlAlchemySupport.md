@@ -93,7 +93,7 @@ from sqlalchemy import create_engine
 engine = create_engine(
     "aws_wrapper_mysql+mysqlconnector://john:pwd@"
     "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
-    "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,host_monitoring_v2&use_pure=True"
+    "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover&use_pure=True"
 )
 ```
 
@@ -188,7 +188,7 @@ async def main() -> None:
     engine = create_async_engine(
         "aws_wrapper_mysql+aiomysql_async://john:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
-        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover,host_monitoring_v2"
+        "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover"
     )
     try:
         async with engine.connect() as conn:

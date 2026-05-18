@@ -89,6 +89,14 @@ class TestCustomEndpoint:
     def props_with_failover(self, default_props):
         p = default_props.copy()
         p["plugins"] = "custom_endpoint,read_write_splitting,failover"
+        # Make the CustomEndpointMonitor poll the AWS API every 2s (default
+        # is 30_000ms). Without this, the test's ``modify_db_cluster_endpoint``
+        # races the monitor: the test's wait helper confirms AWS-side endpoint
+        # update via direct RDS-API check, but the wrapper's monitor still has
+        # its previous (stale) member set when ``conn.read_only = False`` fires,
+        # so ReadWriteSplittingPlugin's writer-discovery fails and the test
+        # raises ReadWriteSplittingError instead of switching cleanly.
+        p["custom_endpoint_info_refresh_rate_ms"] = 2_000
         return p
 
     @pytest.fixture(scope='class')

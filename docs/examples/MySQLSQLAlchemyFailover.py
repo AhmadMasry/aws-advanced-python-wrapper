@@ -32,7 +32,7 @@ def build_engine():
         creator=lambda: connect(
             f"host={CLUSTER_ENDPOINT} database={DB_NAME} user={USER} password={PASSWORD}",
             wrapper_dialect="aurora-mysql",
-            plugins="failover,host_monitoring_v2",
+            plugins="failover",
             use_pure=True,
         ),
     )

@@ -38,12 +38,12 @@ def test_submodule_connect_passes_all_kwargs_through(mocker):
     )
     wrapper_mysql.connect(
         "host=h", wrapper_dialect="aurora-mysql",
-        plugins="failover,host_monitoring_v2", use_pure=False,
+        plugins="failover", use_pure=False,
     )
     _, kwargs = mock_wrapper_connect.call_args
     assert kwargs == {
         "wrapper_dialect": "aurora-mysql",
-        "plugins": "failover,efm",
+        "plugins": "failover",
         "use_pure": False,
     }
 

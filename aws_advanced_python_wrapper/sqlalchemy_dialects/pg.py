@@ -81,6 +81,25 @@ class AwsWrapperPGPsycopgDialect(_FailoverSuccessRewrapMixin, PGDialect_psycopg)
             kwargs["plugins"] = wrapper_plugins
         return args, kwargs
 
+    def is_disconnect(self, e, connection, cursor):
+        # Mirror sync mysql.py for explicit, defensive symmetry. Upstream
+        # PGDialect_psycopg.is_disconnect happens to return False for our
+        # FailoverSuccessError today (it checks ``connection.closed`` /
+        # ``broken`` rather than probing errno), which is why PG passes
+        # naturally. Make that behavior explicit here so it doesn't drift
+        # if upstream changes:
+        #   - FailoverSuccessError → False (pool slot's wrapper is now
+        #     bound to the new writer via plugin_service.current_connection;
+        #     SA should reuse it, not invalidate).
+        #   - FailoverFailedError → True (no usable connection; invalidate).
+        from aws_advanced_python_wrapper.errors import (FailoverFailedError,
+                                                        FailoverSuccessError)
+        if isinstance(e, FailoverSuccessError):
+            return False
+        if isinstance(e, FailoverFailedError):
+            return True
+        return super().is_disconnect(e, connection, cursor)
+
     def _type_info_fetch(self, connection: Any, name: str) -> Any:
         """Unwrap to native psycopg.Connection before TypeInfo.fetch.
 

@@ -141,6 +141,23 @@ class AwsWrapperPGPsycopgAsyncDialect(
     _failover_success_target_cls = _PEP249OperationalError
     is_async = True
 
+    def is_disconnect(self, e, connection, cursor):
+        # Mirror sync pg.py / mysql.py for explicit symmetry across all
+        # 4 dialects:
+        #   - FailoverSuccessError → False (wrapper's target_connection is
+        #     auto-rebound to the new writer via plugin_service; SA pool
+        #     slot is still valid).
+        #   - FailoverFailedError → True (no usable connection).
+        # Complements _AsyncFailoverSuccessRewrapMixin for the
+        # cursor-creation path that runs before do_execute.
+        from aws_advanced_python_wrapper.errors import (FailoverFailedError,
+                                                        FailoverSuccessError)
+        if isinstance(e, FailoverSuccessError):
+            return False
+        if isinstance(e, FailoverFailedError):
+            return True
+        return super().is_disconnect(e, connection, cursor)
+
     def _type_info_fetch(self, connection: Any, name: str) -> Any:
         """Unwrap to native psycopg.AsyncConnection before TypeInfo.fetch.
 
