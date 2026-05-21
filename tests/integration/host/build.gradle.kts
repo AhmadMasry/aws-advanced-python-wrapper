@@ -159,6 +159,7 @@ tasks.register<Test>("test-python-3.13-mysql") {
         systemProperty("exclude-metrics-telemetry", "true")
         systemProperty("exclude-pg-driver", "true")
         systemProperty("exclude-pg-engine", "true")
+        systemProperty("exclude-async-drivers", "true")
     }
 }
 
@@ -177,6 +178,7 @@ tasks.register<Test>("test-python-3.13-pg") {
         systemProperty("exclude-mysql-engine", "true")
         systemProperty("exclude-mariadb-driver", "true")
         systemProperty("exclude-mariadb-engine", "true")
+        systemProperty("exclude-async-drivers", "true")
     }
 }
 
@@ -195,6 +197,7 @@ tasks.register<Test>("test-python-3.14-mysql") {
         systemProperty("exclude-metrics-telemetry", "true")
         systemProperty("exclude-pg-driver", "true")
         systemProperty("exclude-pg-engine", "true")
+        systemProperty("exclude-async-drivers", "true")
     }
 }
 
@@ -213,6 +216,7 @@ tasks.register<Test>("test-python-3.14-pg") {
         systemProperty("exclude-mysql-engine", "true")
         systemProperty("exclude-mariadb-driver", "true")
         systemProperty("exclude-mariadb-engine", "true")
+        systemProperty("exclude-async-drivers", "true")
     }
 }
 

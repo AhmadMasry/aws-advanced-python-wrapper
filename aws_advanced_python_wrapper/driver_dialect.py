@@ -89,6 +89,20 @@ class DriverDialect(ABC):
     def supports_abort_connection(self) -> bool:
         return False
 
+    @property
+    def requires_connect_serialization(self) -> bool:
+        """Whether new connections via this driver must be serialized at
+        the wrapper level on a per-host basis. Native-extension drivers
+        whose underlying C library shares thread-affine global state
+        (e.g., libpq's getaddrinfo cache, OpenSSL error-queue init,
+        libpq event callbacks) need this to avoid concurrent
+        ``PQconnectStart`` races that have crashed the process via
+        SIGSEGV on Aurora-PG multi-instance topologies under V1
+        failover. Default ``False``; pure-Python drivers (e.g.,
+        ``mysql.connector`` with ``use_pure=True``) leave it off.
+        """
+        return False
+
     def can_execute_query(self, conn: Connection) -> bool:
         return True
 

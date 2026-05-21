@@ -37,8 +37,40 @@ def preserve_transaction_status_with_timeout(executor: Executor, timeout_sec, dr
 
             future = executor.submit(func, *args, **kwargs)
 
-            # raises TimeoutError on timeout
-            result = future.result(timeout=timeout_sec)
+            try:
+                # raises TimeoutError on timeout
+                result = future.result(timeout=timeout_sec)
+            except TimeoutError:
+                # The Python-level future timed out, but the OS thread
+                # inside the executor pool is still blocked in libpq
+                # recv() and Python cannot kill it. Two-step unblock:
+                #
+                # 1. ``conn.cancel()`` (psycopg) sends a server-side
+                #    cancellation request through a SEPARATE libpq
+                #    connection, so it doesn't wait for the original
+                #    connection's lock. The server aborts the running
+                #    query and the stuck ``recv()`` returns with an
+                #    error, freeing the pool worker.
+                # 2. Fallback to ``conn.close()`` for drivers without
+                #    a cancel API (eg. mysql.connector) -- best-effort.
+                #
+                # Without this, repeated timeouts on slow-Aurora
+                # topology probes pin every executor pool worker on a
+                # stuck connection until the pool is exhausted; after
+                # that no further topology refresh can start and the
+                # outer wait spins for its full budget.
+                try:
+                    cancel = getattr(conn, "cancel", None)
+                    if callable(cancel):
+                        cancel()
+                    else:
+                        conn.close()
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
 
             if not initial_transaction_status and driver_dialect.is_in_transaction(conn):
                 # this condition is True when autocommit is False and the query started a new transaction.

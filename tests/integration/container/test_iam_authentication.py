@@ -33,6 +33,7 @@ import pytest
 from aws_advanced_python_wrapper import AwsWrapperConnection
 from aws_advanced_python_wrapper.errors import (AwsWrapperError,
                                                 FailoverSuccessError)
+from aws_advanced_python_wrapper.hostinfo import HostRole
 from tests.integration.container.utils.conditions import (
     disable_on_features, enable_on_deployments, enable_on_features,
     enable_on_num_instances)
@@ -162,9 +163,15 @@ class TestAwsIamAuthentication:
             # failure occurs on Cursor invocation
             aurora_utility.assert_first_query_throws(aws_conn, FailoverSuccessError)
 
-            # assert that we are connected to the new writer after failover happens and we can reuse the cursor
+            # Verify writer-status via the data plane (pg_is_in_recovery /
+            # @@innodb_read_only on the actual connection) rather than the
+            # control-plane DescribeDBClusters.IsClusterWriter. After an
+            # Aurora failover the control plane can lag the data plane by
+            # tens of seconds on multi-instance clusters; the data-plane
+            # role is authoritative and free of that race.
+            engine = TestEnvironment.get_current().get_engine()
             current_connection_id = aurora_utility.query_instance_id(aws_conn)
-            assert aurora_utility.is_db_instance_writer(current_connection_id) is True
+            assert aurora_utility.query_host_role(aws_conn, engine) == HostRole.WRITER
             assert current_connection_id != initial_writer_id
 
     def get_ip_address(self, hostname: str):

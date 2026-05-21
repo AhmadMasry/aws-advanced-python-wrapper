@@ -15,7 +15,19 @@
 from __future__ import annotations
 
 import atexit
+import faulthandler
+import sys
 from typing import TYPE_CHECKING, Optional
+
+# Diagnostic: dump every live thread's stack to stderr every 60s so slow /
+# hung tests (e.g. failover_v2 spinning inside
+# _wait_till_topology_gets_updated) leave thread-state snapshots in the
+# gradle log. Uses ``sys.__stderr__`` (pre-capture file with a real
+# .fileno()) because pytest replaces ``sys.stderr`` with a capture stream
+# that lacks .fileno(), which would raise io.UnsupportedOperation here.
+# Cheap (one signal + traceback write per 60s), test-only, removable
+# after diagnostics.
+faulthandler.dump_traceback_later(60, repeat=True, file=sys.__stderr__)
 
 from aws_xray_sdk.core import xray_recorder
 

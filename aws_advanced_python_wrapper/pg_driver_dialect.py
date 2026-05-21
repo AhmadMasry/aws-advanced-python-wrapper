@@ -64,6 +64,15 @@ class PgDriverDialect(DriverDialect):
             return PgDriverDialect.TARGET_DRIVER_CODE.lower() in (connect_func.__module__ + connect_func.__qualname__).lower()
         return True
 
+    @property
+    def requires_connect_serialization(self) -> bool:
+        # psycopg binds libpq (C extension), which has shared thread-
+        # affine state at connect time. Enable per-host serialization
+        # in connection_provider so the wrapper never invokes two
+        # concurrent ``PQconnectStart`` calls against the same host
+        # endpoint. See base-class docstring for context.
+        return True
+
     def is_closed(self, conn: Connection) -> bool:
         if isinstance(conn, psycopg.Connection):
             return conn.closed

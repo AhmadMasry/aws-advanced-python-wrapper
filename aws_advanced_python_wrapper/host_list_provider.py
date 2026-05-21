@@ -570,6 +570,20 @@ class TopologyUtils(ABC):
 
     def _get_writer_id(self, conn: Connection):
         with closing(conn.cursor()) as cursor:
+            # Fix A v3: enforce server-side query timeout. The wrapper's
+            # Python-level ``future.result(timeout=N)`` cannot kill the
+            # OS thread inside libpq's ``recv()``; setting PostgreSQL's
+            # ``statement_timeout`` makes the server itself abort long
+            # queries, which causes libpq's ``recv()`` to return with
+            # an error and the executor-pool worker to be released.
+            # PG-only: ``SET statement_timeout`` is a no-op for MySQL
+            # which doesn't have this hang (mysql-connector's pure-Python
+            # mode times out via its own socket_timeout).
+            try:
+                timeout_ms = max(int(self._max_timeout_sec * 1000) - 200, 1000)
+                cursor.execute(f"SET statement_timeout = {timeout_ms}")
+            except Exception:
+                pass
             cursor.execute(self._dialect.writer_id_query)
             return cursor.fetchone()
 
@@ -588,6 +602,14 @@ class AuroraTopologyUtils(TopologyUtils):
         """
         try:
             with closing(conn.cursor()) as cursor:
+                # See _get_writer_id for the Fix A v3 rationale: server-side
+                # ``statement_timeout`` keeps libpq.recv() from outlasting the
+                # wrapper's per-query budget. PG-only; silently no-op on MySQL.
+                try:
+                    timeout_ms = max(int(self._max_timeout_sec * 1000) - 200, 1000)
+                    cursor.execute(f"SET statement_timeout = {timeout_ms}")
+                except Exception:
+                    pass
                 cursor.execute(self._dialect.topology_query)
                 return self._process_query_results(cursor)
         except ProgrammingError as e:

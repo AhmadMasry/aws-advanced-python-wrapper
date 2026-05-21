@@ -129,6 +129,30 @@ class ClusterTopologyMonitorImpl(ClusterTopologyMonitor):
         if WrapperProperties.CONNECT_TIMEOUT_SEC.get(self._monitoring_properties) is None:
             WrapperProperties.CONNECT_TIMEOUT_SEC.set(self._monitoring_properties, self.DEFAULT_CONNECT_TIMEOUT_SEC)
 
+        # Fix B1: kernel-level TCP timeout for PG monitoring connections.
+        # ``connect_timeout`` covers only libpq's OS ``connect()``; it does NOT
+        # bound the TLS handshake or PostgreSQL startup-packet wait, where
+        # ``psycopg.waiting.wait_conn`` was observed hanging on slow-Aurora
+        # failover (py3.13-pg env-4 multi-5). Setting ``tcp_user_timeout``
+        # (libpq parameter ≥ PG12) maps to the Linux ``TCP_USER_TIMEOUT``
+        # socket option: the kernel itself errors the connection when no
+        # ACK arrives within the window, regardless of which protocol stage
+        # libpq is in. **PG-only**: mysql-connector treats unknown kwargs
+        # as an error, which triggers a HostMonitor retry storm; we gate
+        # on the dialect class name so we only inject the libpq kwarg
+        # when the target driver is psycopg.
+        try:
+            driver_dialect_name = type(self._plugin_service.driver_dialect).__name__.lower()
+        except Exception:
+            driver_dialect_name = ""
+        if "psycopg" in driver_dialect_name and self._monitoring_properties.get("tcp_user_timeout") is None:
+            try:
+                connect_timeout_sec = WrapperProperties.CONNECT_TIMEOUT_SEC.get_int(self._monitoring_properties)
+                if connect_timeout_sec and connect_timeout_sec > 0:
+                    self._monitoring_properties["tcp_user_timeout"] = str(int(connect_timeout_sec * 1000))
+            except Exception:
+                pass
+
         self._start_monitoring()
 
     def force_refresh(self, should_verify_writer: bool, timeout_sec: int) -> Topology:
