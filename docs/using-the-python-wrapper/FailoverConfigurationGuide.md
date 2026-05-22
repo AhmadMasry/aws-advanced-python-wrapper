@@ -36,3 +36,56 @@ A common misconception about failover is the expectation that only one host will
 If you are experiencing difficulties with the failover plugin, try the following:
 - Enable [logging](./UsingThePythonWrapper.md#logging) to find the cause of the failure. If it is a timeout, review the [failover time profiles](#failover-time-profiles) section and adjust the timeout values.
 - For additional assistance, visit the [getting help page](../../README.md#getting-help-and-opening-issues).
+
+### Retry behavior at the SQLAlchemy / Django pool boundary
+
+When a fresh DBAPI connection is opened inside an SQLAlchemy pool creator
+(`SqlAlchemyPooledConnectionProvider`, `AsyncPooledConnectionProvider`) or
+the Django MySQL backend, the wrapper's normal plugin chain is bypassed —
+the call site sits below the failover plugin in the stack. To keep
+post-failover pool refills from failing on Aurora's 15–60 s
+connect-rejection window, the wrapper retries transient connect errors
+with an exponential backoff.
+
+| Knob                                  | Connection property                   | Default  |
+|---------------------------------------|---------------------------------------|----------|
+| Max attempts                          | `connection_retry_max_attempts`       | `10`     |
+| Initial backoff                       | (constant in `transient_connect.py`)  | `1.0 s`  |
+| Multiplier                            | (constant in `transient_connect.py`)  | `1.5×`   |
+| Max backoff per attempt               | `connection_retry_max_backoff_s`      | `30 s`   |
+| Mean total wait (with equal jitter)   | —                                     | `~79 s`  |
+| Worst-case total wait                 | —                                     | `~105 s` |
+
+**Consumer-visible consequence**: during an Aurora failover, a fresh
+`engine.connect()` call (or `engine.dispose()` followed by reconnect) can
+sit for up to ~100 seconds before raising. This is intentional — without
+it the pool refill races Aurora's promoted-writer boot and fails the
+user-visible call. If your application has a tighter end-to-end budget
+than ~100 s, lower `connection_retry_max_attempts` and/or
+`connection_retry_max_backoff_s` via the wrapper's connection properties.
+If you run a multi-region cluster with promotion windows exceeding 100 s,
+raise them. Set `connection_retry_max_attempts=1` to disable retry
+entirely.
+
+The classifier
+(`aws_advanced_python_wrapper/utils/transient_connect.py:is_transient_connect_error`)
+matches on PG SQLSTATEs `57P01`/`57P02`/`57P03`/`08006`, the SQL-standard
+`08` connection-exception class, libpq wire-level error message prefixes,
+and MySQL errnos `2001`–`2055`. See the module docstring for the full
+per-driver breakdown.
+
+For Django, pass the same knobs through the `OPTIONS` dict in
+`DATABASES['default']`:
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "aws_advanced_python_wrapper.django.backends.mysql_connector",
+        "OPTIONS": {
+            "connection_retry_max_attempts": 6,
+            "connection_retry_max_backoff_s": 15.0,
+            # ... other wrapper / driver options
+        },
+    },
+}
+```

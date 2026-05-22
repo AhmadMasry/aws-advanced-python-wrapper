@@ -1,5 +1,7 @@
 # Host Monitoring Plugin
 
+> **Warning**: EFM (both v1 and v2) is **incompatible with sync MySQL** (`mysql-connector-python`) — that driver doesn't expose the thread-based connection abort EFM requires. Symptoms include monitor threads hanging on shutdown and "Python hangs on exit" when a host is unreachable. Use the chain without EFM for sync MySQL, or switch to the async driver (`aiomysql`) which supports EFM v2. See [PluginChainCompatibility.md](../PluginChainCompatibility.md) for the full compatibility matrix.
+
 ## Enhanced Failure Monitoring
 
 The figure that follows shows a simplified Enhanced Failure Monitoring (EFM) workflow. Enhanced Failure Monitoring is a feature available from the Host Monitoring Connection Plugin. The Host Monitoring Connection Plugin periodically checks the connected database host's health or availability. If a database host is determined to be unhealthy, the connection will be aborted. The Host Monitoring Connection Plugin uses the [Enhanced Failure Monitoring Parameters](#enhanced-failure-monitoring-parameters) and a database host's responsiveness to determine whether a host is healthy.
