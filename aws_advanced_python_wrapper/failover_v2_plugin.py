@@ -108,6 +108,17 @@ class FailoverV2Plugin(Plugin):
         if self._is_closed:
             self._invalid_invocation_on_closed_connection()
 
+        # Proactive role-demotion check (STRICT_WRITER only). Aurora can flip
+        # a writer to reader without breaking the underlying connection, so
+        # exception-driven failover (the try/except below) misses that case
+        # and the user's query silently lands on a now-reader. v1's
+        # FailoverPlugin avoids this by calling refresh_host_list() before
+        # every CURSOR_EXECUTE; v2 owns its topology via the
+        # cluster_topology_monitor's background HostMonitor threads, so we
+        # can do the same check for free against the already-cached
+        # ``all_hosts`` topology.
+        self._raise_if_current_host_no_longer_writer()
+
         try:
             result = execute_func()
         except Exception as e:
@@ -115,6 +126,32 @@ class FailoverV2Plugin(Plugin):
             self._deal_with_original_exception(e)
 
         return result
+
+    def _raise_if_current_host_no_longer_writer(self) -> None:
+        if self._failover_mode != FailoverMode.STRICT_WRITER:
+            return
+        if not self._is_failover_enabled():
+            return
+
+        current_host = self._plugin_service.current_host_info
+        if current_host is None:
+            return
+
+        topology_host = next(
+            (h for h in self._plugin_service.all_hosts
+             if h.host == current_host.host and h.port == current_host.port),
+            None)
+        # If the host isn't visible in the topology yet, the refresh may be in
+        # progress -- leave it alone and let the regular exception-driven path
+        # handle it. Only act when we positively see the role is no longer WRITER.
+        if topology_host is None or topology_host.role == HostRole.WRITER:
+            return
+
+        logger.info("FailoverPlugin.CurrentHostNotWriter")
+        self._invalidate_current_connection()
+        self._plugin_service.set_availability(
+            current_host.as_aliases(), HostAvailability.UNAVAILABLE)
+        self._pick_new_connection()  # raises FailoverSuccessError on success
 
     def init_host_provider(
             self,
