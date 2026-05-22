@@ -73,7 +73,7 @@ class HostListProvider(Protocol):
         """
         ...
 
-    def force_monitoring_refresh(self, should_verify_writer: bool, timeout_sec: int) -> Topology:
+    def force_monitoring_refresh(self, should_verify_writer: bool, timeout_sec: int) -> Optional[Topology]:
         ...
 
     def get_cluster_id(self) -> str:
@@ -275,11 +275,21 @@ class RdsHostListProvider(DynamicHostListProvider, HostListProvider):
             return hosts
         return ()
 
-    def force_monitoring_refresh(self, should_verify_writer: bool, timeout_sec: int) -> Topology:
-        """Public API for forcing monitor refresh"""
+    def force_monitoring_refresh(self, should_verify_writer: bool, timeout_sec: int) -> Optional[Topology]:
+        """Public API for forcing monitor refresh.
+
+        Returns ``None`` when the refresh failed (e.g. the underlying
+        ``_wait_till_topology_gets_updated`` timed out without seeing any
+        topology update) so that the caller in
+        ``PluginServiceImpl.force_monitoring_refresh_host_list`` can skip
+        overwriting ``_hosts`` with an empty tuple. Without this distinction
+        a transient no-master window during Aurora PG failover would clobber
+        the last-known-good topology and trip ``FailoverFailedError:
+        No writer host found in topology: {}`` in
+        ``FailoverV2Plugin._failover_writer``.
+        """
         self._initialize()
-        hosts = self._force_refresh_monitor(should_verify_writer, timeout_sec)
-        return hosts if hosts else ()
+        return self._force_refresh_monitor(should_verify_writer, timeout_sec)
 
     def refresh(self, connection: Optional[Connection] = None) -> Topology:
         """
@@ -363,7 +373,7 @@ class ConnectionStringHostListProvider(StaticHostListProvider):
         self._initialize()
         return tuple(self._hosts)
 
-    def force_monitoring_refresh(self, should_verify_writer: bool, timeout_sec: int) -> Topology:
+    def force_monitoring_refresh(self, should_verify_writer: bool, timeout_sec: int) -> Optional[Topology]:
         raise AwsWrapperError(
                 Messages.get_formatted("HostListProvider.ForceMonitoringRefreshUnsupported", "ConnectionStringHostListProvider"))
 
