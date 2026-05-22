@@ -1145,9 +1145,9 @@ public class TestEnvironment implements AutoCloseable {
       case PYTHON_3_12:
         return "python:3.12";
       case PYTHON_3_13:
-        return "python:3.13";
+        return "python:3.13-slim-trixie";
       case PYTHON_3_14:
-        return "python:3.14";
+        return "python:3.14-slim-trixie";
       default:
         throw new UnsupportedOperationException(request.getTargetPythonVersion().toString());
     }

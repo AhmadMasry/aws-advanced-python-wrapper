@@ -203,7 +203,11 @@ public class ContainerHelper {
                   builder -> appendExtraCommandsToBuilder.apply(
                       builder
                           .from(testContainerImageName)
-                          .run("apt-get", "install", "curl", "gcc")
+                          .run("sh", "-c",
+                              "apt-get update && apt-get upgrade -y && "
+                                  + "apt-get install -y --no-install-recommends "
+                                  + "curl gcc libpq-dev pkg-config && "
+                                  + "rm -rf /var/lib/apt/lists/*")
                           .run("mkdir", "app")
                           .workDir("/app")
                           .run("curl", "-sSL", "https://install.python-poetry.org", "--output", "/app/poetry.py")
@@ -222,7 +226,11 @@ public class ContainerHelper {
                   builder -> appendExtraCommandsToBuilder.apply(
                       builder
                           .from(testContainerImageName)
-                          .run("apt-get", "install", "curl", "gcc")
+                          .run("sh", "-c",
+                              "apt-get update && apt-get upgrade -y && "
+                                  + "apt-get install -y --no-install-recommends "
+                                  + "curl gcc libpq-dev pkg-config && "
+                                  + "rm -rf /var/lib/apt/lists/*")
                           .run("mkdir", "app")
                           .workDir("/app")
                           .run("curl", "-sSL", "https://install.python-poetry.org", "--output", "/app/poetry.py")
