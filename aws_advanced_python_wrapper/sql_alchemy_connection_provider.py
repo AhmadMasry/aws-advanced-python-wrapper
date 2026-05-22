@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Optional,
+                    Tuple)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
@@ -30,10 +31,10 @@ from aws_advanced_python_wrapper.host_selector import (
     HighestWeightHostSelector, HostSelector, RandomHostSelector,
     RoundRobinHostSelector, WeightedRandomHostSelector)
 from aws_advanced_python_wrapper.plugin import CanReleaseResources
+from aws_advanced_python_wrapper.utils import transient_connect
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
-from aws_advanced_python_wrapper.utils import transient_connect
 from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
 from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
 from aws_advanced_python_wrapper.utils.storage.sliding_expiration_cache import \
@@ -179,20 +180,27 @@ class SqlAlchemyPooledConnectionProvider(ConnectionProvider, CanReleaseResources
     # bypasses the wrapper's plugin chain, so this layer needs its own
     # transient-retry. Classification and backoff are centralised in
     # ``utils.transient_connect`` so all retry sites (sync pool, async
-    # pool, Django backend) stay in sync.
+    # pool, Django backend) stay in sync. The budget itself is
+    # configurable via ``WrapperProperties.CONNECTION_RETRY_MAX_ATTEMPTS``
+    # and ``CONNECTION_RETRY_MAX_BACKOFF_S`` — defaults match
+    # ``transient_connect.DEFAULT_*`` for backwards compatibility.
     _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = transient_connect.DEFAULT_MAX_ATTEMPTS
 
     def _get_connection_func(self, target_connect_func: Callable, props: Properties):
+        max_attempts = WrapperProperties.CONNECTION_RETRY_MAX_ATTEMPTS.get_int(props)
+        max_backoff = WrapperProperties.CONNECTION_RETRY_MAX_BACKOFF_S.get_float(props)
+
         def _connect_with_transient_retry() -> Any:
             last_exc: Optional[BaseException] = None
-            for attempt in range(self._TRANSIENT_CONNECT_MAX_ATTEMPTS):
+            for attempt in range(max_attempts):
                 try:
                     return target_connect_func(**props)
                 except Exception as exc:
                     last_exc = exc
                     if transient_connect.is_transient_connect_error(exc) \
-                            and attempt < self._TRANSIENT_CONNECT_MAX_ATTEMPTS - 1:
-                        time.sleep(transient_connect.compute_backoff(attempt))
+                            and attempt < max_attempts - 1:
+                        time.sleep(transient_connect.compute_backoff(
+                            attempt, max_backoff=max_backoff))
                         continue
                     raise
             # Defensive: loop exits via return or raise above; this is

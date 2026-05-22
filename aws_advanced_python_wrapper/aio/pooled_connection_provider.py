@@ -37,11 +37,11 @@ from aws_advanced_python_wrapper.host_selector import (
     HighestWeightHostSelector, HostSelector, RandomHostSelector,
     RoundRobinHostSelector, WeightedRandomHostSelector)
 from aws_advanced_python_wrapper.sql_alchemy_connection_provider import PoolKey
+from aws_advanced_python_wrapper.utils import transient_connect
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
-from aws_advanced_python_wrapper.utils import transient_connect
 from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
 from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
 
@@ -349,16 +349,20 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
             target_connect_func: Callable[..., Awaitable[Any]],
             props: Properties,
     ) -> Callable[[], Awaitable[Any]]:
+        max_attempts = WrapperProperties.CONNECTION_RETRY_MAX_ATTEMPTS.get_int(props)
+        max_backoff = WrapperProperties.CONNECTION_RETRY_MAX_BACKOFF_S.get_float(props)
+
         async def _creator() -> Any:
             last_exc: Optional[BaseException] = None
-            for attempt in range(self._TRANSIENT_CONNECT_MAX_ATTEMPTS):
+            for attempt in range(max_attempts):
                 try:
                     return await target_connect_func(**props)
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
                     if transient_connect.is_transient_connect_error(exc) \
-                            and attempt < self._TRANSIENT_CONNECT_MAX_ATTEMPTS - 1:
-                        await asyncio.sleep(transient_connect.compute_backoff(attempt))
+                            and attempt < max_attempts - 1:
+                        await asyncio.sleep(transient_connect.compute_backoff(
+                            attempt, max_backoff=max_backoff))
                         continue
                     raise
             # Defensive: loop exits via return or raise above; keeps mypy

@@ -38,7 +38,9 @@ class DatabaseWrapper(base.DatabaseWrapper):
     # window the new writer rejects connects with a transient error --
     # without retry, Django surfaces this straight back to the request
     # handler as a fatal error. Classification + backoff are centralised
-    # in ``utils.transient_connect``.
+    # in ``utils.transient_connect``. The retry budget is configurable via
+    # ``connection_retry_max_attempts`` / ``connection_retry_max_backoff_s``
+    # in Django's ``OPTIONS`` dict; defaults match ``transient_connect.DEFAULT_*``.
     _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = transient_connect.DEFAULT_MAX_ATTEMPTS
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -50,9 +52,18 @@ class DatabaseWrapper(base.DatabaseWrapper):
         if "converter_class" not in conn_params:
             conn_params["converter_class"] = base.DjangoMySQLConverter
 
+        max_attempts = int(conn_params.get(
+            "connection_retry_max_attempts", transient_connect.DEFAULT_MAX_ATTEMPTS))
+        max_backoff = float(conn_params.get(
+            "connection_retry_max_backoff_s", transient_connect.DEFAULT_MAX_BACKOFF_S))
+        # Don't leak wrapper-only keys to mysql.connector.Connect — strip
+        # before constructing the connection.
+        conn_params.pop("connection_retry_max_attempts", None)
+        conn_params.pop("connection_retry_max_backoff_s", None)
+
         last_exc: BaseException | None = None
         conn = None
-        for attempt in range(self._TRANSIENT_CONNECT_MAX_ATTEMPTS):
+        for attempt in range(max_attempts):
             try:
                 conn = AwsWrapperConnection.connect(
                     mysql.connector.Connect,
@@ -62,8 +73,9 @@ class DatabaseWrapper(base.DatabaseWrapper):
             except Exception as exc:
                 last_exc = exc
                 if transient_connect.is_transient_connect_error(exc) \
-                        and attempt < self._TRANSIENT_CONNECT_MAX_ATTEMPTS - 1:
-                    time.sleep(transient_connect.compute_backoff(attempt))
+                        and attempt < max_attempts - 1:
+                    time.sleep(transient_connect.compute_backoff(
+                        attempt, max_backoff=max_backoff))
                     continue
                 raise
         if conn is None:
