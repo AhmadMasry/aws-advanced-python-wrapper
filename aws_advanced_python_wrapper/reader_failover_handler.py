@@ -82,7 +82,9 @@ class ReaderFailoverHandlerImpl(ReaderFailoverHandler):
     # ``_CONNECT_BACKOFF_S``. Total budget here is bounded by the outer
     # ``_get_result_from_next_task_batch``'s ``as_completed`` timeout
     # (``self.timeout_sec``), so retries cannot overrun the failover
-    # ceiling.
+    # ceiling. If ``self.timeout_sec`` < ``_CONNECT_MAX_ATTEMPTS *
+    # _CONNECT_BACKOFF_S``, the outer timeout pre-empts the retry
+    # mid-sleep and the future is GC'd — intended behavior, not a leak.
     _CONNECT_MAX_ATTEMPTS: ClassVar[int] = 4
     _CONNECT_BACKOFF_S: ClassVar[float] = 1.0
 

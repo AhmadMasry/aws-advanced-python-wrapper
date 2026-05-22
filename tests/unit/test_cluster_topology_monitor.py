@@ -315,12 +315,101 @@ class TestHostMonitor:
         monitor_impl_mock._plugin_service.force_connect.side_effect = login_error
         monitor_impl_mock._plugin_service.is_network_exception.return_value = False
         monitor_impl_mock._plugin_service.is_login_exception.return_value = True
+        # 724de17 added bounded retry on login exceptions; ensure the
+        # ``_host_threads_stop.wait`` call doesn't short-circuit retry.
+        monitor_impl_mock._host_threads_stop.wait.return_value = False
 
         # The login exception is caught and handled in the finally block, not raised
         monitor()
 
         # Verify force_connect was called
         monitor_impl_mock._plugin_service.force_connect.assert_called()
+
+    def test_call_login_exception_exhausts_retry_budget(self, monitor_impl_mock):
+        """724de17: HostMonitor retries IAM/PAM-transient failures up to
+        ``_MAX_TRANSIENT_LOGIN_ATTEMPTS`` before giving up. Asserts the exact
+        attempt count so the budget can't silently drift on future refactors.
+        """
+        host_info = HostInfo("reader.com", 5432, HostRole.READER)
+        monitor = HostMonitor(monitor_impl_mock, host_info, None)
+        monitor_impl_mock._plugin_service.force_connect.side_effect = Exception("PAM rejected")
+        monitor_impl_mock._plugin_service.is_network_exception.return_value = False
+        monitor_impl_mock._plugin_service.is_login_exception.return_value = True
+        monitor_impl_mock._host_threads_stop.is_set.return_value = False
+        monitor_impl_mock._host_threads_stop.wait.return_value = False
+
+        monitor()
+
+        # 1 initial attempt + ``_MAX_TRANSIENT_LOGIN_ATTEMPTS`` retries =
+        # ``_MAX_TRANSIENT_LOGIN_ATTEMPTS + 1`` total ``force_connect`` calls
+        # before RuntimeError is raised internally (and caught by the outer
+        # except).
+        assert (monitor_impl_mock._plugin_service.force_connect.call_count
+                == HostMonitor._MAX_TRANSIENT_LOGIN_ATTEMPTS + 1)
+
+    def test_call_login_exception_recovers_within_budget(
+            self, monitor_impl_mock, topology_utils_mock):
+        """If IAM/PAM stops rejecting within the budget, HostMonitor uses the
+        recovered connection — i.e. retries don't permanently exit the thread.
+        """
+        host_info = HostInfo("writer.com", 5432, HostRole.WRITER)
+        monitor = HostMonitor(monitor_impl_mock, host_info, None)
+        connection_mock = MagicMock()
+        # First 3 calls fail with login, 4th succeeds.
+        monitor_impl_mock._plugin_service.force_connect.side_effect = [
+            Exception("PAM rejected"),
+            Exception("PAM rejected"),
+            Exception("PAM rejected"),
+            connection_mock,
+        ]
+        monitor_impl_mock._plugin_service.is_network_exception.return_value = False
+        monitor_impl_mock._plugin_service.is_login_exception.return_value = True
+        monitor_impl_mock._plugin_service.get_host_role.return_value = HostRole.WRITER
+        topology_utils_mock.get_writer_id_if_connected.return_value = "writer.com"
+        monitor_impl_mock._host_threads_stop.wait.return_value = False
+
+        call_count = [0]
+
+        def stop_after_enough_iters():
+            call_count[0] += 1
+            # Allow through the 3 failures + success path. Each retry
+            # iteration costs 3 ``is_set`` calls (while-cond, line-516,
+            # post-except line-526). The success path then makes ~3 more
+            # is_set checks (line-551 + role-check + final compare-and-set).
+            # Threshold 20 leaves headroom for any extra checks.
+            return call_count[0] > 20
+
+        monitor_impl_mock._host_threads_stop.is_set.side_effect = stop_after_enough_iters
+
+        with patch('time.sleep'):
+            monitor()
+
+        # Exactly 4 connect attempts: 3 failures + 1 success.
+        assert monitor_impl_mock._plugin_service.force_connect.call_count == 4
+
+    def test_call_login_exception_wait_returning_true_exits_early(
+            self, monitor_impl_mock):
+        """Fix #10: shutdown via ``_host_threads_stop.wait`` returning True
+        exits the retry loop immediately rather than sitting through the
+        rest of the budget.
+        """
+        host_info = HostInfo("reader.com", 5432, HostRole.READER)
+        monitor = HostMonitor(monitor_impl_mock, host_info, None)
+        monitor_impl_mock._plugin_service.force_connect.side_effect = Exception("PAM rejected")
+        monitor_impl_mock._plugin_service.is_network_exception.return_value = False
+        monitor_impl_mock._plugin_service.is_login_exception.return_value = True
+        monitor_impl_mock._host_threads_stop.is_set.return_value = False
+        # First retry sleep returns False (continue), second returns True (shutdown).
+        monitor_impl_mock._host_threads_stop.wait.side_effect = [False, True]
+
+        monitor()
+
+        # Call 1 fails → wait → False → continue. Call 2 fails → wait → True
+        # → return. So exactly 2 ``force_connect`` calls; the full budget of
+        # ``_MAX_TRANSIENT_LOGIN_ATTEMPTS + 1`` is NOT reached.
+        assert monitor_impl_mock._plugin_service.force_connect.call_count == 2
+        assert (monitor_impl_mock._plugin_service.force_connect.call_count
+                < HostMonitor._MAX_TRANSIENT_LOGIN_ATTEMPTS + 1)
 
     def test_reader_thread_fetch_topology(self, monitor_impl_mock):
         host_info = HostInfo("reader.com", 5432, HostRole.READER)

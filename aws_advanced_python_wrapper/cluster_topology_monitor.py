@@ -19,7 +19,7 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, ClassVar, Dict, Optional
 
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.host_availability import HostAvailability
@@ -533,10 +533,13 @@ class HostMonitor:
                             # Aurora PG fails IAM/PAM during the promotion window. Retry a
                             # bounded number of times before declaring the credentials
                             # invalid -- a real misconfiguration will keep failing past
-                            # the budget and still raise.
+                            # the budget and still raise. Use ``Event.wait`` instead of
+                            # ``time.sleep`` so a concurrent shutdown wins the race
+                            # deterministically (would otherwise sit out the full backoff).
                             self._login_attempts += 1
                             if self._login_attempts <= HostMonitor._MAX_TRANSIENT_LOGIN_ATTEMPTS:
-                                time.sleep(HostMonitor._LOGIN_RETRY_BACKOFF_SEC)
+                                if self._monitor._host_threads_stop.wait(HostMonitor._LOGIN_RETRY_BACKOFF_SEC):
+                                    return
                                 continue
                             raise RuntimeError(ex)
                         else:
