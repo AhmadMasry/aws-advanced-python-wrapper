@@ -407,12 +407,21 @@ class FailoverV2Plugin(Plugin):
         # rolling back the dead libpq socket, and ``soft=True`` keeps
         # libpq teardown off the failover-trigger thread to avoid
         # contention with the parallel reader-probe connects.
+        # See ``failover_plugin.py:_invalidate_current_connection`` for the
+        # full rationale and the SA-version caveat on
+        # ``_connection_record.dbapi_connection``. ``hasattr`` + nested
+        # ``try/except AttributeError`` make this a no-op on SA layout
+        # changes.
         inv = getattr(conn, "invalidate", None)
         if callable(inv):
             try:
                 record = getattr(conn, "_connection_record", None)
-                if record is not None and getattr(record, "dbapi_connection", None) is not None:
-                    record.dbapi_connection = None
+                if record is not None and hasattr(record, "dbapi_connection"):
+                    try:
+                        if record.dbapi_connection is not None:
+                            record.dbapi_connection = None
+                    except AttributeError:
+                        pass
                 inv(soft=True)
             except TypeError:
                 pass

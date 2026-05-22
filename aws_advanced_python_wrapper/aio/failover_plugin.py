@@ -409,12 +409,21 @@ class AsyncFailoverPlugin(AsyncPlugin):
         conn = self._plugin_service.current_connection
         if conn is None:
             return
+        # See sync ``failover_plugin.py:_invalidate_current_connection`` for
+        # the full rationale and SA-version caveat. ``hasattr`` + nested
+        # ``try/except AttributeError`` keep us safe across SA layout
+        # changes (we're bound to ``SQLAlchemy = "^2.0.49"`` per
+        # ``pyproject.toml``).
         inv = getattr(conn, "invalidate", None)
         if callable(inv):
             try:
                 record = getattr(conn, "_connection_record", None)
-                if record is not None and getattr(record, "dbapi_connection", None) is not None:
-                    record.dbapi_connection = None
+                if record is not None and hasattr(record, "dbapi_connection"):
+                    try:
+                        if record.dbapi_connection is not None:
+                            record.dbapi_connection = None
+                    except AttributeError:
+                        pass
                 result = inv(soft=True)
                 if asyncio.iscoroutine(result):
                     await result

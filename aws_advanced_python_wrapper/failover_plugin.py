@@ -398,12 +398,23 @@ class FailoverPlugin(Plugin):
         #    ReaderFailoverHandler is launching concurrently and has
         #    historically produced SIGSEGV/SIGBUS on multi-instance
         #    Aurora topologies.
+        # NOTE: ``_connection_record.dbapi_connection`` is a private-ish
+        # attribute that we rely on to clear the dead libpq socket. This is
+        # tested against SQLAlchemy ^2.0.49 (see ``pyproject.toml``); if SA
+        # ever renames or restructures the pool record (e.g. in 2.1+), the
+        # ``hasattr`` guard makes the assignment a no-op and we fall through
+        # to ``inv(soft=True)`` — same behavior as before this workaround
+        # was introduced. Re-verify on SA bumps.
         inv = getattr(conn, "invalidate", None)
         if callable(inv):
             try:
                 record = getattr(conn, "_connection_record", None)
-                if record is not None and getattr(record, "dbapi_connection", None) is not None:
-                    record.dbapi_connection = None
+                if record is not None and hasattr(record, "dbapi_connection"):
+                    try:
+                        if record.dbapi_connection is not None:
+                            record.dbapi_connection = None
+                    except AttributeError:
+                        pass
                 inv(soft=True)
             except TypeError:
                 # ``invalidate`` exists but doesn't accept ``soft=`` --

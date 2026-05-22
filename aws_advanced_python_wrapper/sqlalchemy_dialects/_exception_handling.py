@@ -16,31 +16,37 @@
 
 SQLAlchemy classifies DBAPI exceptions in ``Connection._handle_dbapi_exception``
 by walking ``dialect.loaded_dbapi.<ErrorClass>`` and wrapping into
-``sqlalchemy.exc.<MappedClass>``. Wrapper-internal exceptions like
-``FailoverSuccessError`` are subclasses of the wrapper's PEP-249
-``OperationalError`` AND of the driver-native ``OperationalError`` (set up
-in ``errors.py``). In principle SA should pick them up via isinstance, but
-in practice the PGDialect_psycopg classifier path doesn't reclassify
-``FailoverSuccessError`` to ``sqlalchemy.exc.OperationalError`` and the
-exception escapes raw, defeating user-written ``except OperationalError:``
-retry loops.
+``sqlalchemy.exc.<MappedClass>``. SA's classifier needs the raised exception
+to be an instance of the **driver-native** ``OperationalError`` class
+(e.g. ``psycopg.OperationalError``), not the wrapper's PEP-249
+``OperationalError``. Wrapper-internal exceptions like
+``FailoverSuccessError`` are single-inherit from ``FailoverError`` (the
+driver-native multi-inheritance was reverted in commit ``d994d02`` because
+it caused Django's ``wrap_database_errors`` to swallow the failover signal
+on MySQL), so SA's classifier lets them escape raw and any user-written
+``except sqlalchemy.exc.OperationalError:`` retry loop never fires.
 
 The mixin below sidesteps that by intercepting ``FailoverSuccessError`` at
-the ``do_execute`` boundary and re-raising it as the driver-native
-``OperationalError`` class -- which SA's classifier DOES reclassify
-reliably. Each concrete dialect declares its target class via
+the ``do_execute`` / ``do_executemany`` boundary and re-raising it as the
+driver-native ``OperationalError`` class — which SA's classifier DOES
+reclassify reliably to ``sqlalchemy.exc.OperationalError``. The original
+wrapper exception is preserved via ``__cause__`` so callers that need the
+exact wrapper type can ``isinstance(exc.__cause__, FailoverSuccessError)``.
+
+Each concrete dialect declares its target class via
 ``_failover_success_target_cls``; the mixin handles both sync and async
 ``do_execute`` shapes.
+
+Scope: only ``do_execute`` and ``do_executemany`` are wrapped. If
+``FailoverSuccessError`` ever surfaces from ``do_commit`` / ``do_rollback``
+/ ``do_begin_twophase`` / etc., it will escape raw — extend the mixin then.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Type
+from typing import ClassVar, Optional, Type
 
 from aws_advanced_python_wrapper.errors import FailoverSuccessError
-
-if TYPE_CHECKING:
-    pass
 
 
 class _FailoverSuccessRewrapMixin:

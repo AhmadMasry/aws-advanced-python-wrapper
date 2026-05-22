@@ -170,6 +170,12 @@ def is_transient_connect_error(exc: BaseException) -> bool:
       3. SQLSTATE class prefix (covers both PG ``"08"`` and MySQL ``"HY"``)
       4. message-prefix matching for libpq/connector wire errors that
          arrive without a SQLSTATE
+
+    Note on psycopg: ``psycopg.Error`` exceptions sometimes carry
+    ``args == ()`` and place the useful info on ``.diag`` / ``.sqlstate`` /
+    ``.pgcode``. The SQLSTATE branch (#2/#3) handles that case — do NOT
+    add an ``args[0]``-only check above it, that would skip the SQLSTATE
+    match for psycopg and miscount the transient-error class.
     """
     # 1) errno (mysql-connector / aiomysql / pymysql)
     errno = getattr(exc, "errno", None)
