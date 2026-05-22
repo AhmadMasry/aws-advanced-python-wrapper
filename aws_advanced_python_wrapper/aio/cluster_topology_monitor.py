@@ -225,15 +225,40 @@ class AsyncClusterTopologyMonitor:
             task = asyncio.create_task(self._probe_and_report(host_info))
             self._probe_tasks[alias] = task
 
+    # Aurora PG briefly rejects IAM/PAM auth on instances mid-promotion
+    # (the PAM service restarts during the writer-role swap). Mirror the
+    # sync ``HostMonitor`` bounded-retry from commit ``724de17`` so a
+    # single PAM-transient blip doesn't waste this probe slot and force
+    # the outer tick to fully respawn probes. Cancellation
+    # (``CancelledError``) propagates through ``await`` and exits the
+    # retry loop deterministically.
+    _MAX_TRANSIENT_PROBE_ATTEMPTS: int = 10
+    _PROBE_RETRY_BACKOFF_SEC: float = 0.5
+
     async def _probe_and_report(self, host_info: HostInfo) -> None:
         """Run one probe; stash the conn + host on winner, close on loser."""
         assert self._probe_host is not None  # _should_panic gates this
         conn: Optional[Any] = None
-        try:
-            conn, role = await self._probe_host(host_info)
-        except Exception:
-            # Probe failures are expected (network, auth, etc.) -- don't
-            # crash the monitor task.
+        role: Optional[HostRole] = None
+        for attempt in range(self._MAX_TRANSIENT_PROBE_ATTEMPTS + 1):
+            try:
+                conn, role = await self._probe_host(host_info)
+                break  # success
+            except asyncio.CancelledError:
+                # Propagate so ``stop()`` can cleanly cancel this task.
+                raise
+            except Exception:
+                if attempt < self._MAX_TRANSIENT_PROBE_ATTEMPTS:
+                    # Mirror sync HostMonitor: short backoff, then retry.
+                    # Aurora PAM recovery empirically <5s, which matches
+                    # 10 * 0.5s = 5s total budget here.
+                    await asyncio.sleep(self._PROBE_RETRY_BACKOFF_SEC)
+                    continue
+                # Budget exhausted -- swallow per the existing probe
+                # contract ("Probe failures are expected -- don't crash").
+                return
+        if role is None:
+            # Defensive: loop exits via break-on-success or return above.
             return
 
         # Winner gate: the first probe to win the race claims the writer.
