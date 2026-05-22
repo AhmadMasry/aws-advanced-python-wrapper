@@ -615,12 +615,15 @@ class AuroraTopologyUtils(TopologyUtils):
         except ProgrammingError as e:
             raise AwsWrapperError(Messages.get("RdsHostListProvider.InvalidQuery"), e) from e
 
-    def _process_query_results(self, cursor: Cursor) -> Topology:
+    def _process_query_results(self, cursor: Cursor) -> Optional[Topology]:
         """
         Form a list of hosts from the results of the topology query.
         :param cursor: The Cursor object containing a reference to the results of the topology query.
-        :return: a tuple of hosts representing the database topology.
-        An empty tuple will be returned if the query results did not include a writer instance.
+        :return: a tuple of hosts representing the database topology, or ``None`` if the query results did
+        not include a writer instance. Returning ``None`` (rather than an empty tuple) signals the caller
+        not to overwrite the cached topology -- otherwise a brief no-master window during Aurora PG
+        failover would clear the cache and trip ``FailoverFailedError: No writer host found in topology``
+        in failover_v2_plugin._failover_writer.
         """
         host_map = {}
         for record in cursor:
@@ -637,7 +640,7 @@ class AuroraTopologyUtils(TopologyUtils):
 
         if len(writers) == 0:
             logger.error("RdsHostListProvider.InvalidTopology")
-            hosts.clear()
+            return None
         elif len(writers) == 1:
             hosts.append(writers[0])
         else:
@@ -681,7 +684,7 @@ class MultiAzTopologyUtils(TopologyUtils):
         except ProgrammingError as e:
             raise AwsWrapperError(Messages.get("RdsHostListProvider.InvalidQuery"), e) from e
 
-    def _process_multi_az_query_results(self, cursor: Cursor, writer_id: str) -> Topology:
+    def _process_multi_az_query_results(self, cursor: Cursor, writer_id: str) -> Optional[Topology]:
         hosts_dict = {}
         for record in cursor:
             host: HostInfo = self._create_multi_az_host(record, writer_id)
@@ -697,7 +700,7 @@ class MultiAzTopologyUtils(TopologyUtils):
 
         if len(writers) == 0:
             logger.error("RdsHostListProvider.InvalidTopology")
-            hosts.clear()
+            return None
         else:
             hosts.append(writers[0])
 
@@ -752,7 +755,7 @@ class GlobalAuroraTopologyUtils(AuroraTopologyUtils):
             self,
             cursor: Cursor,
             instance_templates_by_region: dict[str, HostInfo]
-    ) -> Topology:
+    ) -> Optional[Topology]:
         hosts_map = {}
         for record in cursor:
             host = self._create_global_host(record, instance_templates_by_region)
@@ -768,7 +771,7 @@ class GlobalAuroraTopologyUtils(AuroraTopologyUtils):
 
         if not writers:
             logger.error("RdsHostListProvider.InvalidTopology")
-            hosts.clear()
+            return None
         elif len(writers) == 1:
             hosts.append(writers[0])
         else:
