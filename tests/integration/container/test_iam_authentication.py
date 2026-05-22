@@ -37,6 +37,7 @@ from aws_advanced_python_wrapper.hostinfo import HostRole
 from tests.integration.container.utils.conditions import (
     disable_on_features, enable_on_deployments, enable_on_features,
     enable_on_num_instances)
+from tests.integration.container.utils.database_engine import DatabaseEngine
 from tests.integration.container.utils.database_engine_deployment import \
     DatabaseEngineDeployment
 from tests.integration.container.utils.driver_helper import DriverHelper
@@ -145,8 +146,18 @@ class TestAwsIamAuthentication:
         aurora_utility = RdsTestUtility(region)
         initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
 
+        # On PostgreSQL, pair failover with host_monitoring_v2 -- the prober
+        # threads keep the topology cache hot so the writer-changed signal
+        # reaches the failover plugin before the test's first post-failover
+        # query lands. host_monitoring is incompatible with mysql-connector
+        # (separate-thread abort not supported), so MySQL stays as-is.
+        engine = TestEnvironment.get_current().get_engine()
+        plugins_to_use = plugins
+        if engine == DatabaseEngine.PG:
+            plugins_to_use = plugins + ",host_monitoring_v2"
+
         props.update({
-            "plugins": plugins,
+            "plugins": plugins_to_use,
             "socket_timeout": 10,
             "connect_timeout": 10,
             "monitoring-connect_timeout": 5,
