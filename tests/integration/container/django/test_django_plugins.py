@@ -32,6 +32,7 @@ from django.db import connection, connections, models
 from django.test.utils import setup_test_environment, teardown_test_environment
 
 from aws_advanced_python_wrapper.errors import FailoverSuccessError
+from aws_advanced_python_wrapper.hostinfo import HostRole
 from tests.integration.container.utils.rds_test_utility import RdsTestUtility
 from ..utils.conditions import (disable_on_features, enable_on_deployments,
                                 enable_on_engines, enable_on_features,
@@ -609,8 +610,9 @@ class TestDjangoPlugins:
         with connection.cursor() as cursor:
             cursor.execute(RdsTestUtility.get_instance_id_query())
             current_writer_id = cursor.fetchone()[0]
-            assert rds_utils.is_db_instance_writer(current_writer_id) is True
             assert current_writer_id != initial_writer_id, "Should be connected to a new writer after failover"
+            assert (rds_utils.query_host_role(connection, TestEnvironment.get_current().get_engine())
+                    == HostRole.WRITER)
 
         # Clean up test data
         TestModel.objects.all().delete()
@@ -670,8 +672,9 @@ class TestDjangoPlugins:
         with connection.cursor() as cursor:
             cursor.execute(RdsTestUtility.get_instance_id_query())
             current_writer_id = cursor.fetchone()[0]
-            assert rds_utils.is_db_instance_writer(current_writer_id) is True
             assert current_writer_id != initial_writer_id, "Should be connected to a new writer after failover"
+            assert (rds_utils.query_host_role(connection, TestEnvironment.get_current().get_engine())
+                    == HostRole.WRITER)
 
         # Clean up test data
         TestModel.objects.all().delete()

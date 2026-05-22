@@ -282,6 +282,7 @@ class TestAuroraFailover:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
+    @pytest.mark.timeout(900)
     def test_writer_fail_within_transaction_start_transaction(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility,
             plugins):

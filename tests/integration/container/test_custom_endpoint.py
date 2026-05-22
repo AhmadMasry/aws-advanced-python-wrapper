@@ -343,9 +343,15 @@ class TestCustomEndpoint:
         with pytest.raises(ReadWriteSplittingError):
             conn.read_only = False
 
-        writer_id = rds_utils.get_cluster_writer_instance_id()
-
         rds_client = client('rds', region_name=TestEnvironment.get_current().get_aurora_region())
+
+        # Capture writer_id from the control plane, but re-confirm it after
+        # the endpoint stabilization wait. The preceding test_custom_endpoint_failover
+        # triggers a failover; the AWS DescribeDBClusters API can briefly report
+        # the old writer for tens of seconds after a flip, which can place a
+        # stale instance ID into the StaticMembers set and leave the wrapper's
+        # filtered topology with no writer host.
+        writer_id = rds_utils.get_cluster_writer_instance_id()
         rds_client.modify_db_cluster_endpoint(
             DBClusterEndpointIdentifier=self.endpoint_id,
             StaticMembers=[original_reader_id, writer_id]
@@ -353,6 +359,21 @@ class TestCustomEndpoint:
 
         try:
             self.wait_until_endpoint_has_members(rds_client, {original_reader_id, writer_id}, rds_utils)
+
+            # If the cluster's writer shifted during the endpoint-stabilization
+            # wait, re-modify the endpoint to include the current writer before
+            # asking the wrapper to switch.
+            for _ in range(3):
+                current_writer_id = rds_utils.get_cluster_writer_instance_id()
+                if current_writer_id == writer_id:
+                    break
+                writer_id = current_writer_id
+                rds_client.modify_db_cluster_endpoint(
+                    DBClusterEndpointIdentifier=self.endpoint_id,
+                    StaticMembers=[original_reader_id, writer_id]
+                )
+                self.wait_until_endpoint_has_members(
+                    rds_client, {original_reader_id, writer_id}, rds_utils)
 
             # We should now be able to switch to writer.
             conn.read_only = False
