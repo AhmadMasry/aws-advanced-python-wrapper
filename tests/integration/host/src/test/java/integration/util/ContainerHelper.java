@@ -206,7 +206,7 @@ public class ContainerHelper {
                           .run("sh", "-c",
                               "apt-get update && apt-get upgrade -y && "
                                   + "apt-get install -y --no-install-recommends "
-                                  + "curl gcc libpq-dev pkg-config && "
+                                  + "build-essential libpq-dev pkg-config curl && "
                                   + "rm -rf /var/lib/apt/lists/*")
                           .run("mkdir", "app")
                           .workDir("/app")
@@ -229,7 +229,7 @@ public class ContainerHelper {
                           .run("sh", "-c",
                               "apt-get update && apt-get upgrade -y && "
                                   + "apt-get install -y --no-install-recommends "
-                                  + "curl gcc libpq-dev pkg-config && "
+                                  + "build-essential libpq-dev pkg-config curl && "
                                   + "rm -rf /var/lib/apt/lists/*")
                           .run("mkdir", "app")
                           .workDir("/app")
