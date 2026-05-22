@@ -146,15 +146,23 @@ class TestAwsIamAuthentication:
         aurora_utility = RdsTestUtility(region)
         initial_writer_id = aurora_utility.get_cluster_writer_instance_id()
 
-        # On PostgreSQL, pair failover with host_monitoring_v2 -- the prober
-        # threads keep the topology cache hot so the writer-changed signal
-        # reaches the failover plugin before the test's first post-failover
-        # query lands. host_monitoring is incompatible with mysql-connector
-        # (separate-thread abort not supported), so MySQL stays as-is.
+        # On PostgreSQL, pair failover/failover_v2 with host_monitoring_v2 by
+        # inserting it *immediately after* the failover plugin in the chain,
+        # e.g. "failover_v2,iam" -> "failover_v2,host_monitoring_v2,iam". The
+        # prober threads keep the topology cache hot so the writer-changed
+        # signal reaches the failover plugin before the test's first
+        # post-failover query lands. host_monitoring is incompatible with
+        # mysql-connector (separate-thread abort not supported), so MySQL
+        # stays as-is.
         engine = TestEnvironment.get_current().get_engine()
         plugins_to_use = plugins
         if engine == DatabaseEngine.PG:
-            plugins_to_use = plugins + ",host_monitoring_v2"
+            chained = []
+            for plugin_code in plugins.split(","):
+                chained.append(plugin_code)
+                if plugin_code in ("failover", "failover_v2"):
+                    chained.append("host_monitoring_v2")
+            plugins_to_use = ",".join(chained)
 
         props.update({
             "plugins": plugins_to_use,
