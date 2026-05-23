@@ -41,6 +41,9 @@ from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.transient_connect import \
     is_transient_connect_error
+from tests.integration.container.utils.test_timings import (
+    WRITER_CHANGED_PROBE_CONNECT_TIMEOUT_SEC,
+    WRITER_CHANGED_PROBE_POLL_INTERVAL_SEC)
 from .database_engine import DatabaseEngine
 from .database_engine_deployment import DatabaseEngineDeployment
 from .driver_helper import DriverHelper
@@ -242,7 +245,8 @@ class RdsTestUtility:
             cluster_endpoint, port, info.get_username(), info.get_password(),
             info.get_default_db_name(),
             test_driver=TestDriver.PG if engine == DatabaseEngine.PG else TestDriver.MYSQL)
-        connect_params["connect_timeout" if engine == DatabaseEngine.PG else "connection_timeout"] = 5
+        connect_params["connect_timeout" if engine == DatabaseEngine.PG else "connection_timeout"] = \
+            WRITER_CHANGED_PROBE_CONNECT_TIMEOUT_SEC
         connect_func = DriverHelper.get_connect_func(
             TestDriver.PG if engine == DatabaseEngine.PG else TestDriver.MYSQL)
         instance_id_query = self.get_instance_id_query(engine)
@@ -286,7 +290,7 @@ class RdsTestUtility:
                         raise last_non_transient_ex
                 # Aurora may briefly reject connections mid-failover; keep polling.
                 self.logger.debug("writer_changed SQL probe failed: " + str(ex))
-            sleep(2)
+            sleep(WRITER_CHANGED_PROBE_POLL_INTERVAL_SEC)
         return False
 
     def _writer_changed_via_rds_api(self, initial_writer_id: str, cluster_id: str, timeout: int) -> bool:

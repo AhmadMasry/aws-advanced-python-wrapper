@@ -40,6 +40,7 @@ from .utils.driver_helper import DriverHelper
 from .utils.rds_test_utility import RdsTestUtility
 from .utils.test_environment import TestEnvironment
 from .utils.test_environment_features import TestEnvironmentFeatures
+from .utils.test_timings import FAILOVER_WITHIN_TRANSACTION_PYTEST_TIMEOUT_SEC
 
 logger = Logger(__name__)
 
@@ -282,7 +283,7 @@ class TestAuroraFailover:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
-    @pytest.mark.timeout(900)
+    @pytest.mark.timeout(FAILOVER_WITHIN_TRANSACTION_PYTEST_TIMEOUT_SEC)
     def test_writer_fail_within_transaction_start_transaction(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility,
             plugins):

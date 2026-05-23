@@ -42,6 +42,8 @@ from tests.integration.container.utils.rds_test_utility import RdsTestUtility
 from tests.integration.container.utils.test_environment import TestEnvironment
 from tests.integration.container.utils.test_environment_features import \
     TestEnvironmentFeatures
+from tests.integration.container.utils.test_timings import \
+    CUSTOM_ENDPOINT_INFO_REFRESH_RATE_MS
 
 
 @enable_on_num_instances(min_instances=3)
@@ -96,7 +98,7 @@ class TestCustomEndpoint:
         # its previous (stale) member set when ``conn.read_only = False`` fires,
         # so ReadWriteSplittingPlugin's writer-discovery fails and the test
         # raises ReadWriteSplittingError instead of switching cleanly.
-        p["custom_endpoint_info_refresh_rate_ms"] = 2_000
+        p["custom_endpoint_info_refresh_rate_ms"] = CUSTOM_ENDPOINT_INFO_REFRESH_RATE_MS
         return p
 
     @pytest.fixture(scope='class')

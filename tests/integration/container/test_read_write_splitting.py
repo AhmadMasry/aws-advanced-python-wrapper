@@ -13,7 +13,6 @@
 #  limitations under the License.
 
 import gc
-import time
 
 import pytest
 from sqlalchemy import PoolProxiedConnection
@@ -44,6 +43,8 @@ from tests.integration.container.utils.test_driver import TestDriver
 from tests.integration.container.utils.test_environment import TestEnvironment
 from tests.integration.container.utils.test_environment_features import \
     TestEnvironmentFeatures
+from tests.integration.container.utils.test_timings import \
+    RWS_CLUSTER_RO_DNS_RETRY_ATTEMPTS
 
 
 @enable_on_num_instances(min_instances=2)
@@ -485,7 +486,7 @@ class TestReadWriteSplitting:
         # top-level wrapper connection per attempt — each iteration
         # is a fresh ``psycopg``/``mysql.connector`` connect with a
         # fresh ``getaddrinfo`` roll.
-        attempts_remaining = 4
+        attempts_remaining = RWS_CLUSTER_RO_DNS_RETRY_ATTEMPTS
         while attempts_remaining > 0 and reader_id == writer_id:
             with AwsWrapperConnection.connect(
                 target_driver_connect,
@@ -775,7 +776,7 @@ class TestReadWriteSplitting:
         # brand-new top-level wrapper connection — each iteration is
         # a fresh ``psycopg``/``mysql.connector`` connect with a
         # fresh ``getaddrinfo`` roll.
-        attempts_remaining = 4
+        attempts_remaining = RWS_CLUSTER_RO_DNS_RETRY_ATTEMPTS
         while (
             attempts_remaining > 0
             and reader_connection_id == writer_connection_id
