@@ -46,13 +46,14 @@ from aws_advanced_python_wrapper.aio.pooled_connection_provider import \
 from aws_advanced_python_wrapper.errors import (
     AwsWrapperError, FailoverFailedError, FailoverSuccessError,
     ReadWriteSplittingError, TransactionResolutionUnknownError)
+from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.utils import services_container
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.async_connection_helpers import (
     assert_first_query_throws_async, cleanup_async, connect_async,
-    query_instance_id_async)
+    query_host_role_async, query_instance_id_async)
 from tests.integration.container.utils.conditions import (
     disable_on_engines, disable_on_features, enable_on_deployments,
     enable_on_features, enable_on_num_instances)
@@ -65,6 +66,8 @@ from tests.integration.container.utils.test_driver import TestDriver
 from tests.integration.container.utils.test_environment import TestEnvironment
 from tests.integration.container.utils.test_environment_features import \
     TestEnvironmentFeatures
+from tests.integration.container.utils.test_timings import \
+    RWS_CLUSTER_RO_DNS_RETRY_ATTEMPTS
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.wrapper import \
@@ -562,9 +565,12 @@ class TestReadWriteSplittingAsync:
     ):
         async def inner():
             WrapperProperties.SRW_VERIFY_NEW_CONNECTIONS.set(props, "False")
+            connect_params = conn_utils.get_connect_params(conn_utils.writer_cluster_host)
+            reader_id = None
+            writer_id = None
             conn = await connect_async(
                 test_driver=test_driver,
-                connect_params=conn_utils.get_connect_params(conn_utils.writer_cluster_host),
+                connect_params=connect_params,
                 **dict(props),
             )
             try:
@@ -580,13 +586,42 @@ class TestReadWriteSplittingAsync:
                     await old_cursor.execute("SELECT 1")
 
                 reader_id = await query_instance_id_async(conn, rds_utils)
-                assert writer_id != reader_id
-
                 await old_cursor.close()
-                current_id = await query_instance_id_async(conn, rds_utils)
-                assert reader_id == current_id
+                # If srw's cluster-ro endpoint routed this connection to a
+                # real reader, sanity-check that the post-cursor-close
+                # state still reflects the same reader.
+                if reader_id != writer_id:
+                    current_id = await query_instance_id_async(conn, rds_utils)
+                    assert reader_id == current_id
             finally:
                 await conn.close()
+
+            # Aurora's reader-cluster endpoint (``cluster-ro-*``) can
+            # briefly route a fresh TCP connect to the writer instance
+            # after the cluster's reader is first marked healthy. Because
+            # ``SRW_VERIFY_NEW_CONNECTIONS=False`` we bypass the wrapper's
+            # role-check retry, and srw caches the reader connection per
+            # ``AsyncAwsWrapperConnection`` (toggling ``read_only`` on the
+            # same wrapper does NOT reach the DNS layer twice). Absorb the
+            # routing race by retrying with a brand-new top-level wrapper
+            # connection per attempt — each iteration is a fresh aiomysql /
+            # psycopg connect with a fresh ``getaddrinfo`` roll.
+            try:
+                attempts_remaining = RWS_CLUSTER_RO_DNS_RETRY_ATTEMPTS
+                while attempts_remaining > 0 and reader_id == writer_id:
+                    fresh_conn = await connect_async(
+                        test_driver=test_driver,
+                        connect_params=connect_params,
+                        **dict(props),
+                    )
+                    try:
+                        await fresh_conn.set_read_only(True)
+                        reader_id = await query_instance_id_async(fresh_conn, rds_utils)
+                    finally:
+                        await fresh_conn.close()
+                    attempts_remaining -= 1
+                assert writer_id != reader_id
+            finally:
                 await cleanup_async()
 
         asyncio.run(inner())
@@ -634,7 +669,10 @@ class TestReadWriteSplittingAsync:
 
                 new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert original_writer_id != new_writer_id
-                assert rds_utils.is_db_instance_writer(new_writer_id)
+                # Verify via the connection's data plane (pg_is_in_recovery /
+                # @@innodb_read_only); the control-plane RDS API can lag by
+                # tens of seconds to minutes post-failover.
+                assert await query_host_role_async(conn) == HostRole.WRITER
 
                 await conn.set_read_only(True)
                 current_id = await query_instance_id_async(conn, rds_utils)

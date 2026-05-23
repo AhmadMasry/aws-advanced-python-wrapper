@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from aws_advanced_python_wrapper.aio.cleanup import release_resources_async
 from aws_advanced_python_wrapper.aio.wrapper import AsyncAwsWrapperConnection
 from aws_advanced_python_wrapper.errors import UnsupportedOperationError
+from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.utils.messages import Messages
 from .database_engine import DatabaseEngine
 from .database_engine_deployment import DatabaseEngineDeployment
@@ -156,6 +157,41 @@ async def query_instance_id_async(
         raise RuntimeError(
             f"query_instance_id_async: unsupported deployment {deployment}"
         )
+
+
+async def query_host_role_async(
+        conn: AsyncAwsWrapperConnection,
+        engine: Optional[DatabaseEngine] = None) -> HostRole:
+    """Async counterpart of ``rds_utils.query_host_role``.
+
+    Reads the live connection's data-plane writer/reader status (PG:
+    ``pg_is_in_recovery()``; MySQL: ``@@innodb_read_only``) via an async
+    cursor. Prefer this over ``aurora_utility.is_db_instance_writer`` in
+    async tests where the connection's role matters — the RDS API field
+    can lag the data plane by tens of seconds to minutes during Aurora
+    failover, while the data plane converges within seconds.
+
+    ``engine`` defaults to the current ``TestEnvironment`` engine so callers
+    don't have to plumb it through every assertion site.
+    """
+    if engine is None:
+        engine = TestEnvironment.get_current().get_engine()
+
+    if engine == DatabaseEngine.MYSQL:
+        is_reader_query = "SELECT @@innodb_read_only"
+    elif engine == DatabaseEngine.PG:
+        is_reader_query = "SELECT pg_catalog.pg_is_in_recovery()"
+    else:
+        raise UnsupportedOperationError(engine.value)
+
+    async with conn.cursor() as cur:
+        await cur.execute(is_reader_query)
+        record = await cur.fetchone()
+        is_reader = record[0]
+
+    if is_reader in (1, True):
+        return HostRole.READER
+    return HostRole.WRITER
 
 
 async def assert_first_query_throws_async(

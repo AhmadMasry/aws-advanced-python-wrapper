@@ -39,11 +39,12 @@ import pytest
 
 from aws_advanced_python_wrapper.errors import (AwsWrapperError,
                                                 FailoverSuccessError)
+from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.async_connection_helpers import (
     assert_first_query_throws_async, cleanup_async, connect_async,
-    query_instance_id_async)
+    query_host_role_async, query_instance_id_async)
 from tests.integration.container.utils.conditions import (
     disable_on_features, enable_on_deployments, enable_on_features,
     enable_on_num_instances)
@@ -261,7 +262,9 @@ class TestAwsIamAuthenticationAsync:
 
                 # assert that we are connected to the new writer after failover happens
                 current_connection_id = await query_instance_id_async(conn, aurora_utility)
-                assert aurora_utility.is_db_instance_writer(current_connection_id) is True
+                # Verify via the connection's data plane (pg_is_in_recovery /
+                # @@innodb_read_only); the control-plane RDS API can lag.
+                assert await query_host_role_async(conn) == HostRole.WRITER
                 assert current_connection_id != initial_writer_id
             finally:
                 await conn.close()

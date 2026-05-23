@@ -23,10 +23,12 @@ import pytest
 
 from aws_advanced_python_wrapper.errors import (
     FailoverSuccessError, TransactionResolutionUnknownError)
+from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 from tests.integration.container.utils.async_connection_helpers import (
-    cleanup_async, connect_async, query_instance_id_async)
+    cleanup_async, connect_async, query_host_role_async,
+    query_instance_id_async)
 from .utils.conditions import (disable_on_features, enable_on_deployments,
                                enable_on_features, enable_on_num_instances)
 from .utils.database_engine_deployment import DatabaseEngineDeployment
@@ -41,6 +43,7 @@ from aws_advanced_python_wrapper.utils.log import Logger
 from .utils.rds_test_utility import RdsTestUtility
 from .utils.test_environment import TestEnvironment
 from .utils.test_environment_features import TestEnvironmentFeatures
+from .utils.test_timings import FAILOVER_WITHIN_TRANSACTION_PYTEST_TIMEOUT_SEC
 
 logger = Logger(__name__)
 
@@ -121,7 +124,11 @@ class TestAuroraFailoverAsync:
 
                 # assert that we are connected to the new writer after failover happens.
                 current_connection_id = await query_instance_id_async(conn, aurora_utility)
-                assert aurora_utility.is_db_instance_writer(current_connection_id) is True
+                # Verify writer-status via the data plane (the connection's
+                # own ``pg_is_in_recovery()`` / ``@@innodb_read_only``) rather
+                # than the control-plane ``DescribeDBClusters.IsClusterWriter``,
+                # which can lag by tens of seconds to minutes post-failover.
+                assert await query_host_role_async(conn) == HostRole.WRITER
                 assert current_connection_id != initial_writer_id
             finally:
                 await conn.close()
@@ -152,7 +159,11 @@ class TestAuroraFailoverAsync:
 
                 # assert that we are connected to the new writer after failover happens and we can reuse the cursor
                 current_connection_id = await query_instance_id_async(conn, aurora_utility)
-                assert aurora_utility.is_db_instance_writer(current_connection_id) is True
+                # Verify writer-status via the data plane (the connection's
+                # own ``pg_is_in_recovery()`` / ``@@innodb_read_only``) rather
+                # than the control-plane ``DescribeDBClusters.IsClusterWriter``,
+                # which can lag by tens of seconds to minutes post-failover.
+                assert await query_host_role_async(conn) == HostRole.WRITER
                 assert current_connection_id != initial_writer_id
             finally:
                 await conn.close()
@@ -189,7 +200,11 @@ class TestAuroraFailoverAsync:
                 current_connection_id = await query_instance_id_async(conn, aurora_utility)
 
                 assert writer_id == current_connection_id
-                assert aurora_utility.is_db_instance_writer(current_connection_id) is True
+                # Verify writer-status via the data plane (the connection's
+                # own ``pg_is_in_recovery()`` / ``@@innodb_read_only``) rather
+                # than the control-plane ``DescribeDBClusters.IsClusterWriter``,
+                # which can lag by tens of seconds to minutes post-failover.
+                assert await query_host_role_async(conn) == HostRole.WRITER
             finally:
                 await conn.close()
                 await cleanup_async()
@@ -230,7 +245,11 @@ class TestAuroraFailoverAsync:
                 # Attempt to query the instance id.
                 current_connection_id = await query_instance_id_async(conn, aurora_utility)
                 # Assert that we are connected to the new writer after failover happens.
-                assert aurora_utility.is_db_instance_writer(current_connection_id) is True
+                # Verify writer-status via the data plane (the connection's
+                # own ``pg_is_in_recovery()`` / ``@@innodb_read_only``) rather
+                # than the control-plane ``DescribeDBClusters.IsClusterWriter``,
+                # which can lag by tens of seconds to minutes post-failover.
+                assert await query_host_role_async(conn) == HostRole.WRITER
                 next_cluster_writer_id = aurora_utility.get_cluster_writer_instance_id()
                 assert current_connection_id == next_cluster_writer_id
                 assert current_connection_id != initial_writer_id
@@ -275,7 +294,11 @@ class TestAuroraFailoverAsync:
                 # Attempt to query the instance id.
                 current_connection_id = await query_instance_id_async(conn, aurora_utility)
                 # Assert that we are connected to the new writer after failover happens.
-                assert aurora_utility.is_db_instance_writer(current_connection_id) is True
+                # Verify writer-status via the data plane (the connection's
+                # own ``pg_is_in_recovery()`` / ``@@innodb_read_only``) rather
+                # than the control-plane ``DescribeDBClusters.IsClusterWriter``,
+                # which can lag by tens of seconds to minutes post-failover.
+                assert await query_host_role_async(conn) == HostRole.WRITER
                 next_cluster_writer_id = aurora_utility.get_cluster_writer_instance_id()
                 assert current_connection_id == next_cluster_writer_id
                 assert current_connection_id != initial_writer_id
@@ -323,7 +346,8 @@ class TestAuroraFailoverAsync:
                 current_connection_id: str = await query_instance_id_async(conn, aurora_utility)
 
                 # assert that we are connected to the new writer after failover happens
-                assert aurora_utility.is_db_instance_writer(current_connection_id)
+                # Data-plane writer check; see earlier sites for rationale.
+                assert await query_host_role_async(conn) == HostRole.WRITER
                 next_cluster_writer_id: str = aurora_utility.get_cluster_writer_instance_id()
 
                 assert current_connection_id == next_cluster_writer_id
@@ -345,6 +369,7 @@ class TestAuroraFailoverAsync:
 
     @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
+    @pytest.mark.timeout(FAILOVER_WITHIN_TRANSACTION_PYTEST_TIMEOUT_SEC)
     def test_writer_fail_within_transaction_start_transaction_async(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility,
             plugins):
@@ -378,7 +403,8 @@ class TestAuroraFailoverAsync:
                 current_connection_id: str = await query_instance_id_async(conn, aurora_utility)
 
                 # assert that we are connected to the new writer after failover happens
-                assert aurora_utility.is_db_instance_writer(current_connection_id)
+                # Data-plane writer check; see earlier sites for rationale.
+                assert await query_host_role_async(conn) == HostRole.WRITER
                 next_cluster_writer_id: str = aurora_utility.get_cluster_writer_instance_id()
 
                 assert current_connection_id == next_cluster_writer_id

@@ -127,6 +127,16 @@ class TestSqlAlchemyAsync:
                 # because FailoverSuccessError is reclassified as OperationalError.
                 recovered = False
                 attempts_remaining = 10
+                # Verify the new connection lands on the actual writer via
+                # the data plane (``pg_is_in_recovery()`` / ``@@innodb_read_only``)
+                # rather than the control-plane ``DescribeDBClusters.IsClusterWriter``
+                # which can lag by tens of seconds to minutes post-failover.
+                engine_type = TestEnvironment.get_current().get_engine()
+                is_reader_sql = (
+                    "SELECT pg_catalog.pg_is_in_recovery()"
+                    if engine_type == DatabaseEngine.PG
+                    else "SELECT @@innodb_read_only"
+                )
                 while attempts_remaining > 0 and not recovered:
                     try:
                         async with engine.connect() as conn:
@@ -134,7 +144,10 @@ class TestSqlAlchemyAsync:
                                 text(_instance_id_sql_async(test_driver))
                             )).scalar_one()
                             assert new_writer_id != initial_writer_id
-                            assert aurora_utility.is_db_instance_writer(new_writer_id) is True
+                            is_reader = (await conn.execute(
+                                text(is_reader_sql)
+                            )).scalar_one()
+                            assert is_reader in (0, False)
                             recovered = True
                     except OperationalError:
                         attempts_remaining -= 1
