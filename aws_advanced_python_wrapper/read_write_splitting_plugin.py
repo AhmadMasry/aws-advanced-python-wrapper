@@ -536,6 +536,7 @@ class TopologyBasedConnectionHandler(ReadWriteConnectionHandler):
 
     def __init__(self, plugin_service: PluginService, props: Properties):
         self._plugin_service: PluginService = plugin_service
+        self._properties: Properties = props
         self._host_list_provider_service: Optional[HostListProviderService] = None
         strategy = WrapperProperties.READER_HOST_SELECTOR_STRATEGY.get(props)
         if strategy is not None:
@@ -575,6 +576,9 @@ class TopologyBasedConnectionHandler(ReadWriteConnectionHandler):
         conn: Optional[Connection] = None
         reader_host: Optional[HostInfo] = None
 
+        recheck_role = WrapperProperties.RWS_RECHECK_READER_ROLE.get_bool(
+            self._properties)
+
         conn_attempts = len(self._plugin_service.hosts) * 2
         for _ in range(conn_attempts):
             host = self._plugin_service.get_host_info_by_strategy(
@@ -582,13 +586,41 @@ class TopologyBasedConnectionHandler(ReadWriteConnectionHandler):
             )
             if host is not None:
                 try:
-                    conn = plugin_service_connect_func(host)
-                    reader_host = host
-                    break
+                    candidate_conn = plugin_service_connect_func(host)
                 except Exception:
                     logger.warning(
                         "ReadWriteSplittingPlugin.FailedToConnectToReader", host.url
                     )
+                    continue
+
+                # Aurora's topology can briefly disagree with the data plane
+                # after a failover (the picked instance was a reader at
+                # topology-query time but has since been promoted). Verify
+                # the live role and refresh on mismatch so we don't hand
+                # back a writer as a reader.
+                if recheck_role:
+                    try:
+                        actual_role = self._plugin_service.get_host_role(candidate_conn)
+                    except Exception:
+                        actual_role = None
+                    if actual_role is not None and actual_role != HostRole.READER:
+                        logger.debug(
+                            "ReadWriteSplittingPlugin.ReaderRoleMismatch",
+                            host.url, str(actual_role))
+                        ReadWriteSplittingConnectionManager.close_connection(
+                            candidate_conn, self._plugin_service.driver_dialect)
+                        try:
+                            self._plugin_service.force_refresh_host_list()
+                        except Exception:
+                            # Topology refresh is best-effort; the next
+                            # iteration's get_host_info_by_strategy will
+                            # work with whatever state we have.
+                            pass
+                        continue
+
+                conn = candidate_conn
+                reader_host = host
+                break
 
         return conn, reader_host
 

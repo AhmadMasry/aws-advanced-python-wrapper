@@ -113,6 +113,16 @@ conn = AwsWrapperConnection.connect(psycopg.Connection.connect, **params)
 | `weighted_random_default_weight`    | This parameter value must be an integer value. This parameter represents the default weight for any hosts that have not been configured with the `weighted_random_host_weight_pairs` parameter. For example, if a connection were already established and host weights were set with `round_robin_host_weight_pairs` but a new reader host was added to the database, the new reader host would use the default weight. <br><br> **Note:** This value must be an integer greater than or equal to 1.                                                                         | 1                                                                                                                  |
 | `fastest_response`                  | The fastest_response strategy will select reader instances based on which database instance has the fastest response time. Note that this strategy requires that the `fastest_response_strategy` and `read_write_splitting` plugins are both enabled. See [`Fastest Response Strategy Plugin`](./UsingTheFastestResponseStrategyPlugin.md)                                                                                                                                                                                                                                   | N/A                                                                                                                |
 
+### Reader role re-verification (`rws_recheck_reader_role`)
+
+Aurora's cluster topology (returned by `SHOW REPLICA STATUS` / equivalent) can briefly lag the data plane after a failover — an instance flagged as `READER` in topology may already have been promoted to writer, or vice versa, in the seconds before the wrapper's next topology refresh. Without verification, the plugin could pick a "reader" from stale topology and hand back a connection that's actually attached to the new writer.
+
+When `read_only = True` is set, the plugin opens a connection to its topology-selected reader, then queries the live connection's role via the data plane (PG: `pg_is_in_recovery()`; MySQL: `@@innodb_read_only`). If the live role doesn't match `HostRole.READER`, the plugin closes the connection, forces a topology refresh, and tries another candidate (up to the existing `2 × len(hosts)` candidate budget).
+
+| Parameter                  | Value   | Required | Description                                                                                                                                                                                                                | Default |
+|----------------------------|---------|----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `rws_recheck_reader_role`  | Boolean | No       | When `True`, the plugin verifies a freshly-picked reader connection's actual role and refreshes topology on mismatch. Set to `False` only if the recheck query shows up as latency in your workload — most consumers should leave it on. | `True`  |
+
 ### Limitations
 
 #### General plugin limitations
