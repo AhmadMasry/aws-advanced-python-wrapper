@@ -362,7 +362,10 @@ class TestCustomEndpoint:
 
             # If the cluster's writer shifted during the endpoint-stabilization
             # wait, re-modify the endpoint to include the current writer before
-            # asking the wrapper to switch.
+            # asking the wrapper to switch. Each iteration includes
+            # ``wait_until_endpoint_has_members`` which polls with its own
+            # internal backoff, so 3 iterations cover ~30-60s of real wall
+            # time -- not 3 tight passes.
             for _ in range(3):
                 current_writer_id = rds_utils.get_cluster_writer_instance_id()
                 if current_writer_id == writer_id:
