@@ -73,6 +73,16 @@ def _instance_id_sql(test_driver: TestDriver) -> str:
     return "SELECT pg_catalog.aurora_db_instance_identifier()"
 
 
+def _is_reader_sql(test_driver: TestDriver) -> str:
+    # Data-plane "is this a reader?" check. After an Aurora failover this
+    # is authoritative on the connected instance, while the control-plane
+    # DescribeDBClusters.IsClusterWriter can lag the data plane by tens of
+    # seconds on multi-instance clusters (5-instance MULTI-5 is the worst).
+    if _is_mysql(test_driver):
+        return "SELECT @@innodb_read_only"
+    return "SELECT pg_catalog.pg_is_in_recovery()"
+
+
 def _readonly_option(test_driver: TestDriver) -> dict:
     return {"mysql_readonly": True} if _is_mysql(test_driver) else {"postgresql_readonly": True}
 
@@ -165,7 +175,13 @@ class TestSqlAlchemy:
                             text(_instance_id_sql(test_driver))
                         ).scalar_one()
                         assert new_writer_id != initial_writer_id
-                        assert aurora_utility.is_db_instance_writer(new_writer_id) is True
+                        # Data-plane role check: pg_is_in_recovery / @@innodb_read_only
+                        # on the connected instance is authoritative and race-free
+                        # against the control plane (DescribeDBClusters), which can
+                        # disagree with the data plane for tens of seconds on
+                        # multi-instance Aurora clusters post-failover.
+                        is_reader = conn.execute(text(_is_reader_sql(test_driver))).scalar_one()
+                        assert is_reader in (0, False)
                         recovered = True
                 except OperationalError:
                     attempts_remaining -= 1

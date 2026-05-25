@@ -33,6 +33,8 @@ from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
+from aws_advanced_python_wrapper.utils.transient_connect import \
+    is_transient_connect_error
 from tests.integration.container.utils.conditions import (
     disable_on_features, enable_on_deployments, enable_on_num_instances)
 from tests.integration.container.utils.database_engine_deployment import \
@@ -301,8 +303,33 @@ class TestCustomEndpoint:
         rds_utils.failover_cluster_and_wait_until_writer_changed(target_id=failover_target)
 
         self.logger.debug("Verifying that new connection has role: " + host_role.name)
-        # Verify that new connection is now the correct role
-        with AwsWrapperConnection.connect(target_driver_connect, **conn_kwargs, **props) as conn:
+        # Verify that new connection is now the correct role.
+        #
+        # Post-failover the cluster's custom endpoint can briefly resolve to
+        # an instance whose driver port (3306 / 5432) isn't yet accepting
+        # connections -- worst on 5-instance MULTI-5 topology where more
+        # candidates need to settle. A bare ``ConnectionRefusedError`` from
+        # the driver socket surfaces directly as a test failure. Retry the
+        # connect a few times on transient connect errors so the test
+        # tolerates that settling window without masking real bugs.
+        attempts_remaining = 5
+        conn = None
+        last_transient_ex: Any = None
+        while attempts_remaining > 0:
+            try:
+                conn = AwsWrapperConnection.connect(target_driver_connect, **conn_kwargs, **props)
+                break
+            except Exception as ex:  # noqa: BLE001 -- classify below
+                if not is_transient_connect_error(ex):
+                    raise
+                last_transient_ex = ex
+                attempts_remaining -= 1
+                sleep(2)
+        if conn is None:
+            raise AssertionError(
+                "Custom endpoint connect did not stabilize within the retry budget; "
+                f"last transient error: {last_transient_ex}")
+        with conn:
             endpoint_members = self.endpoint_info["StaticMembers"]
             original_instance_id = rds_utils.query_instance_id(conn)
             assert original_instance_id in endpoint_members
