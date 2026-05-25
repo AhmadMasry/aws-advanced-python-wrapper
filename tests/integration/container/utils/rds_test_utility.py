@@ -263,6 +263,15 @@ class RdsTestUtility:
         consecutive_non_transient = 0
         last_non_transient_ex: Optional[BaseException] = None
 
+        # The data plane converges within seconds, but downstream test
+        # assertions can call ``get_cluster_writer_instance_id`` (RDS
+        # DescribeDBClusters) and ``is_db_instance_writer``, which read the
+        # control plane and lag the data plane by tens of seconds on
+        # multi-instance Aurora topologies. Returning as soon as the data
+        # plane flips lets those assertions race the control plane. Wait
+        # for control-plane convergence too -- within the same ``timeout``
+        # budget -- so callers see a consistent view across both planes.
+        data_plane_changed = False
         wait_until = timeit.default_timer() + timeout
         while timeit.default_timer() < wait_until:
             try:
@@ -272,7 +281,7 @@ class RdsTestUtility:
                         cursor.execute(instance_id_query)
                         row = cursor.fetchone()
                         if row is not None and row[0] != initial_writer_id:
-                            return True
+                            data_plane_changed = True
                     consecutive_non_transient = 0
                 finally:
                     conn.close()
@@ -290,6 +299,14 @@ class RdsTestUtility:
                         raise last_non_transient_ex
                 # Aurora may briefly reject connections mid-failover; keep polling.
                 self.logger.debug("writer_changed SQL probe failed: " + str(ex))
+            if data_plane_changed:
+                try:
+                    cp_writer = self.get_cluster_writer_instance_id(cluster_id)
+                    if cp_writer is not None and cp_writer != initial_writer_id:
+                        return True
+                except Exception as ex:
+                    self.logger.debug(
+                        "writer_changed control-plane probe failed: " + str(ex))
             sleep(WRITER_CHANGED_PROBE_POLL_INTERVAL_SEC)
         return False
 
