@@ -41,6 +41,7 @@ import timeit
 from time import sleep
 from typing import List
 
+import boto3
 import pytest
 
 from .utils.connection_utils import ConnectionUtils
@@ -51,6 +52,22 @@ from .utils.test_environment import TestEnvironment
 from .utils.test_environment_features import TestEnvironmentFeatures
 
 logger = Logger(__name__)
+
+
+# Pre-warm the full AWS API call pipeline on the main thread, before any
+# test creates failover-handler / topology-monitor worker threads. boto3
+# defers a lot of lazy initialisation (SSL context, urllib3 pool manager,
+# requests.Request construction, AWS credential-chain resolution) until
+# the first actual API call. Running one harmless describe_db_clusters at
+# conftest import time forces all of those to materialise once, on the
+# main thread, before any worker thread can run them concurrently with
+# libpq / psycopg activity -- which has caused native-level concurrency
+# races during heavy multi-thread Aurora failover workloads.
+try:
+    _prewarm_client = boto3.client(service_name='rds', region_name='us-east-1')
+    _prewarm_client.describe_db_clusters(MaxRecords=20)
+except Exception as _ex:  # noqa: BLE001 -- best-effort, must not block tests
+    logger.debug(f"AWS pipeline prewarm failed (non-fatal): {_ex}")
 
 
 @pytest.fixture(scope='module')
