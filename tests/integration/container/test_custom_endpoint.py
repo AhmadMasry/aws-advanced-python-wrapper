@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Set
 
 if TYPE_CHECKING:
     from tests.integration.container.utils.test_driver import TestDriver
@@ -313,11 +313,14 @@ class TestCustomEndpoint:
         # connect a few times on transient connect errors so the test
         # tolerates that settling window without masking real bugs.
         attempts_remaining = 5
-        conn = None
+        # Distinct name from the ``with ... as conn`` block above: that ``conn``
+        # is function-scoped and typed ``AwsWrapperConnection``, so reusing it
+        # here as ``None`` trips mypy's no-redef / incompatible-assignment.
+        verify_conn: Optional[AwsWrapperConnection] = None
         last_transient_ex: Any = None
         while attempts_remaining > 0:
             try:
-                conn = AwsWrapperConnection.connect(target_driver_connect, **conn_kwargs, **props)
+                verify_conn = AwsWrapperConnection.connect(target_driver_connect, **conn_kwargs, **props)
                 break
             except Exception as ex:  # noqa: BLE001 -- classify below
                 if not is_transient_connect_error(ex):
@@ -325,16 +328,16 @@ class TestCustomEndpoint:
                 last_transient_ex = ex
                 attempts_remaining -= 1
                 sleep(2)
-        if conn is None:
+        if verify_conn is None:
             raise AssertionError(
                 "Custom endpoint connect did not stabilize within the retry budget; "
                 f"last transient error: {last_transient_ex}")
-        with conn:
+        with verify_conn:
             endpoint_members = self.endpoint_info["StaticMembers"]
-            original_instance_id = rds_utils.query_instance_id(conn)
+            original_instance_id = rds_utils.query_instance_id(verify_conn)
             assert original_instance_id in endpoint_members
 
-            new_role = rds_utils.query_host_role(conn, TestEnvironment.get_current().get_engine())
+            new_role = rds_utils.query_host_role(verify_conn, TestEnvironment.get_current().get_engine())
             assert new_role == host_role
         self.logger.debug("Custom endpoint instance successfully set to role: " + host_role.name)
 
