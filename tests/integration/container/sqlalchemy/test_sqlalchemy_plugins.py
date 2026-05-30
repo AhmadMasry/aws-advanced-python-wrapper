@@ -14,6 +14,22 @@
 
 # flake8: noqa: N806
 
+"""SQLAlchemy ORM + plugins integration tests.
+
+Salvaged from main's PR #1224 and now bound to the wrapper's own dialect via
+the ``mysql+aws_wrapper_mysqlconnector://`` URL (see SqlAlchemySupport.md).
+
+PENDING VERIFICATION (do after the EC2/Aurora run confirms the merge is
+clean): these tests connect with mysql-connector's default C extension --
+they do NOT set ``use_pure=True``. The README recommends ``use_pure=True``
+for Aurora MySQL because the C extension's ``is_connected`` can block
+indefinitely on network failure, which is exactly what the failover tests
+here provoke. If these flake/hang on failover, add ``use_pure=True`` to the
+engine URLs. Tracked because the wrapper's MySQL SA dialect is already
+verified under ``use_pure=True`` elsewhere (test_sqlalchemy.py), but these
+ORM-level failover paths are not yet exercised on real Aurora.
+"""
+
 from __future__ import annotations
 
 import json
