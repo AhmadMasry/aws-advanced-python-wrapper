@@ -194,7 +194,7 @@ def test_sa_dialect_subclasses_mysqldialect_aiomysql():
         AwsWrapperMySQLAiomysqlAsyncDialect, MySQLDialect_aiomysql
     )
     assert AwsWrapperMySQLAiomysqlAsyncDialect.is_async is True
-    assert AwsWrapperMySQLAiomysqlAsyncDialect.driver == "aiomysql_async"
+    assert AwsWrapperMySQLAiomysqlAsyncDialect.driver == "aws_wrapper_aiomysql"
 
 
 def test_sa_dialect_import_dbapi_returns_adapter():
@@ -206,16 +206,16 @@ def test_sa_dialect_import_dbapi_returns_adapter():
     assert adapter.Error is aio_aiomysql.Error
 
 
-def test_sa_dialect_registry_resolves_both_url_forms():
+def test_sa_dialect_registry_resolves():
     from sqlalchemy.dialects import registry
 
     from aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async import \
         AwsWrapperMySQLAiomysqlAsyncDialect
-    cls = registry.load("aws_wrapper_mysql_async")
-    assert cls is AwsWrapperMySQLAiomysqlAsyncDialect
 
-    cls2 = registry.load("aws_wrapper_mysql.aiomysql_async")
-    assert cls2 is AwsWrapperMySQLAiomysqlAsyncDialect
+    # aiomysql is an async-only DBAPI, so the driver name conveys async on its
+    # own -- no ``_async`` suffix, matching stock ``mysql+aiomysql``.
+    cls = registry.load("mysql.aws_wrapper_aiomysql")
+    assert cls is AwsWrapperMySQLAiomysqlAsyncDialect
 
 
 def test_sa_url_resolves_to_our_dialect():
@@ -224,9 +224,9 @@ def test_sa_url_resolves_to_our_dialect():
     from aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async import \
         AwsWrapperMySQLAiomysqlAsyncDialect
     url = make_url(
-        "aws_wrapper_mysql+aiomysql_async://u:p@h:3306/db?wrapper_dialect=aurora-mysql"
+        "mysql+aws_wrapper_aiomysql://u:p@h:3306/db?wrapper_dialect=aurora-mysql"
     )
-    assert url.get_dialect() is AwsWrapperMySQLAiomysqlAsyncDialect
+    assert url.get_dialect(_is_async=True) is AwsWrapperMySQLAiomysqlAsyncDialect
 
 
 def test_sa_dialect_renames_wrapper_plugins_url_alias():
@@ -236,7 +236,7 @@ def test_sa_dialect_renames_wrapper_plugins_url_alias():
         AwsWrapperMySQLAiomysqlAsyncDialect
     d = AwsWrapperMySQLAiomysqlAsyncDialect()
     url = make_url(
-        "aws_wrapper_mysql+aiomysql_async://u:p@h:3306/db"
+        "mysql+aws_wrapper_aiomysql://u:p@h:3306/db"
         "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover"
     )
     _args, kwargs = d.create_connect_args(url)

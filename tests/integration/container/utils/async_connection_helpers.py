@@ -84,14 +84,16 @@ def create_async_engine_for_driver(
         **engine_kwargs: Any) -> AsyncEngine:
     """Build an AsyncEngine using the wrapper's registered async dialect.
 
-    Dialect URL schemes (registered in pyproject.toml):
-      * aws_wrapper_postgresql+psycopg_async  (PG)
-      * aws_wrapper_mysql+aiomysql_async      (MySQL)
+    Dialect URL schemes (registered in pyproject.toml). PG uses the same
+    URL as sync -- create_async_engine selects the async dialect via the
+    sync dialect's get_async_dialect_cls hook:
+      * postgresql+aws_wrapper_psycopg  (PG, sync + async)
+      * mysql+aws_wrapper_aiomysql      (MySQL async)
     """
     if test_driver == TestDriver.PG_ASYNC:
-        driver_scheme = "aws_wrapper_postgresql+psycopg_async"
+        driver_scheme = "postgresql+aws_wrapper_psycopg"
     elif test_driver == TestDriver.MYSQL_ASYNC:
-        driver_scheme = "aws_wrapper_mysql+aiomysql_async"
+        driver_scheme = "mysql+aws_wrapper_aiomysql"
     else:
         raise UnsupportedOperationError(
             Messages.get_formatted(

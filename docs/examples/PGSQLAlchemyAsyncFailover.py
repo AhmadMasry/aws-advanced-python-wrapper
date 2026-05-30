@@ -14,10 +14,11 @@
 
 """Async SQLAlchemy + AWS Advanced Python Wrapper: failover on Aurora PostgreSQL.
 
-URL-based async engine usage (SP-9). The dialect `aws_wrapper_postgresql+psycopg_async`
-routes `create_async_engine` through `AsyncAwsWrapperConnection`, so all wrapper
-plugins (failover, host_monitoring_v2, etc. -- landing in later sub-projects) are available in
-async apps.
+URL-based async engine usage (SP-9). The `postgresql+aws_wrapper_psycopg` URL is
+shared with the sync engine -- `create_async_engine` selects the async dialect via
+the sync dialect's `get_async_dialect_cls` hook -- routing through
+`AsyncAwsWrapperConnection`, so all wrapper plugins (failover, host_monitoring_v2,
+etc.) are available in async apps.
 
 The wrapper's `plugins` connection property is spelled `wrapper_plugins` in the
 URL query string because SA reserves `plugins=` for its own engine-plugin loader.
@@ -40,7 +41,7 @@ PASSWORD = "pwd"
 
 def build_engine():
     return create_async_engine(
-        f"aws_wrapper_postgresql+psycopg_async://{USER}:{PASSWORD}@"
+        f"postgresql+aws_wrapper_psycopg://{USER}:{PASSWORD}@"
         f"{CLUSTER_ENDPOINT}:5432/{DB_NAME}"
         "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2",
     )

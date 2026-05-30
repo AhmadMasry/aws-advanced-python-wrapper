@@ -22,7 +22,7 @@ URL-based dialect path in SP-9::
     from aws_advanced_python_wrapper.aio.psycopg import connect
 
     engine = create_async_engine(
-        "postgresql+psycopg_async://",
+        "postgresql+aws_wrapper_psycopg://",
         async_creator=lambda: connect(
             "host=... user=... dbname=...",
             wrapper_dialect="aurora-pg",

@@ -66,7 +66,7 @@ unset FILTER  # Done testing the IAM tests, unset FILTER
 
 ## Running async integration tests
 
-The wrapper ships async counterparts to every sync integration test file. Async tests exercise `AsyncAwsWrapperConnection` (raw) and `create_async_engine` with the wrapper's async dialects (`aws_wrapper_postgresql+psycopg_async`, `aws_wrapper_mysql+aiomysql_async`). They are invoked via dedicated Gradle tasks, independent of the sync tasks:
+The wrapper ships async counterparts to every sync integration test file. Async tests exercise `AsyncAwsWrapperConnection` (raw) and `create_async_engine` with the wrapper's dialects (`postgresql+aws_wrapper_psycopg` — shared with sync via `get_async_dialect_cls`; `mysql+aws_wrapper_aiomysql`). They are invoked via dedicated Gradle tasks, independent of the sync tasks:
 
 | Deployment | Engine | Sync task | Async task |
 |---|---|---|---|

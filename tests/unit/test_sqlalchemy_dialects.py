@@ -36,7 +36,7 @@ def test_pg_dialect_import_dbapi_returns_wrapper_submodule():
 
 
 def test_pg_dialect_driver_attr():
-    assert AwsWrapperPGPsycopgDialect.driver == "psycopg"
+    assert AwsWrapperPGPsycopgDialect.driver == "aws_wrapper_psycopg"
 
 
 def test_mysql_dialect_subclasses_mysqldialect_mysqlconnector():
@@ -48,39 +48,32 @@ def test_mysql_dialect_import_dbapi_returns_wrapper_submodule():
 
 
 def test_mysql_dialect_driver_attr():
-    assert AwsWrapperMySQLConnectorDialect.driver == "mysqlconnector"
+    assert AwsWrapperMySQLConnectorDialect.driver == "aws_wrapper_mysqlconnector"
 
 
-def test_registry_resolves_aws_wrapper_postgresql():
-    cls = registry.load("aws_wrapper_postgresql")
+# Registration uses the SA <dialect>.<driver> convention: the wrapper plugs in
+# as a driver under the stock ``postgresql`` / ``mysql`` dialects, so the URL is
+# ``postgresql+aws_wrapper_psycopg`` / ``mysql+aws_wrapper_mysqlconnector``.
+def test_registry_resolves_postgresql_aws_wrapper_psycopg():
+    cls = registry.load("postgresql.aws_wrapper_psycopg")
     assert cls is AwsWrapperPGPsycopgDialect
 
 
-def test_registry_resolves_aws_wrapper_postgresql_psycopg():
-    cls = registry.load("aws_wrapper_postgresql.psycopg")
-    assert cls is AwsWrapperPGPsycopgDialect
-
-
-def test_registry_resolves_aws_wrapper_mysql():
-    cls = registry.load("aws_wrapper_mysql")
-    assert cls is AwsWrapperMySQLConnectorDialect
-
-
-def test_registry_resolves_aws_wrapper_mysql_mysqlconnector():
-    cls = registry.load("aws_wrapper_mysql.mysqlconnector")
+def test_registry_resolves_mysql_aws_wrapper_mysqlconnector():
+    cls = registry.load("mysql.aws_wrapper_mysqlconnector")
     assert cls is AwsWrapperMySQLConnectorDialect
 
 
 def test_url_get_dialect_pg():
     url = make_url(
-        "aws_wrapper_postgresql+psycopg://u:p@h:5432/db?wrapper_dialect=aurora-pg"
+        "postgresql+aws_wrapper_psycopg://u:p@h:5432/db?wrapper_dialect=aurora-pg"
     )
     assert url.get_dialect() is AwsWrapperPGPsycopgDialect
 
 
 def test_url_get_dialect_mysql():
     url = make_url(
-        "aws_wrapper_mysql+mysqlconnector://u:p@h:3306/db?wrapper_dialect=aurora-mysql"
+        "mysql+aws_wrapper_mysqlconnector://u:p@h:3306/db?wrapper_dialect=aurora-mysql"
     )
     assert url.get_dialect() is AwsWrapperMySQLConnectorDialect
 
@@ -96,7 +89,7 @@ def test_url_query_args_flow_through_to_wrapper_connect(mocker):
     # Our dialect's create_connect_args translates wrapper_plugins → plugins
     # before handing kwargs to the DBAPI.
     engine = create_engine(
-        "aws_wrapper_postgresql+psycopg://u:p@h:5432/db"
+        "postgresql+aws_wrapper_psycopg://u:p@h:5432/db"
         "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm"
     )
     try:

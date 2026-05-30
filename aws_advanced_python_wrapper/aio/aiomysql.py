@@ -16,7 +16,7 @@
 
 Async counterpart of :mod:`aws_advanced_python_wrapper.mysql_connector`.
 Enables SQLAlchemy's ``create_async_engine`` with the custom dialect
-``aws_wrapper_mysql+aiomysql_async`` registered in Task 2-C.
+``mysql+aws_wrapper_aiomysql``.
 
 Module-level attributes are populated via :func:`_dbapi.install`;
 PEP 562 ``__getattr__`` forwards missing attrs to the real

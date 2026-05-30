@@ -16,6 +16,6 @@
 AWS Advanced Python Wrapper.
 
 Users should prefer the SA dialect registry
-(``create_engine("aws-wrapper-postgresql+psycopg://...")``) over importing
+(``create_engine("postgresql+aws_wrapper_psycopg://...")``) over importing
 these classes directly.
 """

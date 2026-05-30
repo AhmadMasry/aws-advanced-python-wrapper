@@ -14,9 +14,9 @@
 
 """MySQL SQLAlchemy dialect bound to the AWS Advanced Python Wrapper.
 
-Registered as ``aws-wrapper-mysql`` / ``aws-wrapper-mysql+mysqlconnector``
-via a pyproject entry-point. Subclasses SA's standard
-MySQLDialect_mysqlconnector and only swaps the DBAPI module to
+Registered as ``mysql.aws_wrapper_mysqlconnector`` via a pyproject
+entry-point (URL ``mysql+aws_wrapper_mysqlconnector://``). Subclasses SA's
+standard MySQLDialect_mysqlconnector and only swaps the DBAPI module to
 :mod:`aws_advanced_python_wrapper.mysql_connector`, which routes connect()
 through the wrapper's plugin pipeline.
 """
@@ -36,7 +36,7 @@ class AwsWrapperMySQLConnectorDialect(
         _FailoverSuccessRewrapMixin, MySQLDialect_mysqlconnector):
     """SQLAlchemy dialect that uses the AWS Advanced Python Wrapper as its DBAPI."""
 
-    driver = "mysqlconnector"
+    driver = "aws_wrapper_mysqlconnector"
     supports_statement_cache = True
 
     # See _FailoverSuccessRewrapMixin / sqlalchemy_dialects/pg.py for the

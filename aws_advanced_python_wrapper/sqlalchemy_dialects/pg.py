@@ -14,10 +14,13 @@
 
 """PostgreSQL SQLAlchemy dialect bound to the AWS Advanced Python Wrapper.
 
-Registered as ``aws-wrapper-postgresql`` / ``aws-wrapper-postgresql+psycopg``
-via a pyproject entry-point. Subclasses SA's standard PGDialect_psycopg and
-only swaps the DBAPI module to :mod:`aws_advanced_python_wrapper.psycopg`,
-which routes connect() through the wrapper's plugin pipeline.
+Registered as ``postgresql.aws_wrapper_psycopg`` via a pyproject entry-point
+(URL ``postgresql+aws_wrapper_psycopg://``). The same URL serves both sync
+and async: this class implements ``get_async_dialect_cls`` so
+``create_async_engine`` swaps in the async dialect. Subclasses SA's standard
+PGDialect_psycopg and only swaps the DBAPI module to
+:mod:`aws_advanced_python_wrapper.psycopg`, which routes connect() through
+the wrapper's plugin pipeline.
 """
 
 from __future__ import annotations
@@ -50,7 +53,7 @@ class AwsWrapperPGPsycopgDialect(_FailoverSuccessRewrapMixin, PGDialect_psycopg)
     psycopg. Current overrides: ``_type_info_fetch``.
     """
 
-    driver = "psycopg"
+    driver = "aws_wrapper_psycopg"
     supports_statement_cache = True
 
     # See _FailoverSuccessRewrapMixin. SA's classifier checks
@@ -68,6 +71,21 @@ class AwsWrapperPGPsycopgDialect(_FailoverSuccessRewrapMixin, PGDialect_psycopg)
     def import_dbapi(cls):
         import aws_advanced_python_wrapper.psycopg as dbapi
         return dbapi
+
+    @classmethod
+    def get_async_dialect_cls(cls, url):
+        # psycopg3 is a single DBAPI that does both sync and async, so a
+        # single ``postgresql+aws_wrapper_psycopg://`` URL serves both. SA
+        # selects async purely by which factory the caller uses:
+        # ``create_async_engine`` resolves the dialect via
+        # ``URL.get_dialect(_is_async=True)`` -> this hook, while
+        # ``create_engine`` uses this (sync) class directly. Mirrors stock
+        # ``PGDialect_psycopg.get_async_dialect_cls``. Lazy import to avoid a
+        # module-load cycle. MySQL cannot do this -- its sync/async paths are
+        # different DBAPIs (mysql-connector-python vs aiomysql).
+        from aws_advanced_python_wrapper.sqlalchemy_dialects.pg_async import \
+            AwsWrapperPGPsycopgAsyncDialect
+        return AwsWrapperPGPsycopgAsyncDialect
 
     def create_connect_args(self, url):
         # SQLAlchemy's `create_engine` intercepts `plugins=` in the URL query

@@ -14,19 +14,21 @@
 
 """Async PostgreSQL SQLAlchemy dialect bound to the AWS Advanced Python Wrapper.
 
-Registered as ``aws_wrapper_postgresql_async`` /
-``aws_wrapper_postgresql+psycopg_async`` via pyproject entry-points.
-Subclasses SA's standard ``PGDialectAsync_psycopg`` and swaps the DBAPI to
-an adapter that routes ``connect()`` through the async plugin pipeline
-while preserving SA's ``AsyncAdapt_psycopg_connection`` greenlet-bridge
-wrapper that the async engine expects.
+Reached via the sync dialect's ``get_async_dialect_cls`` hook, not a distinct
+URL: ``create_async_engine("postgresql+aws_wrapper_psycopg://...")`` resolves
+to this class (psycopg3 is a single DBAPI that does both sync and async, so
+one URL serves both -- mirrors stock ``postgresql+psycopg``). Subclasses SA's
+standard ``PGDialectAsync_psycopg`` and swaps the DBAPI to an adapter that
+routes ``connect()`` through the async plugin pipeline while preserving SA's
+``AsyncAdapt_psycopg_connection`` greenlet-bridge wrapper that the async
+engine expects.
 
 Example::
 
     from sqlalchemy.ext.asyncio import create_async_engine
 
     engine = create_async_engine(
-        "aws_wrapper_postgresql+psycopg_async://user:pwd@"
+        "postgresql+aws_wrapper_psycopg://user:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
         "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2"
     )
@@ -130,7 +132,10 @@ class AwsWrapperPGPsycopgAsyncDialect(
     to psycopg. Current overrides: ``_type_info_fetch``.
     """
 
-    driver = "psycopg_async"
+    # Same driver name as the sync dialect: this class is reached via the
+    # sync dialect's ``get_async_dialect_cls`` (not a distinct URL), mirroring
+    # stock psycopg where both sync and async report ``driver = "psycopg"``.
+    driver = "aws_wrapper_psycopg"
     supports_statement_cache = True
 
     # See _AsyncFailoverSuccessRewrapMixin / sqlalchemy_dialects/pg.py.

@@ -15,7 +15,7 @@
 """Async SQLAlchemy + AWS Advanced Python Wrapper: failover on Aurora MySQL.
 
 Uses aiomysql as the async MySQL driver. The dialect
-`aws_wrapper_mysql+aiomysql_async` routes create_async_engine through the
+`mysql+aws_wrapper_aiomysql` routes create_async_engine through the
 wrapper's async plugin pipeline.
 
 Wrapper plugins are configured via the `wrapper_plugins` URL alias
@@ -38,7 +38,7 @@ PASSWORD = "pwd"
 
 def build_engine():
     return create_async_engine(
-        f"aws_wrapper_mysql+aiomysql_async://{USER}:{PASSWORD}@"
+        f"mysql+aws_wrapper_aiomysql://{USER}:{PASSWORD}@"
         f"{CLUSTER_ENDPOINT}:3306/{DB_NAME}"
         "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover",
     )

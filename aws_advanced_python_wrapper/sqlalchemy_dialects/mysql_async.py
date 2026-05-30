@@ -14,19 +14,21 @@
 
 """Async MySQL SQLAlchemy dialect bound to the AWS Advanced Python Wrapper.
 
-Registered as ``aws_wrapper_mysql_async`` /
-``aws_wrapper_mysql+aiomysql_async`` via pyproject entry-points.
-Subclasses SA's standard ``MySQLDialect_aiomysql`` and swaps the DBAPI
-to an adapter that routes ``connect()`` through the async plugin pipeline
-while preserving SA's ``AsyncAdapt_aiomysql_connection`` greenlet-bridge
-wrapper that the async engine expects.
+Registered as ``mysql.aws_wrapper_aiomysql`` via a pyproject entry-point
+(URL ``mysql+aws_wrapper_aiomysql://``). aiomysql is an async-only DBAPI, so
+unlike PG this needs a distinct driver name from the sync
+``mysql+aws_wrapper_mysqlconnector`` (the two are different DBAPIs and cannot
+share one URL). Subclasses SA's standard ``MySQLDialect_aiomysql`` and swaps
+the DBAPI to an adapter that routes ``connect()`` through the async plugin
+pipeline while preserving SA's ``AsyncAdapt_aiomysql_connection``
+greenlet-bridge wrapper that the async engine expects.
 
 Example::
 
     from sqlalchemy.ext.asyncio import create_async_engine
 
     engine = create_async_engine(
-        "aws_wrapper_mysql+aiomysql_async://user:pwd@"
+        "mysql+aws_wrapper_aiomysql://user:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
         "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover"
     )
@@ -93,7 +95,7 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
         _AsyncFailoverSuccessRewrapMixin, MySQLDialect_aiomysql):
     """Async SQLAlchemy dialect that uses the AWS Advanced Python Wrapper as its DBAPI."""
 
-    driver = "aiomysql_async"
+    driver = "aws_wrapper_aiomysql"
     supports_statement_cache = True
     is_async = True
 

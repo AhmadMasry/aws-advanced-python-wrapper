@@ -26,14 +26,17 @@ Repository = "https://github.com/awslabs/aws-advanced-python-wrapper"
 Documentation = "https://github.com/awslabs/aws-advanced-python-wrapper/docs/"
 
 [project.entry-points."sqlalchemy.dialects"]
-aws_wrapper_postgresql = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg:AwsWrapperPGPsycopgDialect"
-"aws_wrapper_postgresql.psycopg" = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg:AwsWrapperPGPsycopgDialect"
-aws_wrapper_postgresql_async = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg_async:AwsWrapperPGPsycopgAsyncDialect"
-"aws_wrapper_postgresql.psycopg_async" = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg_async:AwsWrapperPGPsycopgAsyncDialect"
-aws_wrapper_mysql = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
-"aws_wrapper_mysql.mysqlconnector" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
-aws_wrapper_mysql_async = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async:AwsWrapperMySQLAiomysqlAsyncDialect"
-"aws_wrapper_mysql.aiomysql_async" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async:AwsWrapperMySQLAiomysqlAsyncDialect"
+# Registered as <dialect>.<driver> so the wrapper plugs in as a driver under
+# SQLAlchemy's existing dialects (matches stock mysql+mysqlconnector /
+# postgresql+psycopg), rather than as a parallel top-level dialect name.
+# postgresql+aws_wrapper_psycopg serves BOTH sync and async: the sync class
+# below implements get_async_dialect_cls so create_async_engine swaps in the
+# async dialect from the same URL (exactly how stock postgresql+psycopg works).
+"postgresql.aws_wrapper_psycopg" = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg:AwsWrapperPGPsycopgDialect"
+# MySQL's sync and async paths are different DBAPIs (mysql-connector-python vs
+# aiomysql), so they cannot share one driver name the way psycopg does.
+"mysql.aws_wrapper_mysqlconnector" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
+"mysql.aws_wrapper_aiomysql" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async:AwsWrapperMySQLAiomysqlAsyncDialect"
 
 [tool.poetry]
 include = ["CONTRIBUTING.md"]

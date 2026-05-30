@@ -60,7 +60,7 @@ def _sa_url(test_driver: TestDriver) -> str:
     # connection via the wrapper's _type_info_fetch override. The built-in
     # ``postgresql+psycopg``/``mysql+mysqlconnector`` dialects do not unwrap
     # AwsWrapperConnection and raise TypeError on lazy type fetches.
-    return "aws_wrapper_mysql+mysqlconnector://" if _is_mysql(test_driver) else "aws_wrapper_postgresql+psycopg://"
+    return "mysql+aws_wrapper_mysqlconnector://" if _is_mysql(test_driver) else "postgresql+aws_wrapper_psycopg://"
 
 
 def _wrapper_dialect(test_driver: TestDriver) -> str:

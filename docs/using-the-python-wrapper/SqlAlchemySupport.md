@@ -79,7 +79,7 @@ PostgreSQL:
 from sqlalchemy import create_engine
 
 engine = create_engine(
-    "aws_wrapper_postgresql+psycopg://john:pwd@"
+    "postgresql+aws_wrapper_psycopg://john:pwd@"
     "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
     "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2"
 )
@@ -91,7 +91,7 @@ MySQL:
 from sqlalchemy import create_engine
 
 engine = create_engine(
-    "aws_wrapper_mysql+mysqlconnector://john:pwd@"
+    "mysql+aws_wrapper_mysqlconnector://john:pwd@"
     "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
     "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover&use_pure=True"
 )
@@ -99,7 +99,16 @@ engine = create_engine(
 
 ### Naming
 
-The dialect names (`aws_wrapper_postgresql`, `aws_wrapper_mysql`) echo the JDBC wrapper's `jdbc:aws-wrapper:postgresql://` / `jdbc:aws-wrapper:mysql://` URL scheme, using underscores because SQLAlchemy's URL grammar (`(?P<name>[\w\+]+)://`) does not accept hyphens in the dialect name. The driver slot (`+psycopg`, `+mysqlconnector`) defaults to the wrapper's supported DBAPIs; bare `aws_wrapper_postgresql://` resolves to `+psycopg`.
+The wrapper registers as a **driver under SQLAlchemy's existing dialects**, following SA's `<dialect>+<driver>` URL convention (the same shape as stock `postgresql+psycopg`, `mysql+mysqlconnector`, `mysql+aiomysql`):
+
+| Engine | Sync URL | Async URL |
+|--------|----------|-----------|
+| PostgreSQL | `postgresql+aws_wrapper_psycopg://` | `postgresql+aws_wrapper_psycopg://` (same — see below) |
+| MySQL | `mysql+aws_wrapper_mysqlconnector://` | `mysql+aws_wrapper_aiomysql://` |
+
+This keeps the dialect identity correct (`engine.dialect.name == "postgresql"` / `"mysql"`), so dialect-specific type compilation, reserved-word handling, and any third-party `if dialect.name == ...` checks behave as expected.
+
+**PostgreSQL uses one URL for both sync and async.** psycopg3 is a single DBAPI that does both, so — exactly like stock `postgresql+psycopg` — `create_engine(...)` yields the sync dialect and `create_async_engine(...)` yields the async dialect from the *same* `postgresql+aws_wrapper_psycopg://` URL. The selection is made by which engine factory you call, not by the URL. MySQL cannot share a URL this way because its sync and async paths are different DBAPIs (`mysql-connector-python` vs `aiomysql`), hence the distinct `+aws_wrapper_mysqlconnector` / `+aws_wrapper_aiomysql` driver names.
 
 ### URL parameter `wrapper_plugins` (not `plugins`)
 
@@ -158,7 +167,9 @@ from aws_advanced_python_wrapper.aio import release_resources_async
 
 async def main() -> None:
     engine = create_async_engine(
-        "aws_wrapper_postgresql+psycopg_async://john:pwd@"
+        # Same URL as the sync PG example above: create_async_engine selects
+        # the async dialect via the sync dialect's get_async_dialect_cls hook.
+        "postgresql+aws_wrapper_psycopg://john:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:5432/db"
         "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,host_monitoring_v2"
     )
@@ -186,7 +197,7 @@ Async MySQL usage (via aiomysql):
 ```python
 async def main() -> None:
     engine = create_async_engine(
-        "aws_wrapper_mysql+aiomysql_async://john:pwd@"
+        "mysql+aws_wrapper_aiomysql://john:pwd@"
         "database.cluster-xyz.us-east-1.rds.amazonaws.com:3306/db"
         "?wrapper_dialect=aurora-mysql&wrapper_plugins=failover"
     )

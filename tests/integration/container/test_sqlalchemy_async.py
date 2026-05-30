@@ -14,9 +14,9 @@
 
 """Async SQLAlchemy integration tests for Aurora PG and Aurora MySQL.
 
-Async twin of test_sqlalchemy.py.  Uses the wrapper's registered async URL
-schemes (aws_wrapper_postgresql+psycopg_async, aws_wrapper_mysql+aiomysql_async)
-via ``create_async_engine_for_driver`` rather than the sync creator-callable
+Async twin of test_sqlalchemy.py.  Uses the wrapper's registered URL schemes
+(postgresql+aws_wrapper_psycopg, mysql+aws_wrapper_aiomysql) via
+``create_async_engine_for_driver`` rather than the sync creator-callable
 pattern.
 
 Proves:

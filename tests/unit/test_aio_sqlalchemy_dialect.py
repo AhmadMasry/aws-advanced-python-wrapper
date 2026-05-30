@@ -14,9 +14,10 @@
 
 """F3-B SP-9: SQLAlchemy async dialect registration.
 
-Verifies the async dialect class, entry-point registration under both
-the bare and driver-slot URL forms, URL resolution via ``make_url``, and
-the ``wrapper_plugins`` -> ``plugins`` URL translation.
+Verifies the async dialect class, async resolution via the sync dialect's
+``get_async_dialect_cls`` hook (single ``postgresql+aws_wrapper_psycopg`` URL
+serving both sync and async), and the ``wrapper_plugins`` -> ``plugins`` URL
+translation.
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from sqlalchemy.dialects import registry
 from sqlalchemy.dialects.postgresql.psycopg import PGDialectAsync_psycopg
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -46,7 +46,10 @@ def test_async_dialect_is_async_flag():
 
 
 def test_async_dialect_driver_attr():
-    assert AwsWrapperPGPsycopgAsyncDialect.driver == "psycopg_async"
+    # Same driver name as the sync dialect: async is reached via the sync
+    # dialect's get_async_dialect_cls, not a distinct URL (mirrors stock
+    # psycopg, where both report driver="psycopg").
+    assert AwsWrapperPGPsycopgAsyncDialect.driver == "aws_wrapper_psycopg"
 
 
 def test_async_dialect_import_dbapi_returns_adapter_wrapping_aio_submodule():
@@ -95,31 +98,38 @@ def test_async_dialect_import_dbapi_sets_exec_status_on_cursor_class():
         AsyncAdapt_psycopg_cursor._psycopg_ExecStatus = ExecStatus
 
 
-# ---- Registry tests -----------------------------------------------------
+# ---- Async resolution via get_async_dialect_cls -------------------------
+# psycopg3 is a single DBAPI doing both sync and async, so there is no
+# separate async registry key. A single ``postgresql+aws_wrapper_psycopg``
+# URL serves both: ``create_engine`` uses the sync dialect, while
+# ``create_async_engine`` resolves the async dialect via the sync dialect's
+# ``get_async_dialect_cls`` hook (``URL.get_dialect(_is_async=True)``).
 
 
-def test_registry_resolves_aws_wrapper_postgresql_async():
-    cls = registry.load("aws_wrapper_postgresql_async")
-    assert cls is AwsWrapperPGPsycopgAsyncDialect
+def test_sync_dialect_get_async_dialect_cls_returns_async():
+    from aws_advanced_python_wrapper.sqlalchemy_dialects.pg import \
+        AwsWrapperPGPsycopgDialect
+    url = make_url("postgresql+aws_wrapper_psycopg://u:p@h:5432/db")
+    assert AwsWrapperPGPsycopgDialect.get_async_dialect_cls(url) \
+        is AwsWrapperPGPsycopgAsyncDialect
 
 
-def test_registry_resolves_aws_wrapper_postgresql_psycopg_async():
-    cls = registry.load("aws_wrapper_postgresql.psycopg_async")
-    assert cls is AwsWrapperPGPsycopgAsyncDialect
-
-
-def test_url_get_dialect_async_bare_form():
+def test_url_get_dialect_async_resolves_async_class():
     url = make_url(
-        "aws_wrapper_postgresql_async://u:p@h:5432/db?wrapper_dialect=aurora-pg"
+        "postgresql+aws_wrapper_psycopg://u:p@h:5432/db?wrapper_dialect=aurora-pg"
     )
-    assert url.get_dialect() is AwsWrapperPGPsycopgAsyncDialect
+    # create_async_engine drives this path with _is_async=True.
+    assert url.get_dialect(_is_async=True) is AwsWrapperPGPsycopgAsyncDialect
 
 
-def test_url_get_dialect_async_driver_slot_form():
+def test_url_get_dialect_sync_resolves_sync_class():
+    from aws_advanced_python_wrapper.sqlalchemy_dialects.pg import \
+        AwsWrapperPGPsycopgDialect
     url = make_url(
-        "aws_wrapper_postgresql+psycopg_async://u:p@h:5432/db?wrapper_dialect=aurora-pg"
+        "postgresql+aws_wrapper_psycopg://u:p@h:5432/db?wrapper_dialect=aurora-pg"
     )
-    assert url.get_dialect() is AwsWrapperPGPsycopgAsyncDialect
+    # create_engine drives this path with _is_async=False (the default).
+    assert url.get_dialect() is AwsWrapperPGPsycopgDialect
 
 
 # ---- URL kwargs passthrough --------------------------------------------
@@ -141,7 +151,7 @@ def test_async_url_query_args_flow_through_to_async_wrapper_connect(mocker):
 
     async def _body() -> None:
         engine = create_async_engine(
-            "aws_wrapper_postgresql+psycopg_async://u:p@h:5432/db"
+            "postgresql+aws_wrapper_psycopg://u:p@h:5432/db"
             "?wrapper_dialect=aurora-pg&wrapper_plugins=failover,efm"
         )
         try:
@@ -171,7 +181,7 @@ def test_async_dialect_create_connect_args_renames_wrapper_plugins():
     invoked directly (no engine involved)."""
     dialect = AwsWrapperPGPsycopgAsyncDialect()
     url = make_url(
-        "aws_wrapper_postgresql+psycopg_async://u:p@h:5432/db"
+        "postgresql+aws_wrapper_psycopg://u:p@h:5432/db"
         "?wrapper_dialect=aurora-pg&wrapper_plugins=failover"
     )
     _args, kwargs = dialect.create_connect_args(url)
