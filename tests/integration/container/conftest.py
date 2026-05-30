@@ -54,20 +54,35 @@ from .utils.test_environment_features import TestEnvironmentFeatures
 logger = Logger(__name__)
 
 
-# Pre-warm the full AWS API call pipeline on the main thread, before any
-# test creates failover-handler / topology-monitor worker threads. boto3
-# defers a lot of lazy initialisation (SSL context, urllib3 pool manager,
-# requests.Request construction, AWS credential-chain resolution) until
-# the first actual API call. Running one harmless describe_db_clusters at
-# conftest import time forces all of those to materialise once, on the
-# main thread, before any worker thread can run them concurrently with
-# libpq / psycopg activity -- which has caused native-level concurrency
-# races during heavy multi-thread Aurora failover workloads.
-try:
-    _prewarm_client = boto3.client(service_name='rds', region_name='us-east-1')
-    _prewarm_client.describe_db_clusters(MaxRecords=20)
-except Exception as _ex:  # noqa: BLE001 -- best-effort, must not block tests
-    logger.debug(f"AWS pipeline prewarm failed (non-fatal): {_ex}")
+@pytest.fixture(scope="session", autouse=True)
+def _prewarm_aws_pipeline():
+    """Force boto3's lazy initialisation on the main thread before any test.
+
+    boto3 defers a lot of lazy init (SSL context, urllib3 pool manager,
+    requests.Request construction, AWS credential-chain resolution) until the
+    first actual API call. When that first call happens on a worker thread
+    concurrently with libpq / psycopg activity during a multi-thread Aurora
+    failover, we have observed native-level concurrency races ending in a
+    SIGSEGV inside the OpenSSL / urllib3 / psycopg-binary stack.
+
+    A single harmless ``describe_db_clusters`` here materialises all of it
+    once, on the main thread, before the first test body spawns any
+    failover-handler / topology-monitor worker thread. Implemented as a
+    session-scoped autouse fixture rather than a conftest import-time side
+    effect so it (a) does NOT fire during pure collection (``--collect-only``,
+    or running a single unrelated test) and (b) uses the **configured test
+    region** instead of a hardcoded one, exercising the same RDS endpoint the
+    tests will hit. Best-effort: a network-poor sandbox must not block the run.
+    """
+    try:
+        info = TestEnvironment.get_current().get_info()
+        kwargs = {"service_name": "rds", "region_name": info.get_region()}
+        endpoint = info.get_rds_endpoint()
+        if endpoint:
+            kwargs["endpoint_url"] = endpoint
+        boto3.client(**kwargs).describe_db_clusters(MaxRecords=20)
+    except Exception as ex:  # noqa: BLE001 -- best-effort, must not block tests
+        logger.debug(f"AWS pipeline prewarm failed (non-fatal): {ex}")
 
 
 @pytest.fixture(scope='module')
