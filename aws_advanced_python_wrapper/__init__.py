@@ -17,6 +17,7 @@ from logging import DEBUG, getLogger
 
 from aws_advanced_python_wrapper import _dbapi
 from aws_advanced_python_wrapper.cleanup import release_resources
+from aws_advanced_python_wrapper.driver_info import DriverInfo
 from aws_advanced_python_wrapper.utils.utils import LogUtils
 from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
 
@@ -24,6 +25,8 @@ from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
 # apilevel/threadsafety/paramstyle). `connect` stays bound to
 # AwsWrapperConnection.connect for back-compat with existing callers.
 _dbapi.install(sys.modules[__name__].__dict__, connect=AwsWrapperConnection.connect)
+
+__version__ = DriverInfo.DRIVER_VERSION
 
 
 def set_logger(name="aws_advanced_python_wrapper", level=DEBUG, format_string=None):
