@@ -116,6 +116,27 @@ class AsyncDriverDialect(ABC):
         """Open a new connection to ``host_info`` using the target async driver."""
         raise NotImplementedError
 
+    async def execute_connect(
+            self,
+            target_func: Callable[..., Awaitable[Any]],
+            prepared: Properties,
+            props: Properties) -> Any:
+        """Run an already-prepared driver connect, applying any driver-specific
+        timeout bounding.
+
+        Both connect paths funnel through here -- the dialect's own
+        :meth:`connect` and :class:`AsyncDriverConnectionProvider`, which
+        prepares props itself and must not bypass per-driver connect handling.
+
+        Default: invoke the driver connect directly. Drivers whose connect
+        kwarg doesn't bound the FULL connect (e.g. aiomysql's ``connect_timeout``
+        bounds only the TCP connect, not the handshake/auth reads) override this
+        to wrap the connect in :func:`asyncio.wait_for`. psycopg's
+        ``connect_timeout`` already bounds the whole attempt, so it uses this
+        default.
+        """
+        return await target_func(**prepared)
+
     @abstractmethod
     async def is_closed(self, conn: Any) -> bool:
         raise NotImplementedError

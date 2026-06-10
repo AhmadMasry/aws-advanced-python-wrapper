@@ -47,6 +47,11 @@ class _FakeDriverDialect:
     def prepare_connect_info(self, host_info, props):
         return dict(props)
 
+    async def execute_connect(self, target_func, prepared, props):
+        # Mirror AsyncDriverDialect.execute_connect's default (plain connect);
+        # the provider now funnels the connect through this hook.
+        return await target_func(**prepared)
+
 
 class _RecordingProvider(AsyncConnectionProvider):
     """Custom provider that records every call for assertion."""

@@ -137,7 +137,10 @@ class AsyncDriverConnectionProvider(AsyncConnectionProvider):
             host_info.host,
             PropertiesUtils.log_properties(PropertiesUtils.mask_properties(prepared)),
         )
-        return await target_func(**prepared)
+        # Delegate to the dialect so per-driver connect handling (e.g. aiomysql's
+        # full-connect timeout bounding) applies here too -- calling target_func
+        # directly would bypass it and let a dead endpoint hang the handshake.
+        return await driver_dialect.execute_connect(target_func, prepared, props)
 
 
 class AsyncConnectionProviderManager:

@@ -31,13 +31,15 @@ Adapts aiomysql's API surface into the wrapper's ABC:
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from aws_advanced_python_wrapper.aio.driver_dialect.base import \
     AsyncDriverDialect
 from aws_advanced_python_wrapper.driver_dialect_codes import DriverDialectCodes
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
-from aws_advanced_python_wrapper.utils.properties import Properties
+from aws_advanced_python_wrapper.utils.properties import (
+    Properties, WrapperProperties)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.hostinfo import HostInfo
@@ -107,6 +109,18 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
         if "db" not in prop_copy and "database" in prop_copy:
             prop_copy["db"] = prop_copy["database"]
         PropertiesUtils.remove_wrapper_props(prop_copy)
+        # remove_wrapper_props() just stripped CONNECT_TIMEOUT_SEC
+        # ("connect_timeout"), but aiomysql needs it as a connect kwarg or it
+        # waits forever on an unresponsive/blackholed socket: aiomysql's
+        # connect_timeout defaults to None, so there's no asyncio.wait_for
+        # bound around the handshake. Re-inject it (mirrors the sync
+        # MySQLDriverDialect.prepare_connect_info) so a dead-endpoint connect
+        # fails fast instead of hanging (test_proxied_wrapper_connection_failed
+        # _async). Coerce to float -- aiomysql passes it to asyncio.wait_for,
+        # which needs a number, and the wrapper prop may arrive as a string.
+        connect_timeout = WrapperProperties.CONNECT_TIMEOUT_SEC.get(props)
+        if connect_timeout is not None:
+            prop_copy["connect_timeout"] = float(connect_timeout)
         return prop_copy
 
     async def connect(
@@ -120,9 +134,31 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
         # string port that bypasses is_port_specified().
         if "port" in prepared:
             prepared["port"] = int(prepared["port"])
-        # aiomysql.connect returns a _ConnectionContextManager; awaiting
-        # it yields the Connection.
-        return await connect_func(**prepared)
+        # aiomysql.connect returns a _ConnectionContextManager; awaiting it
+        # yields the Connection. Route through execute_connect so the
+        # connect-timeout bounding below applies on this path too.
+        return await self.execute_connect(connect_func, prepared, props)
+
+    async def execute_connect(
+            self,
+            target_func: Callable[..., Awaitable[Any]],
+            prepared: Properties,
+            props: Properties) -> Any:
+        # aiomysql's own connect_timeout (passed in via prepare_connect_info)
+        # only bounds the TCP connect -- connection.py _connect wraps just
+        # _open_connection in asyncio.wait_for, leaving the handshake
+        # (_get_server_information) and auth reads unbounded. Against an
+        # accept-but-silent endpoint (e.g. a disabled proxy) those reads hang
+        # forever. Bound the WHOLE connect with the wrapper's connect_timeout so
+        # a dead endpoint fails fast instead of hanging
+        # (test_proxied_wrapper_connection_failed_async). This runs for BOTH the
+        # dialect connect path and AsyncDriverConnectionProvider, which prepares
+        # props itself and would otherwise call the driver connect directly.
+        connect_timeout = WrapperProperties.CONNECT_TIMEOUT_SEC.get(props)
+        coro = target_func(**prepared)
+        if connect_timeout is None:
+            return await coro
+        return await asyncio.wait_for(coro, timeout=float(connect_timeout))
 
     async def is_closed(self, conn: Any) -> bool:
         return not conn.open
