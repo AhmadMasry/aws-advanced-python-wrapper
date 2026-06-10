@@ -23,6 +23,7 @@ intercept it.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
                     Sequence, Type, Union)
 
@@ -168,11 +169,30 @@ class AsyncAwsWrapperCursor:
     def lastrowid(self) -> Any:
         return self._target_cursor.lastrowid
 
+    async def _resolve_target_cursor(self) -> Any:
+        """Resolve and cache the underlying driver cursor.
+
+        psycopg's ``AsyncConnection.cursor()`` returns a ready cursor
+        synchronously, so ``AsyncAwsWrapperConnection.cursor()`` -- a sync
+        factory matching psycopg semantics -- can wrap it directly. aiomysql's
+        ``Connection.cursor()`` instead returns a ``_ContextManager`` that must
+        be awaited to yield the real cursor. Await-and-cache on first use so a
+        single sync ``cursor()`` factory works for both drivers. Idempotent:
+        once resolved, ``_target_cursor`` exposes ``execute`` and is left
+        untouched.
+        """
+        tc = self._target_cursor
+        if not hasattr(tc, "execute") and inspect.isawaitable(tc):
+            self._target_cursor = await tc
+        return self._target_cursor
+
     async def execute(
             self,
             query: Any,
             params: Any = None,
             **kwargs: Any) -> AsyncAwsWrapperCursor:
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             if params is None:
                 return await self._target_cursor.execute(query, **kwargs)
@@ -188,6 +208,8 @@ class AsyncAwsWrapperCursor:
             query: Any,
             seq_of_params: Sequence[Any],
             **kwargs: Any) -> AsyncAwsWrapperCursor:
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             return await self._target_cursor.executemany(
                 query, seq_of_params, **kwargs)
@@ -198,6 +220,8 @@ class AsyncAwsWrapperCursor:
         return self
 
     async def fetchone(self) -> Any:
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             return await self._target_cursor.fetchone()
 
@@ -206,6 +230,8 @@ class AsyncAwsWrapperCursor:
         )
 
     async def fetchmany(self, size: Optional[int] = None) -> List[Any]:
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             if size is None:
                 return await self._target_cursor.fetchmany()
@@ -216,6 +242,8 @@ class AsyncAwsWrapperCursor:
         )
 
     async def fetchall(self) -> List[Any]:
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             return await self._target_cursor.fetchall()
 
@@ -224,6 +252,8 @@ class AsyncAwsWrapperCursor:
         )
 
     async def close(self) -> None:
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             return await self._target_cursor.close()
 
@@ -238,6 +268,8 @@ class AsyncAwsWrapperCursor:
         a coroutine. We probe the return value and await only when needed
         so the same wrapper method works for both shapes.
         """
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             result = self._target_cursor.scroll(value, mode)
             if asyncio.iscoroutine(result):
@@ -254,6 +286,8 @@ class AsyncAwsWrapperCursor:
         Like :meth:`scroll`, probes the target's return value and awaits
         only if the driver made ``callproc`` async.
         """
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             result = self._target_cursor.callproc(procname, args)
             if asyncio.iscoroutine(result):
@@ -269,6 +303,8 @@ class AsyncAwsWrapperCursor:
 
         Probes the target's return value and awaits only if async.
         """
+        await self._resolve_target_cursor()
+
         async def _call() -> Any:
             result = self._target_cursor.nextset()
             if asyncio.iscoroutine(result):
@@ -290,6 +326,7 @@ class AsyncAwsWrapperCursor:
         self._target_cursor.setoutputsize(size, column)
 
     async def __aenter__(self) -> AsyncAwsWrapperCursor:
+        await self._resolve_target_cursor()
         return self
 
     async def __aexit__(
@@ -563,7 +600,8 @@ class AsyncAwsWrapperConnection:
             # the RWS plugin raises first -- so guarding on the user-txn flag
             # only spares switch/reset artifacts from the rollback.
             try:
-                if (not self._plugin_service.is_in_transaction
+                if (conn is not None
+                        and not self._plugin_service.is_in_transaction
                         and await dd.is_in_transaction(conn)):
                     rb = conn.rollback()
                     if asyncio.iscoroutine(rb):
@@ -814,7 +852,14 @@ class AsyncAwsWrapperConnection:
 
     async def close(self) -> None:
         async def _call() -> Any:
-            return await self._target_conn.close()
+            # psycopg's AsyncConnection.close() is a coroutine; aiomysql's
+            # Connection.close() is a sync call that closes the socket and
+            # returns None. Probe the return value and await only when the
+            # driver made close async, so one wrapper works for both.
+            result = self._target_conn.close()
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
 
         await self._plugin_manager.execute(
             self, DbApiMethod.CONNECTION_CLOSE, _call,

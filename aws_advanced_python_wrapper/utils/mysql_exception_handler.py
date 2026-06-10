@@ -76,6 +76,17 @@ class MySQLExceptionHandler(ExceptionHandler):
         if isinstance(error, DatabaseError):
             if error.errno in self._NETWORK_ERRORS:
                 return True
+        # aiomysql raises pymysql errors, which are NOT mysql.connector
+        # InterfaceError/DatabaseError and expose no ``.errno`` or
+        # ``.sqlstate``; the MySQL client error code is the first ``args``
+        # element instead (e.g. OperationalError(2013, 'Lost connection to
+        # MySQL server during query')). Match that shape so async failover
+        # triggers on connection loss. Additive: mysql.connector network
+        # errors are already caught above, so this only widens coverage to
+        # the pymysql shape and never changes the sync verdict.
+        args = getattr(error, "args", None)
+        if args and isinstance(args[0], int) and args[0] in self._NETWORK_ERRORS:
+            return True
         if hasattr(error, 'msg') and error.msg is not None and self._UNAVAILABLE_CONNECTION in error.msg:
             return True
 
@@ -112,13 +123,23 @@ class MySQLExceptionHandler(ExceptionHandler):
         if error is None:
             return False
 
+        # mysql.connector exposes the code as ``.errno`` and the text as
+        # ``.msg``; aiomysql's pymysql errors carry ``(errno, message)`` in
+        # ``args`` with neither attribute. Read both shapes so read-only
+        # detection (used by the STRICT_WRITER failover escape hatch) works on
+        # the async path too.
         errno = getattr(error, "errno", None)
+        if not isinstance(errno, int):
+            args = getattr(error, "args", None)
+            if args and isinstance(args[0], int):
+                errno = args[0]
         if errno == 1836:  # ERROR 1836 (HY000): Running in read-only mode
             return True
 
         error_msg = getattr(error, "msg", None)
-        if error_msg is not None:
-            if any(msg in error_msg for msg in self._READ_ONLY_ERROR_MESSAGES):
-                return True
+        if error_msg is None:
+            error_msg = str(error)
+        if any(msg in error_msg for msg in self._READ_ONLY_ERROR_MESSAGES):
+            return True
 
         return False
