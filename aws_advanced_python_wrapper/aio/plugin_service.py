@@ -33,6 +33,7 @@ from aws_advanced_python_wrapper.aio.session_state import (
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.exception_handling import ExceptionManager
 from aws_advanced_python_wrapper.utils.messages import Messages
+from aws_advanced_python_wrapper.utils.notifications import ConnectionEvent
 from aws_advanced_python_wrapper.utils.storage.cache_map import CacheMap
 
 if TYPE_CHECKING:
@@ -191,6 +192,17 @@ class AsyncPluginService(Protocol):
         """
         ...
 
+    async def force_connect(
+            self,
+            host_info: HostInfo,
+            props: Properties,
+            plugin_to_skip: Optional[AsyncPlugin] = None) -> Any:
+        """Like :meth:`connect` but BYPASSES any custom connection provider
+        (e.g. the pooled provider), using the default driver provider, while
+        still running the plugin pipeline. Mirrors sync
+        ``plugin_service.force_connect``."""
+        ...
+
     def set_status(
             self,
             clazz: type,
@@ -223,6 +235,11 @@ class AsyncPluginService(Protocol):
             role: HostRole,
             strategy: str,
             host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
+        ...
+
+    def filter_hosts(self, hosts: List[HostInfo]) -> List[HostInfo]:
+        """Restrict a host list to those permitted by allowed_and_blocked_hosts
+        (custom endpoint membership). No-op when no permissions are set."""
         ...
 
     def get_connection_provider_manager(self) -> AsyncConnectionProviderManager:
@@ -312,6 +329,11 @@ class AsyncPluginService(Protocol):
         """
         ...
 
+    def set_connection_wrapper(self, wrapper: Any) -> None:
+        """Register the owning AsyncAwsWrapperConnection so connection
+        switches can rebind its cached target connection."""
+        ...
+
 
 class AsyncPluginServiceImpl(AsyncPluginService):
     """Minimal concrete ``AsyncPluginService`` for SP-1.
@@ -345,6 +367,9 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         self._initial_connection_host_info: Optional[HostInfo] = None
         self._current_host_info: Optional[HostInfo] = host_info
         self._current_connection: Optional[Any] = None
+        # Back-reference to the owning AsyncAwsWrapperConnection so connection
+        # switches (failover / RWS) can rebind its cached ``_target_conn``.
+        self._connection_wrapper: Optional[Any] = None
         self._telemetry_factory: Optional[TelemetryFactory] = None
         self._target_driver_func: Optional[Callable] = None
         self._status_store: Dict[Tuple[type, str], Any] = {}
@@ -429,6 +454,39 @@ class AsyncPluginServiceImpl(AsyncPluginService):
             return False
         return self._plugin_manager.accepts_strategy(role, strategy)
 
+    def filter_hosts(self, hosts: List[HostInfo]) -> List[HostInfo]:
+        """Restrict a host list to those permitted by allowed_and_blocked_hosts.
+
+        No-op when no permissions are set (the common case), so non-custom-
+        endpoint connections are unaffected. The custom endpoint monitor sets
+        allowed_and_blocked_hosts so failover / RWS / connect only use the
+        endpoint's member instances. Mirrors sync PluginService.hosts.
+        """
+        perms = self._allowed_and_blocked_hosts
+        if perms is None:
+            return hosts
+
+        def _instance_id(h: HostInfo) -> Optional[str]:
+            # allowed/blocked sets hold RDS DB instance identifiers (the custom
+            # endpoint's StaticMembers). Topology HostInfo.host_id is the
+            # instance id when populated, but some async topology paths leave it
+            # None; fall back to the leftmost DNS label of the instance endpoint
+            # (e.g. "my-instance" from "my-instance.<hash>.<region>.rds...").
+            if h.host_id:
+                return h.host_id
+            if h.host:
+                return h.host.split(".", 1)[0]
+            return None
+
+        result = hosts
+        allowed = perms.allowed_host_ids
+        blocked = perms.blocked_host_ids
+        if allowed is not None:
+            result = [h for h in result if _instance_id(h) in allowed]
+        if blocked is not None:
+            result = [h for h in result if _instance_id(h) not in blocked]
+        return result
+
     def get_host_info_by_strategy(
             self,
             role: HostRole,
@@ -436,7 +494,9 @@ class AsyncPluginServiceImpl(AsyncPluginService):
             host_list: Optional[List[HostInfo]] = None) -> Optional[HostInfo]:
         if self._plugin_manager is None:
             return None
-        return self._plugin_manager.get_host_info_by_strategy(role, strategy, host_list)
+        candidates = list(host_list) if host_list is not None else list(self._all_hosts)
+        candidates = self.filter_hosts(candidates)
+        return self._plugin_manager.get_host_info_by_strategy(role, strategy, candidates)
 
     def get_connection_provider_manager(self) -> AsyncConnectionProviderManager:
         return self._connection_provider_manager
@@ -444,6 +504,15 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     @property
     def session_state_service(self) -> AsyncSessionStateService:
         return self._session_state_service
+
+    def set_connection_wrapper(self, wrapper: Any) -> None:
+        """Register the owning AsyncAwsWrapperConnection.
+
+        Lets ``set_current_connection`` rebind the wrapper's cached
+        ``_target_conn`` on plugin-driven connection switches so the wrapper
+        follows failover / read-write-splitting swaps.
+        """
+        self._connection_wrapper = wrapper
 
     @property
     def allowed_and_blocked_hosts(self) -> Optional[AllowedAndBlockedHosts]:
@@ -635,6 +704,42 @@ class AsyncPluginServiceImpl(AsyncPluginService):
             plugin_to_skip=plugin_to_skip,
         )
 
+    async def force_connect(
+            self,
+            host_info: HostInfo,
+            props: Properties,
+            plugin_to_skip: Optional[AsyncPlugin] = None) -> Any:
+        """Open a connection that BYPASSES any custom connection provider
+        (e.g. the pooled provider), using the default driver provider, while
+        still running the plugin pipeline so auth plugins (IAM, Secrets,
+        Federated, Okta) re-apply. Mirrors sync ``plugin_service.force_connect``.
+
+        Failover uses this rather than :meth:`connect`: the failover reconnect
+        must produce a fresh, non-pooled connection. Routing it through the
+        pooled provider creates internal pools on the failover target -- which
+        breaks the pooled-connection failover tests, where a connection
+        established via a cluster URL must stay unpooled even after failover
+        (test_pooled_connection__cluster_url_failover) and a pooled connection
+        must be replaced by a non-pooled one after failover
+        (test_pooled_connection__failover).
+        """
+        if self._plugin_manager is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.force_connect requires a plugin_manager; "
+                "it is populated by AsyncAwsWrapperConnection.connect.")
+        if self._target_driver_func is None:
+            raise AwsWrapperError(
+                "AsyncPluginService.force_connect requires target_driver_func "
+                "to be set; AsyncAwsWrapperConnection.connect normally wires this.")
+        return await self._plugin_manager.force_connect(
+            target_driver_func=self._target_driver_func,
+            driver_dialect=self._driver_dialect,
+            host_info=host_info,
+            props=props,
+            is_initial_connection=False,
+            plugin_to_skip=plugin_to_skip,
+        )
+
     def set_target_driver_func(self, func: Callable) -> None:
         """Wired by AsyncAwsWrapperConnection.connect at connect time."""
         self._target_driver_func = func
@@ -669,16 +774,55 @@ class AsyncPluginServiceImpl(AsyncPluginService):
         prev = self._current_connection
         self._current_connection = connection
         self._current_host_info = host_info
+        # Keep the owning wrapper's cached target connection in sync so its
+        # cursor() / commit() / etc. follow the switch (see
+        # AsyncAwsWrapperConnection.connect's set_connection_wrapper call).
+        if self._connection_wrapper is not None:
+            self._connection_wrapper._target_conn = connection
         if prev is not None and prev is not connection:
-            # Apply tracked session state to the new connection before the
-            # driver dialect's fallback transfer, then hand off to the
-            # dialect for anything state-service doesn't cover.
+            # Apply tracked session state to the new connection, then a
+            # best-effort dialect-level transfer as a supplement.
             try:
                 await self._session_state_service.apply_current_session_state(
                     connection)
             except Exception:  # noqa: BLE001 - best-effort apply
                 pass
-            await self._driver_dialect.transfer_session_state(prev, connection)
+            # Sync's set_current_connection (plugin_service.py:392) applies state
+            # SOLELY via apply_current_session_state above and never calls the
+            # driver dialect's transfer_session_state here -- the transfer is an
+            # async-only supplement and MUST NOT be fatal. transfer_session_state
+            # calls set_autocommit on the new connection, which psycopg rejects
+            # while that connection is mid-transaction
+            # (ProgrammingError "can't change 'autocommit' now: ... INTRANS") --
+            # e.g. a reader RWS just switched to, on which a role-check query
+            # already opened a txn, or a freshly-reconnected failover target.
+            # apply_current_session_state already applied the tracked
+            # autocommit/read_only (the only state the async transfer copies), so
+            # swallow transfer failures rather than abort the switch
+            # (test_failover_with_secrets_manager,
+            # test_sqlalchemy_creator_read_write_splitting).
+            try:
+                await self._driver_dialect.transfer_session_state(
+                    prev, connection)
+            except Exception:  # noqa: BLE001 - best-effort transfer
+                pass
+
+        # Notify plugins that the current connection object changed so
+        # per-connection plugin state is reset/re-pointed at the new
+        # connection. Mirrors sync plugin_service.set_current_connection
+        # (plugin_service.py:400 / :424). Critically, the host-monitoring (EFM)
+        # plugin clears its UNAVAILABLE flag and cancels the monitor bound to
+        # the OLD host here -- without this, after a failover swap the EFM
+        # monitor keeps reporting the old (dead) host unavailable and re-raises
+        # "Host ... is unavailable" on the next query even though the new writer
+        # connection is healthy (test_fail_from_reader_to_writer).
+        if self._plugin_manager is not None:
+            if prev is None:
+                self._plugin_manager.notify_connection_changed(
+                    {ConnectionEvent.INITIAL_CONNECTION})
+            elif prev is not connection:
+                self._plugin_manager.notify_connection_changed(
+                    {ConnectionEvent.CONNECTION_OBJECT_CHANGED})
 
 
 __all__ = ["AsyncPluginService", "AsyncPluginServiceImpl"]

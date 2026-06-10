@@ -147,6 +147,13 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
         inner = getattr(dbapi, "target_connection", dbapi)
         return inner.charset
 
+    def _driver_error_module(self):
+        # aiomysql raises pymysql's PEP-249 error classes; lets
+        # _normalize_driver_error translate a raw pymysql error into the
+        # wrapper's PEP-249 type so SA classifies it (see _exception_handling).
+        import pymysql
+        return pymysql
+
     def is_disconnect(self, e, connection, cursor):
         # Mirror sync mysql.py. Two goals:
         # 1. Avoid the upstream probe of ``e.errno`` / ``e.args[0]`` (in
@@ -163,10 +170,14 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
         #      return True so SA invalidates and the creator retries.
         # _AsyncFailoverSuccessRewrapMixin handles do_execute path;
         # this handles the cursor-creation path that runs earlier.
-        from aws_advanced_python_wrapper.errors import (FailoverFailedError,
-                                                        FailoverSuccessError)
-        if isinstance(e, FailoverSuccessError):
-            return False
-        if isinstance(e, FailoverFailedError):
-            return True
+        from aws_advanced_python_wrapper.errors import (FailoverError,
+                                                        FailoverFailedError)
+        # Catch the whole FailoverError family -- including
+        # TransactionResolutionUnknownError -- before upstream probes
+        # ``e.errno`` / ``e.args[0]`` (the wrapper errors carry neither). Only
+        # FailoverFailedError means no usable connection (-> True, SA
+        # invalidates); FailoverSuccessError and TransactionResolutionUnknownError
+        # both mean the wrapper reconnected to a new writer (-> False).
+        if isinstance(e, FailoverError):
+            return isinstance(e, FailoverFailedError)
         return super().is_disconnect(e, connection, cursor)

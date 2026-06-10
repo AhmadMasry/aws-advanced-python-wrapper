@@ -111,7 +111,8 @@ def driver_dialect_mock(mocker, writer_conn_mock, closed_writer_conn_mock):
     driver_dialect_mock.get_connection_from_obj.return_value = writer_conn_mock
     driver_dialect_mock.unwrap_connection.return_value = writer_conn_mock
     driver_dialect_mock.can_execute_query.return_value = True
-    driver_dialect_mock.execute.side_effect = lambda method, func: func()
+    # Mirror DriverDialect.execute(method_name, exec_func, *args, exec_timeout=None, conn=None, **kwargs)
+    driver_dialect_mock.execute.side_effect = lambda method, func, *args, **kwargs: func()
     return driver_dialect_mock
 
 
@@ -817,10 +818,7 @@ def test_open_new_reader_connection_role_mismatch_refreshes_and_retries(
     another candidate. Locks the contract added for the cluster-ro DNS
     routing race.
     """
-    from aws_advanced_python_wrapper.read_write_splitting_plugin import \
-        TopologyBasedConnectionHandler
-
-    handler = TopologyBasedConnectionHandler(plugin_service_mock, props)
+    plugin = ReadWriteSplittingPlugin(plugin_service_mock, props)
 
     # Two consecutive reader-pick attempts: first returns an instance that
     # turns out to be a writer (stale topology), second returns a real reader.
@@ -828,14 +826,15 @@ def test_open_new_reader_connection_role_mismatch_refreshes_and_retries(
         reader_host1, reader_host2,
     ]
 
-    # ``plugin_service_connect_func`` (the lambda passed to
-    # open_new_reader_connection) hands back the writer-acting conn first,
-    # then the real reader conn on the second attempt.
+    # plugin_service.connect(host, props, plugin) hands back the writer-acting
+    # conn first, then the real reader conn on the second attempt.
     connect_calls: List = []
 
-    def fake_connect(host: HostInfo):
+    def fake_connect(host, _props, _plugin):
         connect_calls.append(host)
         return writer_conn_mock if len(connect_calls) == 1 else reader_conn_mock
+
+    plugin_service_mock.connect.side_effect = fake_connect
 
     # get_host_role: the first conn reports WRITER (stale-topology case),
     # the second reports READER (recovered).
@@ -843,7 +842,7 @@ def test_open_new_reader_connection_role_mismatch_refreshes_and_retries(
         HostRole.WRITER if conn == writer_conn_mock else HostRole.READER
     )
 
-    conn, host = handler.open_new_reader_connection(fake_connect)
+    conn, host = plugin._open_new_reader_connection()
 
     assert conn == reader_conn_mock
     assert host == reader_host2
@@ -857,19 +856,17 @@ def test_open_new_reader_connection_recheck_disabled_keeps_mismatched_conn(
     returns the picked connection even if its live role disagrees.
     Confirms the property gates the new behavior.
     """
-    from aws_advanced_python_wrapper.read_write_splitting_plugin import \
-        TopologyBasedConnectionHandler
-
     props_no_recheck = Properties()
     props_no_recheck[WrapperProperties.RWS_RECHECK_READER_ROLE.name] = "False"
-    handler = TopologyBasedConnectionHandler(plugin_service_mock, props_no_recheck)
+    plugin = ReadWriteSplittingPlugin(plugin_service_mock, props_no_recheck)
 
     plugin_service_mock.get_host_info_by_strategy.return_value = reader_host1
+    plugin_service_mock.connect.return_value = reader_conn_mock
     # Even though the live role disagrees, recheck is disabled so the
     # mismatch isn't observed.
     plugin_service_mock.get_host_role.return_value = HostRole.WRITER
 
-    conn, host = handler.open_new_reader_connection(lambda h: reader_conn_mock)
+    conn, host = plugin._open_new_reader_connection()
 
     assert conn == reader_conn_mock
     assert host == reader_host1

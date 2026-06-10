@@ -159,11 +159,43 @@ class AsyncSimpleReadWriteSplittingPlugin(AsyncPlugin):
 
         read_only = bool(args[0]) if args else False
         driver_dialect = self._plugin_service.driver_dialect
+        current = self._plugin_service.current_connection
 
         if read_only:
-            await self._switch_to(
-                self._read_host_info, HostRole.READER, driver_dialect)
+            # Don't swap endpoints mid-transaction. The endpoint switch would
+            # silently abandon the open transaction; instead leave the
+            # connection put and let the terminal set_read_only run -- on PG
+            # that raises (read_only can't change inside a transaction); MySQL
+            # permits it. Mirrors the RWS plugin's in-transaction handling.
+            if current is None or not await driver_dialect.is_in_transaction(current):
+                try:
+                    await self._switch_to(
+                        self._read_host_info, HostRole.READER, driver_dialect)
+                except Exception:
+                    # Mirror sync AbstractReadWriteSplittingPlugin
+                    # ._switch_connection_if_required (read_write_splitting_plugin
+                    # .py:209-221): if no verified reader can be established (e.g.
+                    # the configured read endpoint resolves to a writer, or the
+                    # reader is unreachable), fall back to the still-usable current
+                    # connection rather than propagating. A misconfigured reader
+                    # endpoint must not break set_read_only(True)
+                    # (test_incorrect_reader_endpoint). Only re-raise if the
+                    # current connection is itself gone.
+                    if current is None or await driver_dialect.is_closed(current):
+                        raise
+                    current_host = self._plugin_service.current_host_info
+                    logger.warning(
+                        "ReadWriteSplittingPlugin.FallbackToCurrentConnection",
+                        current_host.url if current_host is not None else "current")
         else:
+            # Switching back to the writer mid-transaction is unsafe: the
+            # transaction's fate is undefined across an endpoint swap. Mirror
+            # the RWS plugin and refuse.
+            if current is not None and await driver_dialect.is_in_transaction(current):
+                raise ReadWriteSplittingError(
+                    "Cannot switch back to the writer while in a transaction. "
+                    "Commit or roll back before setting the connection "
+                    "read-write.")
             await self._switch_to(
                 self._write_host_info, HostRole.WRITER, driver_dialect)
         return await execute_func()

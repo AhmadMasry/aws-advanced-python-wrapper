@@ -88,7 +88,19 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
         prop_copy = Properties(props.copy())
         prop_copy["host"] = host_info.host
         if host_info.is_port_specified():
-            prop_copy["port"] = str(host_info.port)
+            prop_copy["port"] = host_info.port
+        # aiomysql/pymysql format the port with "%d", so it MUST be an int. The
+        # port can reach here as a STRING from two paths: host_info.port, or --
+        # the case the conditional above misses -- a string `port` already in
+        # `props` when host_info has no explicit port. Both
+        # AsyncDriverConnectionProvider and AsyncPooledConnectionProvider call
+        # prepare_connect_info directly and never hit connect()'s coercion, so
+        # cast unconditionally whenever a port is present. A string port
+        # otherwise raises "%d format: a real number is required, not str" from
+        # aiomysql connection.py (every test_*_connection_async on MySQL).
+        port_val = prop_copy.get("port")
+        if port_val is not None and port_val != "":
+            prop_copy["port"] = int(port_val)
         # aiomysql's connect expects `db=`, not `database=`. Translate
         # before the wrapper-prop stripper drops `database`. Explicit
         # `db=` beats a generic `database=`.
@@ -103,7 +115,9 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
             props: Properties,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
         prepared = self.prepare_connect_info(host_info, props)
-        # Coerce port to int -- aiomysql rejects string ports.
+        # Defensive: prepare_connect_info already casts port to int (aiomysql
+        # rejects string ports), but a custom props dict could still carry a
+        # string port that bypasses is_port_specified().
         if "port" in prepared:
             prepared["port"] = int(prepared["port"])
         # aiomysql.connect returns a _ConnectionContextManager; awaiting

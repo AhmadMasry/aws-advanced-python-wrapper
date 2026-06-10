@@ -20,8 +20,13 @@ other downstream libraries may touch:
 
   Properties (both wrappers, plain getters):
     info, broken, adapters, prepare_threshold (+ setter),
-    prepared_max (+ setter), deferrable, read_only (async getter;
-    sync already has an intercepted property).
+    prepared_max (+ setter), deferrable.
+
+  read_only is NOT a plain passthrough on either wrapper: the sync
+  wrapper has a plugin-aware intercepted property, and the async getter
+  normalizes psycopg's None tri-state (and aiomysql's _aws_read_only
+  intent stash) to a plain bool so callers get `conn.read_only is
+  False/True` -- see test_async_wrapper_read_only_normalizes_to_bool.
 
   Sync methods (both wrappers):
     fileno, cancel, xid, pipeline, notifies, transaction.
@@ -47,8 +52,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aws_advanced_python_wrapper.aio.wrapper import AsyncAwsWrapperConnection
-from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
+from aws_advanced_python_wrapper.aio.wrapper import (AsyncAwsWrapperConnection,
+                                                     AsyncAwsWrapperCursor)
+from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.wrapper import (AwsWrapperConnection,
+                                                 AwsWrapperCursor)
 
 # ---- Fixtures ------------------------------------------------------------
 
@@ -87,7 +95,7 @@ def test_sync_wrapper_property_reads_target(prop_name: str) -> None:
 
 @pytest.mark.parametrize("prop_name", [
     "info", "broken", "adapters", "prepare_threshold", "prepared_max",
-    "deferrable", "read_only",
+    "deferrable",
 ])
 def test_async_wrapper_property_reads_target(prop_name: str) -> None:
     sentinel = object()
@@ -95,6 +103,25 @@ def test_async_wrapper_property_reads_target(prop_name: str) -> None:
     setattr(target, prop_name, sentinel)
     wrapper = _async_wrapper(target)
     assert getattr(wrapper, prop_name) is sentinel
+
+
+def test_async_wrapper_read_only_normalizes_to_bool() -> None:
+    # The async read_only getter is NOT a raw passthrough: psycopg exposes
+    # read_only as a tri-state (None == unset/server default), so the wrapper
+    # normalizes to a plain bool to honor the integration contract
+    # `assert conn.read_only is False`. aiomysql has no native flag, so it
+    # falls back to the dialect's _aws_read_only intent stash.
+    target = MagicMock()
+    target.read_only = None
+    target._aws_read_only = False
+    wrapper = _async_wrapper(target)
+    assert wrapper.read_only is False
+    target.read_only = True
+    assert wrapper.read_only is True
+    # aiomysql shape: native attr absent/None, intent stashed on _aws_read_only.
+    target.read_only = None
+    target._aws_read_only = True
+    assert wrapper.read_only is True
 
 
 @pytest.mark.parametrize("prop_name", ["prepare_threshold", "prepared_max"])
@@ -223,24 +250,48 @@ def test_async_wrapper_cancel_safe_awaits_target() -> None:
 
 
 def test_sync_wrapper_execute_delegates_with_all_kwargs() -> None:
+    # psycopg3 Connection.execute() opens a cursor, runs the query through
+    # the plugin chain, and returns the cursor (not the raw execute result) --
+    # the wrapper deliberately routes via its cursor so the SQL is visible to
+    # plugins. Verify the prepare/binary kwargs are forwarded all the way to
+    # the underlying target cursor's execute.
     target = MagicMock()
-    target.execute = MagicMock(return_value="cursor-sentinel")
     wrapper = _sync_wrapper(target)
-    result = wrapper.execute(
-        "SELECT 1", ("p",), prepare=True, binary=True)
-    assert result == "cursor-sentinel"
-    target.execute.assert_called_once_with(
+    # Route plugin_manager.execute straight to the provided callable so the
+    # underlying cursor work actually runs.
+    wrapper._plugin_manager.execute = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda obj, method, func, *a, **k: func())
+
+    result = wrapper.execute("SELECT 1", ("p",), prepare=True, binary=True)
+
+    assert isinstance(result, AwsWrapperCursor)
+    target.cursor.return_value.execute.assert_called_once_with(
         "SELECT 1", ("p",), prepare=True, binary=True)
 
 
-def test_async_wrapper_execute_awaits_target() -> None:
+def test_async_wrapper_execute_routes_query_to_target_cursor() -> None:
+    # psycopg3 AsyncConnection.execute() opens a cursor, runs the query
+    # through the plugin chain, and returns the cursor. Verify the query
+    # reaches the underlying (target) cursor's execute and a wrapper cursor
+    # is returned -- not a direct passthrough of target.execute.
     target = MagicMock()
-    target.execute = AsyncMock(return_value="async-cursor-sentinel")
+    target_cursor = target.cursor.return_value
+    target_cursor.execute = AsyncMock(return_value="raw-result")
     wrapper = _async_wrapper(target)
+
+    # plugin_manager.execute is awaited on the async path; route it straight
+    # to the provided coroutine factory so the target cursor actually runs.
+    async def _pm_execute(obj, method, func, *a, **k):
+        return await func()
+
+    wrapper._plugin_manager.execute = AsyncMock(  # type: ignore[method-assign]
+        side_effect=_pm_execute)
+
     result = asyncio.run(wrapper.execute("SELECT 1"))
-    assert result == "async-cursor-sentinel"
-    target.execute.assert_awaited_once_with(
-        "SELECT 1", None, prepare=None, binary=False)
+
+    assert isinstance(result, AsyncAwsWrapperCursor)
+    target_cursor.execute.assert_awaited_once_with(
+        "SELECT 1", prepare=None, binary=False)
 
 
 def test_sync_wrapper_wait_delegates() -> None:
@@ -303,12 +354,22 @@ def test_sync_wrapper_set_autocommit_routes_through_property() -> None:
     wrapper._plugin_manager.execute.assert_called_once()
 
 
-def test_async_wrapper_set_read_only_awaits_target() -> None:
+def test_async_wrapper_set_read_only_routes_through_plugin_pipeline() -> None:
+    """The async wrapper's set_read_only routes CONNECTION_SET_READ_ONLY
+    through the plugin pipeline -- parity with the sync wrapper -- so the
+    read/write-splitting plugin can swap reader/writer connections. A bare
+    passthrough to the target would bypass every plugin and RWS would never
+    switch."""
     target = MagicMock()
-    target.set_read_only = AsyncMock()
+    target.closed = False  # not closed -> passes the is_closed guard
     wrapper = _async_wrapper(target)
+    wrapper._plugin_manager.execute = AsyncMock(return_value=None)  # type: ignore[method-assign]
     asyncio.run(wrapper.set_read_only(True))
-    target.set_read_only.assert_awaited_once_with(True)
+    wrapper._plugin_manager.execute.assert_awaited_once()
+    # Routed under CONNECTION_SET_READ_ONLY with the value as the trailing arg.
+    await_args = wrapper._plugin_manager.execute.await_args.args
+    assert await_args[1] == DbApiMethod.CONNECTION_SET_READ_ONLY
+    assert await_args[3] is True
 
 
 # ---- Plugin-chain bypass assertions -------------------------------------

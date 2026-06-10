@@ -260,8 +260,75 @@ class AsyncAuroraConnectionTrackerPlugin(AsyncPlugin):
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
         conn = await connect_func()
         if conn is not None:
+            await self._fill_instance_alias(host_info, conn)
             self._tracker.track(host_info, conn)
+            await self._pin_current_writer(host_info, conn)
         return conn
+
+    async def _pin_current_writer(self, host_info: HostInfo, conn: Any) -> None:
+        """Pin the current writer at connect time so a later failover is
+        detected as a *transition*.
+
+        Unlike sync, the async connect flow never populates
+        ``plugin_service.all_hosts`` -- it stays empty until something calls
+        ``refresh_host_list`` explicitly, which (for a failover-bound
+        connection) first happens only *inside* the failover handler. By then
+        ``_current_writer`` is still ``None``, so the post-failover writer
+        reads as a first observation in :meth:`_update_writer_from_topology`
+        and the demoted writer's tracked (idle) connections are never
+        invalidated (``test_writer_failover_in_idle_connections``).
+
+        Refreshing once here pins ``_current_writer`` to the instance the
+        connection landed on, so the subsequent failover registers as
+        old_writer -> new_writer and triggers ``invalidate_all``. Gated to
+        RDS hosts so non-Aurora connections pay no topology round-trip, and
+        skipped once a writer is already pinned. Best-effort: a refresh
+        failure just leaves the prior (no-pin) behavior in place.
+        """
+        try:
+            if self._current_writer is not None:
+                return
+            rds = RdsUtils()
+            if not (rds.is_rds_instance(host_info.host)
+                    or rds.identify_rds_type(host_info.host).is_rds_cluster):
+                return
+            await self._plugin_service.refresh_host_list(conn)
+            self._update_writer_from_topology()
+        except Exception:  # noqa: BLE001 - writer pinning is best-effort
+            pass
+
+    async def _fill_instance_alias(
+            self, host_info: HostInfo, conn: Any) -> None:
+        """Add the connection's resolved instance endpoint as an alias.
+
+        A cluster-endpoint connection lands on whichever instance the
+        cluster DNS currently points at, but ``host_info.host`` stays the
+        cluster endpoint -- so the tracker would key it only under the
+        cluster alias. On writer failover the change is detected against
+        the *instance* host (``_current_writer_from_hosts`` returns a
+        topology row), so ``invalidate_all(writer_instance)`` would never
+        match the cluster-keyed entry and the stale idle connection would
+        survive the demotion (``test_writer_failover_in_idle_connections``).
+
+        Mirrors sync ``AuroraConnectionTrackerPlugin.connect`` which calls
+        ``plugin_service.fill_aliases`` for ``is_rds_cluster`` hosts. Only
+        cluster-endpoint connections pay the extra identify round-trip;
+        instance-endpoint connections already key correctly. Best-effort:
+        on any failure we fall back to cluster-key-only tracking (the
+        prior behavior), so a transient identify failure never blocks the
+        connect.
+        """
+        try:
+            if not RdsUtils().identify_rds_type(host_info.host).is_rds_cluster:
+                return
+            identified = await self._plugin_service.identify_connection(conn)
+            if identified is None:
+                return
+            host_info.reset_aliases()
+            host_info.add_alias(host_info.as_alias())
+            host_info.add_alias(*identified.as_aliases())
+        except Exception:  # noqa: BLE001 - alias enrichment is best-effort
+            pass
 
     async def execute(
             self,

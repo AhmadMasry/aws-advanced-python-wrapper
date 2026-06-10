@@ -134,7 +134,12 @@ class Book(Base):
 def _build_url(user, password, host, port, dbname, wrapper_plugins=None, **extra_options):
     """Build a SQLAlchemy connection URL using the aws wrapper dialect."""
     query_params = {}
-    if wrapper_plugins:
+    # ``is not None`` (not truthiness): an explicit empty string means "no
+    # plugins" and must be passed through as ``wrapper_plugins=`` so the
+    # wrapper loads zero plugins. Treating '' as falsy here would drop it and
+    # let the engine inherit DEFAULT_PLUGINS (which includes host_monitoring_v2,
+    # unsupported on MySQL) -- breaking test_sqlalchemy_with_no_plugins.
+    if wrapper_plugins is not None:
         query_params['wrapper_plugins'] = wrapper_plugins
     query_params['connect_timeout'] = str(extra_options.get('connect_timeout', 10))
     for k, v in extra_options.items():

@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.dialects import registry
 from sqlalchemy.dialects.mysql.mysqlconnector import \
@@ -49,6 +50,28 @@ def test_mysql_dialect_import_dbapi_returns_wrapper_submodule():
 
 def test_mysql_dialect_driver_attr():
     assert AwsWrapperMySQLConnectorDialect.driver == "aws_wrapper_mysqlconnector"
+
+
+@pytest.mark.parametrize(
+    "dialect_cls", [AwsWrapperMySQLConnectorDialect, AwsWrapperPGPsycopgDialect])
+def test_is_disconnect_handles_full_failover_error_family(dialect_cls):
+    # Regression: is_disconnect must classify the ENTIRE FailoverError family
+    # without probing driver-specific attrs (errno/args[0]). A mid-transaction
+    # failover raises TransactionResolutionUnknownError, which carries no
+    # ``errno`` -- the old code only special-cased FailoverSuccessError /
+    # FailoverFailedError and fell through to the upstream errno probe, raising
+    # "AttributeError: 'TransactionResolutionUnknownError' object has no
+    # attribute 'errno'" (MySQL SQLAlchemy failover tests, env-3/env-4).
+    from aws_advanced_python_wrapper.errors import (
+        FailoverFailedError, FailoverSuccessError,
+        TransactionResolutionUnknownError)
+    d = dialect_cls.__new__(dialect_cls)  # avoid full dialect __init__/dbapi
+    # Reconnected-to-new-writer signals -> not a disconnect (slot still valid).
+    assert d.is_disconnect(FailoverSuccessError("x"), None, None) is False
+    assert d.is_disconnect(
+        TransactionResolutionUnknownError("x"), None, None) is False
+    # No usable connection -> disconnect (SA invalidates the slot).
+    assert d.is_disconnect(FailoverFailedError("x"), None, None) is True
 
 
 # Registration uses the SA <dialect>.<driver> convention: the wrapper plugs in

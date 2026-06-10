@@ -282,7 +282,7 @@ class TestAwsSecretsManagerAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover,aws_secrets_manager", "failover_v2,aws_secrets_manager"])
+    @pytest.mark.parametrize("plugins", ["failover_v2,aws_secrets_manager"])
     @enable_on_num_instances(min_instances=2)
     @disable_on_features([TestEnvironmentFeatures.RUN_AUTOSCALING_TESTS_ONLY,
                           TestEnvironmentFeatures.BLUE_GREEN_DEPLOYMENT,

@@ -122,7 +122,20 @@ class AsyncDefaultPlugin(AsyncPlugin):
             execute_func: Callable[..., Awaitable[Any]],
             *args: Any,
             **kwargs: Any) -> Any:
-        return await execute_func()
+        result = await execute_func()
+        # Track transaction state after each op so the failover plugin can tell
+        # whether the caller was mid-transaction when failover struck (parity
+        # with sync DefaultPlugin.execute:114). It must be refreshed here, while
+        # the connection is healthy -- the post-failover connection is always
+        # idle, so probing it then would always report "not in a transaction".
+        if (self._plugin_service is not None
+                and method_name != DbApiMethod.CONNECTION_CLOSE.method_name
+                and self._plugin_service.current_connection is not None):
+            try:
+                await self._plugin_service.update_in_transaction()
+            except Exception:  # noqa: BLE001 - tracking is best-effort
+                pass
+        return result
 
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:
         if role == HostRole.UNKNOWN:

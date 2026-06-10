@@ -39,6 +39,7 @@ import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from sqlalchemy.util.concurrency import greenlet_spawn
 
 from aws_advanced_python_wrapper.aio.wrapper import AsyncAwsWrapperConnection
@@ -144,20 +145,20 @@ def test_await_is_staticmethod_on_both_wrappers() -> None:
 # ---- run_async method ------------------------------------------------
 
 
-def test_sync_wrapper_run_async_passes_driver_connection_to_fn() -> None:
-    """Matches ``AdaptedConnection.run_async``: the function receives the
-    raw driver connection."""
+def test_sync_wrapper_run_async_raises_not_supported() -> None:
+    """The sync wrapper intentionally does NOT support ``run_async`` (c0ca385).
+    Its target connection is a sync DBAPI conn, not an asyncio driver conn, so
+    there is nothing meaningful to hand to ``fn``; it raises instead of
+    misbehaving. ``run_async`` is supported only on the async wrapper -- see
+    ``test_async_wrapper_run_async_passes_driver_connection_to_fn``."""
     target = MagicMock()
     wrapper = _sync_wrapper(target)
-    captured: list = []
 
     async def _fn(driver_conn: Any) -> str:
-        captured.append(driver_conn)
         return "invoked"
 
-    result = asyncio.run(greenlet_spawn(lambda: wrapper.run_async(_fn)))
-    assert result == "invoked"
-    assert captured == [target]
+    with pytest.raises(NotImplementedError):
+        asyncio.run(greenlet_spawn(lambda: wrapper.run_async(_fn)))
 
 
 def test_async_wrapper_run_async_passes_driver_connection_to_fn() -> None:
@@ -193,10 +194,18 @@ def test_run_async_bypasses_plugin_chain_on_both_wrappers() -> None:
     async def _fn(_c: Any) -> int:
         return 1
 
-    for wrapper_factory in (_sync_wrapper, _async_wrapper):
-        wrapper = wrapper_factory(MagicMock())
-        asyncio.run(greenlet_spawn(lambda: wrapper.run_async(_fn)))
-        wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[union-attr]
+    # Async wrapper: run_async is supported and must NOT route through the
+    # plugin pipeline.
+    async_wrapper = _async_wrapper(MagicMock())
+    asyncio.run(greenlet_spawn(lambda: async_wrapper.run_async(_fn)))
+    async_wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[union-attr]
+
+    # Sync wrapper: run_async is intentionally unsupported (c0ca385); it
+    # raises before any plugin work, so the chain is likewise untouched.
+    sync_wrapper = _sync_wrapper(MagicMock())
+    with pytest.raises(NotImplementedError):
+        asyncio.run(greenlet_spawn(lambda: sync_wrapper.run_async(_fn)))
+    sync_wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[union-attr]
 
 
 # ---- SA AdaptedConnection duck-type contract verification ------------

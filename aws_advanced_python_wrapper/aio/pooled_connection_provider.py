@@ -160,8 +160,26 @@ class _PooledAsyncConnectionProxy:
         self._pool = pool
         self._invalidated = False
 
-    def invalidate(self) -> None:
+    def invalidate(self, soft: bool = False) -> None:
+        # Accept ``soft`` for parity with SQLAlchemy's
+        # ``PoolProxiedConnection.invalidate(soft=...)``: the failover plugin's
+        # ``_invalidate_current_connection`` calls ``invalidate(soft=True)`` to
+        # mark a broken connection for eviction. Without the kwarg that call
+        # raised TypeError, fell through, and the dead connection was returned
+        # to the pool's idle queue (so the next checkout handed it back). The
+        # flag makes ``close()`` actually close the raw connection instead.
         self._invalidated = True
+
+    @property
+    def driver_connection(self) -> Any:
+        """The underlying raw driver connection beneath the pool proxy.
+
+        Parity with SQLAlchemy's ``PoolProxiedConnection.driver_connection``
+        (which the sync ``SqlAlchemyPooledConnectionProvider`` yields): lets
+        callers reach the real connection, e.g. to assert the pool handed out
+        a *fresh* underlying connection after an eviction.
+        """
+        return self._raw
 
     async def close(self) -> None:
         await self._pool.release(self._raw, invalidated=self._invalidated)
@@ -338,7 +356,18 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
             props: Properties,
     ) -> Tuple[_AsyncPool, Properties]:
         kwargs: Dict[str, Any] = (
-            {} if self._pool_configurator is None else self._pool_configurator(host_info, props))
+            {} if self._pool_configurator is None else dict(self._pool_configurator(host_info, props)))
+        # The pool_configurator contract is shared with the sync
+        # SqlAlchemyPooledConnectionProvider, whose configurator dict feeds
+        # SQLAlchemy's QueuePool (keys: pool_size, max_overflow, timeout).
+        # _AsyncPool uses native names (max_size, max_overflow,
+        # timeout_seconds); translate the QueuePool-style aliases so one
+        # configurator works against either provider (async parity). Native
+        # names, if also present, take precedence.
+        if "pool_size" in kwargs:
+            kwargs.setdefault("max_size", kwargs.pop("pool_size"))
+        if "timeout" in kwargs:
+            kwargs.setdefault("timeout_seconds", kwargs.pop("timeout"))
         prepared = driver_dialect.prepare_connect_info(host_info, props)
         database_dialect.prepare_conn_props(prepared)
         creator = self._get_connection_func(target_func, prepared)

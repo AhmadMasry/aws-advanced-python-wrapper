@@ -37,6 +37,7 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional,
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.iam_utils import IamAuthUtils
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
@@ -110,15 +111,39 @@ class AsyncAuthPluginBase(AsyncPlugin):
         try:
             return await connect_func()
         except Exception as exc:
-            if not was_cached:
+            # Network / failover exceptions must propagate untouched so the
+            # failover plugin can act on them (parity with the sync plugins,
+            # which special-case is_network_exception before wrapping).
+            if self._plugin_service.is_network_exception(error=exc):
                 raise
-            if not self._plugin_service.is_login_exception(error=exc):
-                raise
+            # Non-login failure, or a login failure with FRESH (non-cached)
+            # credentials, is terminal: wrap as AwsWrapperError so callers see
+            # a wrapper error rather than the raw driver exception (parity with
+            # sync IamAuthPlugin._connect:143 / AwsSecretsManagerPlugin._connect:142).
+            # e.g. a wrong username fails auth on a freshly generated token.
+            if not was_cached or not self._plugin_service.is_login_exception(error=exc):
+                raise self._wrap_connect_exception(exc) from exc
             # Cached credentials failed auth -- invalidate, refetch, retry once.
             self._invalidate_cache(host_info, props)
             user, password, _ = await self._resolve_credentials(host_info, props)
             self._inject_credentials(props, user, password)
-            return await connect_func()
+            try:
+                return await connect_func()
+            except Exception as retry_exc:
+                if self._plugin_service.is_network_exception(error=retry_exc):
+                    raise
+                raise self._wrap_connect_exception(retry_exc) from retry_exc
+
+    def _wrap_connect_exception(self, exc: Exception) -> AwsWrapperError:
+        """Wrap a terminal connect/login failure as :class:`AwsWrapperError`.
+
+        Subclasses override to supply a plugin-specific message (parity with
+        the sync plugins). The base default preserves an already-wrapped
+        error and otherwise wraps generically.
+        """
+        if isinstance(exc, AwsWrapperError):
+            return exc
+        return AwsWrapperError(str(exc), exc)
 
     @staticmethod
     def _inject_credentials(
@@ -264,6 +289,13 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
         if cache_key is not None:
             self._token_cache.pop(cache_key, None)
 
+    def _wrap_connect_exception(self, exc: Exception) -> AwsWrapperError:
+        # Parity with sync IamAuthPlugin._connect:143.
+        if isinstance(exc, AwsWrapperError):
+            return exc
+        return AwsWrapperError(
+            Messages.get_formatted("IamAuthPlugin.ConnectException", exc), exc)
+
     @staticmethod
     def _generate_token_blocking(
             host: str,
@@ -356,9 +388,29 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
 
         if self._fetch_secret_counter is not None:
             self._fetch_secret_counter.inc()
-        secret = await asyncio.to_thread(
-            self._fetch_secret_blocking, secret_id, region, endpoint
-        )
+        # Wrap raw botocore fetch errors in AwsWrapperError, mirroring the sync
+        # plugin's _update_secret (aws_secrets_manager_plugin.py:167-181). A bad
+        # secret id raises ClientError (ResourceNotFoundException); a bad region
+        # raises EndpointConnectionError. Callers (and the negative-path tests)
+        # expect AwsWrapperError, not the raw botocore exception.
+        from botocore.exceptions import (ClientError,
+                                         EndpointConnectionError)
+        try:
+            secret = await asyncio.to_thread(
+                self._fetch_secret_blocking, secret_id, region, endpoint
+            )
+        except (ClientError, AttributeError) as e:
+            raise AwsWrapperError(
+                Messages.get_formatted(
+                    "AwsSecretsManagerPlugin.FailedToFetchDbCredentials", e), e) from e
+        except EndpointConnectionError as e:
+            raise AwsWrapperError(
+                Messages.get_formatted(
+                    "AwsSecretsManagerPlugin.EndpointOverrideInvalidConnection", endpoint), e) from e
+        except ValueError as e:
+            raise AwsWrapperError(
+                Messages.get_formatted(
+                    "AwsSecretsManagerPlugin.EndpointOverrideMisconfigured", endpoint), e) from e
         # Allow custom field names via *_KEY properties (e.g. Terraform secrets
         # with non-default schemas).
         user_key = (
@@ -391,6 +443,13 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
         if not region:
             region = self._extract_region_from_arn(secret_id)
         self._secret_cache.pop((secret_id, region), None)
+
+    def _wrap_connect_exception(self, exc: Exception) -> AwsWrapperError:
+        # Parity with sync AwsSecretsManagerPlugin._connect:142.
+        if isinstance(exc, AwsWrapperError):
+            return exc
+        return AwsWrapperError(
+            Messages.get_formatted("AwsSecretsManagerPlugin.FailedLogin", exc), exc)
 
     @staticmethod
     def _extract_region_from_arn(secret_id: str) -> Optional[str]:

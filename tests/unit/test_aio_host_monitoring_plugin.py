@@ -312,6 +312,34 @@ def test_threshold_breach_marks_host_unavailable_and_aborts():
     assert plugin._host_unavailable is True
 
 
+def test_efm_abort_unwraps_pooled_proxy_to_raw_connection():
+    # A pooled connection is a _PooledAsyncConnectionProxy whose close() returns
+    # it to the pool (socket stays open). EFM must abort the UNDERLYING raw
+    # connection (via .driver_connection) so an in-flight blackholed query is
+    # actually severed -- otherwise it hangs until the kernel/test timeout.
+    plugin, svc, driver_dialect, _conn = _build()
+    svc.set_availability = MagicMock()
+    raw = MagicMock(name="raw")
+    proxy = MagicMock(name="pool-proxy")
+    proxy.driver_connection = raw
+
+    asyncio.run(plugin._mark_host_unavailable(proxy, driver_dialect))
+
+    driver_dialect.abort_connection.assert_awaited_once_with(raw)
+
+
+def test_efm_abort_non_pooled_connection_aborts_itself():
+    # A non-pooled connection has no .driver_connection -> aborted directly
+    # (behavior unchanged for the common case).
+    plugin, svc, driver_dialect, _conn = _build()
+    svc.set_availability = MagicMock()
+    raw = object()  # no driver_connection attribute
+
+    asyncio.run(plugin._mark_host_unavailable(raw, driver_dialect))
+
+    driver_dialect.abort_connection.assert_awaited_once_with(raw)
+
+
 def test_execute_raises_when_host_already_unavailable():
     from aws_advanced_python_wrapper.errors import AwsWrapperError
 

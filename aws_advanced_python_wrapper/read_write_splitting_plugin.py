@@ -326,7 +326,7 @@ class AbstractReadWriteSplittingPlugin(Plugin):
 
         try:
             if self._is_connection_usable(internal_conn, driver_dialect):
-                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: internal_conn.close())
+                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: internal_conn.close(), conn=internal_conn)
         except Exception:
             # Ignore exceptions during cleanup - connection might already be dead
             pass
@@ -362,7 +362,7 @@ class AbstractReadWriteSplittingPlugin(Plugin):
     def close_connection(conn: Optional[Connection], driver_dialect: DriverDialect):
         if conn is not None:
             try:
-                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close())
+                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close(), conn=conn)
             except Exception:
                 # Swallow exception
                 return
@@ -469,16 +469,28 @@ class ReadWriteSplittingPlugin(AbstractReadWriteSplittingPlugin):
             )
 
         current_host = self._plugin_service.initial_connection_host_info
-        if current_host is not None:
-            if current_role == current_host.role:
-                return current_conn
-
+        effective_host = current_host
+        if current_host is not None and current_role != current_host.role:
             updated_host = deepcopy(current_host)
             updated_host.role = current_role
+            effective_host = updated_host
             if self._host_list_provider_service is not None:
                 self._host_list_provider_service.initial_connection_host_info = (
                     updated_host
                 )
+
+        # Seed the connection cache under the verified role so a later
+        # set_read_only reuses THIS connection instead of switching to a
+        # different instance. Without this, connecting to the reader-cluster
+        # endpoint and then set_read_only(True) finds an empty reader cache and
+        # switches off the current reader to a strategy-picked one (and a
+        # transient role-probe/topology glitch under load makes it land on the
+        # wrong reader). Parity with the async plugin's connect().
+        if effective_host is not None:
+            if current_role == HostRole.WRITER and self._writer_connection is None:
+                self._set_writer_connection(current_conn, effective_host)
+            elif current_role == HostRole.READER and self._reader_connection is None:
+                self._set_reader_connection(current_conn, effective_host)
 
         return current_conn
 

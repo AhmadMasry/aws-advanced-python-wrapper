@@ -105,3 +105,43 @@ def test_get_host_role_handles_async_cursor_creation():
     role = asyncio.run(AsyncDialectUtils.get_host_role(
         conn, MagicMock(), "SELECT 1"))
     assert role == HostRole.READER
+
+
+# ---- transaction-status preservation (read_only-INTRANS regression) ------
+
+
+def test_get_host_role_rolls_back_transient_probe_txn():
+    """A probe on a NOT-in-transaction connection must roll back afterward so
+    the connection isn't left INTRANS -- an autocommit=False conn would
+    otherwise have an open txn from the SELECT, blocking a later set_read_only
+    (test_sqlalchemy_creator_read_write_splitting). Mirrors sync's
+    preserve_transaction_status."""
+    conn, cursor = _mk_conn(reader_row=(False,))
+    conn.rollback = AsyncMock()
+    dd = MagicMock()
+    dd.is_in_transaction = AsyncMock(return_value=False)
+    role = asyncio.run(AsyncDialectUtils.get_host_role(conn, dd, "q"))
+    assert role == HostRole.WRITER
+    conn.rollback.assert_awaited_once()
+
+
+def test_get_host_role_preserves_existing_transaction():
+    """If the connection is already mid-transaction, the probe must NOT roll
+    back -- don't disturb the caller's open transaction."""
+    conn, cursor = _mk_conn(reader_row=(True,))
+    conn.rollback = AsyncMock()
+    dd = MagicMock()
+    dd.is_in_transaction = AsyncMock(return_value=True)
+    role = asyncio.run(AsyncDialectUtils.get_host_role(conn, dd, "q"))
+    assert role == HostRole.READER
+    conn.rollback.assert_not_awaited()
+
+
+def test_get_instance_id_rolls_back_transient_probe_txn():
+    conn, cursor = _mk_conn(reader_row=("inst-1",))
+    conn.rollback = AsyncMock()
+    dd = MagicMock()
+    dd.is_in_transaction = AsyncMock(return_value=False)
+    iid = asyncio.run(AsyncDialectUtils.get_instance_id(conn, dd, "q"))
+    assert iid == "inst-1"
+    conn.rollback.assert_awaited_once()

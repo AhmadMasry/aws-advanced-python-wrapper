@@ -328,23 +328,28 @@ class AsyncAwsWrapperConnection:
         return self._target_conn
 
     @property
-    def autocommit(self) -> Any:
-        """Current autocommit setting, read from the driver dialect.
+    def autocommit(self) -> bool:
+        """Current autocommit setting as a plain ``bool`` (sync property).
 
-        This is the getter half of an async-aware autocommit API. The
-        setter is spelled :meth:`set_autocommit` (a coroutine) rather
-        than an ``@autocommit.setter`` because property setters cannot
-        be ``async``. Routing stays at the driver-dialect layer because
-        autocommit is session state -- the plugin pipeline doesn't
-        intercept it on the sync side either.
-
-        Return type is :class:`typing.Any` rather than ``bool`` because
-        :meth:`AsyncDriverDialect.get_autocommit` is itself async -- callers
-        may need to ``await`` the returned coroutine. Sync dialects (or
-        mocked dialects in tests) may return ``bool`` directly; the runtime
-        value is whatever the dialect hands back.
+        Parity with the sync wrapper's ``autocommit`` property and with this
+        wrapper's :attr:`read_only`. The async driver dialect's
+        ``get_autocommit`` is a coroutine, but every supported driver exposes
+        autocommit *synchronously* -- psycopg ``AsyncConnection.autocommit``
+        (a bool property), aiomysql ``Connection.get_autocommit()`` -- so we
+        answer here without awaiting. Returning the coroutine instead made
+        ``conn.autocommit is False`` (no await) silently false and forced some
+        callers to ``await`` it, inconsistent with the sync wrapper. The setter
+        is still :meth:`set_autocommit` (a coroutine), since property setters
+        can't be async.
         """
-        return self._plugin_service.driver_dialect.get_autocommit(self._target_conn)
+        target = self._target_conn
+        ac = getattr(target, "autocommit", False)
+        # aiomysql exposes ``autocommit`` as a setter *method* and reads via
+        # ``get_autocommit()``; psycopg exposes ``autocommit`` as a sync bool
+        # property. Discriminate on callability (robust vs. driver shape).
+        if callable(ac):
+            return bool(target.get_autocommit())
+        return bool(ac)
 
     async def set_autocommit(self, value: bool) -> None:
         """Set autocommit on the underlying driver connection.
@@ -455,6 +460,27 @@ class AsyncAwsWrapperConnection:
         return bool(getattr(self._target_conn, "closed", False))
 
     @property
+    def is_closed(self) -> bool:
+        """Whether the connection is closed -- parity with the sync wrapper's
+        ``is_closed`` property (wrapper.py:88) that users and the failover
+        parity tests rely on (``assert conn.is_closed is False/True``).
+
+        The async driver dialect's ``is_closed`` is a coroutine, but every
+        supported async driver exposes closed-state synchronously
+        (psycopg ``AsyncConnection.closed``; aiomysql ``Connection.open``),
+        so we answer here without awaiting. Without this property
+        ``__getattr__`` forwards ``is_closed`` to the raw driver connection,
+        which has no such attribute -> AttributeError.
+        """
+        target = self._target_conn
+        if hasattr(target, "closed"):
+            return bool(target.closed)
+        # aiomysql Connection exposes ``open`` (inverse of closed), not ``closed``.
+        if hasattr(target, "open"):
+            return not bool(target.open)
+        return False
+
+    @property
     def prepare_threshold(self) -> Any:
         return self._target_conn.prepare_threshold
 
@@ -475,14 +501,80 @@ class AsyncAwsWrapperConnection:
         return self._target_conn.deferrable
 
     @property
-    def read_only(self) -> Any:
-        return self._target_conn.read_only
+    def read_only(self) -> bool:
+        """Current read-only intent, normalized to a plain ``bool``.
+
+        psycopg exposes ``read_only`` as a tri-state (``None`` == server
+        default / unset); aiomysql has no native flag, so the async aiomysql
+        driver dialect stashes intent on ``_aws_read_only``. Mirror the async
+        driver dialects' ``is_read_only`` normalization so callers get the
+        same ``bool`` surface as the sync wrapper -- a bare passthrough
+        returns psycopg's ``None`` and fails ``assert conn.read_only is False``.
+        """
+        val = getattr(self._target_conn, "read_only", None)
+        if val is None:
+            val = getattr(self._target_conn, "_aws_read_only", False)
+        return bool(val)
 
     async def set_deferrable(self, value: Any) -> None:
         await self._target_conn.set_deferrable(value)
 
     async def set_read_only(self, value: Any) -> None:
-        await self._target_conn.set_read_only(value)
+        """Set read-only, routing through the plugin pipeline.
+
+        Mirrors the sync wrapper's ``read_only`` setter (wrapper.py:99),
+        which sends ``CONNECTION_SET_READ_ONLY`` through
+        ``plugin_manager.execute``. This is what lets the read/write-splitting
+        plugin intercept the call and swap reader/writer connections -- a bare
+        ``await self._target_conn.set_read_only(...)`` bypasses every plugin,
+        so RWS never switches and ``conn.read_only`` toggles have no routing
+        effect.
+        """
+        # A closed connection can't change read/write mode. Without this the
+        # RWS plugin would happily open a *fresh* reader and silently succeed,
+        # masking the error the caller expects (parity with the sync wrapper,
+        # which fails when operating on a closed connection).
+        if self.is_closed:
+            raise AwsWrapperError(
+                "Cannot set read-only mode on a closed connection.")
+
+        async def _call() -> None:
+            # Terminal mirrors sync _set_read_only: track session state, then
+            # apply on the CURRENT connection -- the RWS plugin may have just
+            # swapped it to a reader/writer ahead of this terminal running.
+            ss = self._plugin_service.session_state_service
+            await ss.setup_pristine_readonly(value)
+            dd = self._plugin_service.driver_dialect
+            conn = self._plugin_service.current_connection
+            # psycopg rejects set_read_only while the connection is
+            # mid-transaction ("can't change 'read_only' now: ... INTRANS").
+            # After an RWS connection-switch (or SQLAlchemy's pool-reset on
+            # close), a transient switch/probe query can leave the (new)
+            # connection INTRANS; roll that transient transaction back so the
+            # session-level read_only flip can apply
+            # (test_sqlalchemy_creator_read_write_splitting).
+            #
+            # Roll back ONLY a transient, non-USER transaction. A genuine user
+            # transaction (the plugin service tracks BEGIN/COMMIT) must NOT be
+            # silently rolled back: for set_read_only(True) mid-user-txn the
+            # driver (psycopg) correctly REJECTS the change and the caller
+            # expects that error (test_set_read_only_true_in_transaction). A
+            # set_read_only(False) mid-user-txn never reaches this terminal --
+            # the RWS plugin raises first -- so guarding on the user-txn flag
+            # only spares switch/reset artifacts from the rollback.
+            try:
+                if (not self._plugin_service.is_in_transaction
+                        and await dd.is_in_transaction(conn)):
+                    rb = conn.rollback()
+                    if asyncio.iscoroutine(rb):
+                        await rb
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+            await dd.set_read_only(conn, value)
+            ss.set_read_only(value)
+
+        await self._plugin_manager.execute(
+            self, DbApiMethod.CONNECTION_SET_READ_ONLY, _call, value)
 
     def fileno(self) -> int:
         return self._target_conn.fileno()
@@ -617,12 +709,25 @@ class AsyncAwsWrapperConnection:
         props: Properties = PropertiesUtils.parse_properties(
             conn_info=conninfo, **kwargs)
 
-        # Pick the driver dialect. SP-2 hardcodes psycopg-async; later SPs
-        # will add a DriverDialectManager for async drivers so this becomes
-        # dispatch by target_func identity.
-        from aws_advanced_python_wrapper.aio.driver_dialect.psycopg import \
-            AsyncPsycopgDriverDialect
-        driver_dialect: AsyncDriverDialect = AsyncPsycopgDriverDialect()
+        # Pick the driver dialect by the target connect callable's module:
+        # aiomysql.connect -> AsyncAiomysqlDriverDialect (MySQL); otherwise the
+        # psycopg-async dialect. Previously this was hardcoded to psycopg, so
+        # MySQL connections ran through the psycopg dialect -- whose
+        # prepare_connect_info leaves a STRING port (aiomysql then raises
+        # "%d format: a real number is required, not str"), and whose
+        # cursor/transaction/is_closed/abort semantics don't match aiomysql.
+        # That mis-selection was the real root cause of the broad MySQL-async
+        # failures across all envs, not just the port cast.
+        target_module = getattr(target_func, "__module__", "") or ""
+        driver_dialect: AsyncDriverDialect
+        if "aiomysql" in target_module:
+            from aws_advanced_python_wrapper.aio.driver_dialect.aiomysql import \
+                AsyncAiomysqlDriverDialect
+            driver_dialect = AsyncAiomysqlDriverDialect()
+        else:
+            from aws_advanced_python_wrapper.aio.driver_dialect.psycopg import \
+                AsyncPsycopgDriverDialect
+            driver_dialect = AsyncPsycopgDriverDialect()
 
         host = props.get("host", "")
         port_raw = props.get("port")
@@ -686,7 +791,17 @@ class AsyncAwsWrapperConnection:
             )
 
         await plugin_service.set_current_connection(target_conn, host_info)
-        return AsyncAwsWrapperConnection(plugin_service, plugin_manager, target_conn)
+        wrapper = AsyncAwsWrapperConnection(plugin_service, plugin_manager, target_conn)
+        # Register so that plugin-driven connection switches (failover / RWS
+        # reader-writer swaps) rebind the wrapper's ``_target_conn``. Without
+        # this the wrapper stays pinned to the original connection: after a
+        # switch, cursor() / commit() still hit the old (often now-closed)
+        # connection -- "the connection is closed", RWS never redirects, etc.
+        # The sync wrapper sidesteps this because its ``target_connection`` is
+        # a live property over ``current_connection``; the async wrapper caches
+        # the conn for speed, so it must be kept in sync explicitly.
+        plugin_service.set_connection_wrapper(wrapper)
+        return wrapper
 
     def cursor(self, *args: Any, **kwargs: Any) -> AsyncAwsWrapperCursor:
         """Return a new :class:`AsyncAwsWrapperCursor`.

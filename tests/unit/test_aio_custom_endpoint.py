@@ -70,9 +70,9 @@ def test_monitor_start_is_idempotent():
                 refresh_interval_sec=0.5,
             )
             monitor.start()
-            first_task = monitor._task
+            first_thread = monitor._thread
             monitor.start()
-            assert monitor._task is first_task
+            assert monitor._thread is first_thread
             await monitor.stop()
 
     asyncio.run(_body())
@@ -82,19 +82,20 @@ def test_monitor_survives_boto3_errors():
     async def _body() -> None:
         call_count = [0]
 
-        async def _flaky(self: AsyncCustomEndpointMonitor) -> List[str]:
+        # The polling thread calls the (static) blocking fetch directly; first
+        # call raises, subsequent calls succeed. The monitor must swallow the
+        # error and keep polling. patch.object replaces the staticmethod with a
+        # MagicMock (not bound), so it's called as (endpoint_id, region).
+        def _flaky(endpoint_id: str, region) -> List[str]:
             call_count[0] += 1
             if call_count[0] == 1:
                 raise RuntimeError("transient AWS failure")
             return ["i-good"]
 
-        # Patch the async wrapper directly -- bypasses asyncio.to_thread
-        # timing surprises in the test sleep. Patched function must take
-        # `self` since patch.object replaces an instance method on the class.
         with patch.object(
             AsyncCustomEndpointMonitor,
-            "_fetch_members",
-            _flaky,
+            "_fetch_members_blocking",
+            side_effect=_flaky,
         ):
             monitor = AsyncCustomEndpointMonitor(
                 cluster_identifier="c",
@@ -126,12 +127,14 @@ def test_monitor_extracts_static_members_from_describe_response():
     )
     with patch("boto3.client", return_value=fake_client):
         members = AsyncCustomEndpointMonitor._fetch_members_blocking(
-            "c", "e", "us-east-1"
+            "e", "us-east-1"
         )
     assert members == ["instance-1", "instance-2", "instance-3"]
+    # Resolved by endpoint id + custom-type filter only -- never by
+    # DBClusterIdentifier (the wrapper's CLUSTER_ID is not the real RDS id).
     fake_client.describe_db_cluster_endpoints.assert_called_once_with(
-        DBClusterIdentifier="c",
         DBClusterEndpointIdentifier="e",
+        Filters=[{"Name": "db-cluster-endpoint-type", "Values": ["custom"]}],
     )
 
 
@@ -412,8 +415,10 @@ def test_plugin_connect_waits_for_info_and_returns_conn_on_success():
 
 
 def test_plugin_connect_raises_on_wait_timeout():
-    """On wait_for_info timeout, connect aborts the half-established
-    connection and raises AwsWrapperError (N.3 realignment with sync)."""
+    """On wait_for_info timeout, connect raises AwsWrapperError WITHOUT
+    connecting -- the monitor wait now happens before connect_func() so the
+    allowed-hosts filter is in place before the connection is made (sync
+    parity). Since no connection was established, none is aborted."""
     async def _body() -> None:
         aio_cleanup.clear_shutdown_hooks()
         props = Properties({
@@ -431,8 +436,10 @@ def test_plugin_connect_raises_on_wait_timeout():
             return_value=[],
         ):
             raw_conn = MagicMock()
+            connect_called = [0]
 
             async def _connect_func() -> object:
+                connect_called[0] += 1
                 return raw_conn
 
             driver_dialect = MagicMock()
@@ -451,8 +458,10 @@ def test_plugin_connect_raises_on_wait_timeout():
                         is_initial_connection=True,
                         connect_func=_connect_func,
                     )
-                # connection was aborted as part of the raise path.
-                driver_dialect.abort_connection.assert_awaited_once_with(raw_conn)
+                # We raise BEFORE connecting, so connect_func is never called
+                # and there is no connection to abort.
+                assert connect_called[0] == 0
+                driver_dialect.abort_connection.assert_not_awaited()
             finally:
                 await aio_cleanup.release_resources_async()
 

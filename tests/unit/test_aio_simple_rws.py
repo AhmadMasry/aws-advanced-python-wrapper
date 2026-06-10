@@ -29,7 +29,8 @@ import pytest
 
 from aws_advanced_python_wrapper.aio.simple_read_write_splitting_plugin import \
     AsyncSimpleReadWriteSplittingPlugin
-from aws_advanced_python_wrapper.errors import AwsWrapperError
+from aws_advanced_python_wrapper.errors import (AwsWrapperError,
+                                                ReadWriteSplittingError)
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import (Properties,
@@ -64,6 +65,10 @@ def _build_plugin_service(
     dd = MagicMock()
     dd.is_closed = AsyncMock(return_value=False)
     dd.abort_connection = AsyncMock()
+    # Default: not in a transaction, so the SRW in-transaction guard lets the
+    # endpoint switch proceed. Individual tests override to True to exercise
+    # the guard (no switch on read-only; raise on read-write).
+    dd.is_in_transaction = AsyncMock(return_value=False)
     svc.driver_dialect = dd
 
     # plugin_service.connect now stands in for the old pipeline-bypass
@@ -132,6 +137,56 @@ def test_set_read_only_true_switches_to_read_endpoint():
     asyncio.run(_body())
 
 
+def test_srw_set_read_only_false_in_transaction_raises():
+    # Switching back to the writer mid-transaction must raise (the endpoint
+    # swap would silently abandon the open transaction). Parity with the RWS
+    # plugin; previously the SRW plugin switched unconditionally.
+    async def _body() -> None:
+        svc, dd = _build_plugin_service(role_returns=HostRole.WRITER)
+        dd.is_in_transaction = AsyncMock(return_value=True)
+        props = _base_props()
+        plugin = AsyncSimpleReadWriteSplittingPlugin(svc, props)
+
+        async def _noop() -> None:
+            return None
+
+        with pytest.raises(ReadWriteSplittingError):
+            await plugin.execute(
+                MagicMock(),
+                DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+                _noop, False,
+            )
+        svc.set_current_connection.assert_not_awaited()
+
+    asyncio.run(_body())
+
+
+def test_srw_set_read_only_true_in_transaction_does_not_switch():
+    # Read-only toggle mid-transaction must NOT swap endpoints (the terminal
+    # set_read_only then raises on PG / is allowed on MySQL).
+    async def _body() -> None:
+        svc, dd = _build_plugin_service(role_returns=HostRole.READER)
+        dd.is_in_transaction = AsyncMock(return_value=True)
+        props = _base_props()
+        plugin = AsyncSimpleReadWriteSplittingPlugin(svc, props)
+
+        called = {"n": 0}
+
+        async def _terminal() -> None:
+            called["n"] += 1
+
+        await plugin.execute(
+            MagicMock(),
+            DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _terminal, True,
+        )
+        # No endpoint switch, but the terminal still runs.
+        svc.set_current_connection.assert_not_awaited()
+        assert called["n"] == 1
+
+    asyncio.run(_body())
+
+
 def test_set_read_only_false_switches_to_write_endpoint():
     async def _body() -> None:
         svc, dd = _build_plugin_service(role_returns=HostRole.WRITER)
@@ -158,11 +213,13 @@ def test_set_read_only_false_switches_to_write_endpoint():
 # ---- Role-verification retry ----------------------------------------------
 
 
-def test_verify_retries_when_role_mismatches_and_times_out():
-    """If get_host_role never matches, _verify_role eventually returns None
-    and _switch_to raises."""
-    from aws_advanced_python_wrapper.errors import ReadWriteSplittingError
-
+def test_verify_retries_then_falls_back_when_role_mismatches_and_current_usable():
+    """If get_host_role never matches, _verify_role exhausts retries and
+    _switch_to raises -- but set_read_only(True) then FALLS BACK to the
+    still-usable current connection (sync parity
+    read_write_splitting_plugin.py:209-221) rather than propagating. A
+    misconfigured read endpoint that resolves to a writer must not break
+    set_read_only(True) (test_incorrect_reader_endpoint)."""
     async def _body() -> None:
         # Asked for a reader, but every probe says WRITER -> exhaust retries.
         svc, dd = _build_plugin_service(role_returns=HostRole.WRITER)
@@ -178,16 +235,47 @@ def test_verify_retries_when_role_mismatches_and_times_out():
         async def _noop() -> None:
             return None
 
-        with pytest.raises(ReadWriteSplittingError):
-            await plugin.execute(
-                MagicMock(),
-                DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
-                _noop, True,  # request reader
-            )
+        # Must NOT raise -- the current connection is usable, so we fall back.
+        await plugin.execute(
+            MagicMock(),
+            DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _noop, True,  # request reader
+        )
         # Multiple connect attempts made before giving up.
         assert svc.connect.await_count >= 2
         # Each wrong-role connection was aborted.
         assert dd.abort_connection.await_count >= 2
+        # Stayed on the current connection -- no swap.
+        svc.set_current_connection.assert_not_called()
+
+    asyncio.run(_body())
+
+
+def test_reader_switch_failure_raises_when_current_connection_unusable():
+    """If no verified reader can be opened AND the current connection is
+    closed, set_read_only(True) propagates -- there is no safe fallback."""
+    from aws_advanced_python_wrapper.errors import ReadWriteSplittingError
+
+    async def _body() -> None:
+        svc, dd = _build_plugin_service(role_returns=HostRole.WRITER)
+        dd.is_closed = AsyncMock(return_value=True)  # current connection is gone
+        props = _base_props(
+            **{
+                WrapperProperties.SRW_CONNECT_RETRY_TIMEOUT_MS.name: "30",
+                WrapperProperties.SRW_CONNECT_RETRY_INTERVAL_MS.name: "5",
+            }
+        )
+        plugin = AsyncSimpleReadWriteSplittingPlugin(svc, props)
+
+        async def _noop() -> None:
+            return None
+
+        with pytest.raises(ReadWriteSplittingError):
+            await plugin.execute(
+                MagicMock(),
+                DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+                _noop, True,
+            )
 
     asyncio.run(_body())
 

@@ -39,6 +39,22 @@ def _build():
     return plugin, svc, driver_dialect, tracker
 
 
+def _plain_conn(name, close_side_effect=None):
+    """A driver-style async connection mock: has ``close()``, no ``invalidate()``.
+
+    Real psycopg / aiomysql async connections expose ``close()`` but not the
+    SQLAlchemy pool-fairy ``invalidate()``. A bare ``MagicMock`` auto-creates
+    an ``invalidate`` attribute, which sends ``AsyncOpenedConnectionTracker``
+    down its pool-fairy ``invalidate()`` branch (added in c0ca385) instead of
+    ``close()``. Deleting ``invalidate`` models a plain driver connection so
+    these tests exercise the intended close path.
+    """
+    c = MagicMock(name=name)
+    del c.invalidate
+    c.close = MagicMock(side_effect=close_side_effect)
+    return c
+
+
 def test_tracker_records_connection_on_connect():
     plugin, svc, driver_dialect, tracker = _build()
     host = HostInfo(host="instance-1", port=5432, role=HostRole.WRITER)
@@ -61,6 +77,179 @@ def test_tracker_records_connection_on_connect():
     assert conn in tracked
 
 
+def test_connect_enriches_cluster_endpoint_with_resolved_instance_alias():
+    """A cluster-endpoint connection must be tracked under the resolved
+    *instance* alias so writer-failover ``invalidate_all(instance)`` closes
+    it -- regression for ``test_writer_failover_in_idle_connections`` where
+    idle cluster-connected sockets survived the writer demotion because they
+    were keyed only under the cluster endpoint.
+    """
+    plugin, svc, driver_dialect, tracker = _build()
+    cluster_host = HostInfo(
+        host="idledb.cluster-xy9.us-east-1.rds.amazonaws.com",
+        port=5432,
+        role=HostRole.WRITER,
+    )
+    instance_host = HostInfo(
+        host="idle-inst-1.xy9.us-east-1.rds.amazonaws.com",
+        port=5432,
+        role=HostRole.WRITER,
+    )
+    svc.identify_connection = AsyncMock(return_value=instance_host)
+    conn = _plain_conn("idle_conn")
+
+    async def _connect_func():
+        return conn
+
+    async def _run():
+        await plugin.connect(
+            target_driver_func=MagicMock(),
+            driver_dialect=driver_dialect,
+            host_info=cluster_host,
+            props=svc.props,
+            is_initial_connection=True,
+            connect_func=_connect_func)
+        # Failover detects the change against the *instance* topology row;
+        # invalidate_all(instance) must now find the cluster-connected conn.
+        await tracker.invalidate_all(
+            HostInfo(host="idle-inst-1.xy9.us-east-1.rds.amazonaws.com", port=5432))
+
+    asyncio.run(_run())
+    svc.identify_connection.assert_awaited_once()
+    conn.close.assert_called()
+
+
+def test_connect_falls_back_to_cluster_key_when_identify_returns_none():
+    """If instance resolution yields nothing, the connect still succeeds and
+    the conn stays tracked under the cluster key (prior behavior, no regression)."""
+    plugin, svc, driver_dialect, tracker = _build()
+    cluster_host = HostInfo(
+        host="fbdb.cluster-zz1.us-east-1.rds.amazonaws.com",
+        port=5432,
+        role=HostRole.WRITER,
+    )
+    svc.identify_connection = AsyncMock(return_value=None)
+    conn = _plain_conn("fb_conn")
+
+    async def _connect_func():
+        return conn
+
+    async def _run():
+        await plugin.connect(
+            target_driver_func=MagicMock(),
+            driver_dialect=driver_dialect,
+            host_info=cluster_host,
+            props=svc.props,
+            is_initial_connection=True,
+            connect_func=_connect_func)
+
+    asyncio.run(_run())
+    svc.identify_connection.assert_awaited_once()
+    assert conn in tracker._tracked_for(cluster_host)
+
+
+def test_connect_skips_identify_for_instance_endpoint():
+    """Instance-endpoint connections already key correctly -- no extra
+    identify round-trip is paid."""
+    plugin, svc, driver_dialect, tracker = _build()
+    instance_host = HostInfo(
+        host="direct-inst.zz2.us-east-1.rds.amazonaws.com",
+        port=5432,
+        role=HostRole.WRITER,
+    )
+    svc.identify_connection = AsyncMock(return_value=instance_host)
+    conn = MagicMock(name="direct_conn")
+
+    async def _connect_func():
+        return conn
+
+    async def _run():
+        await plugin.connect(
+            target_driver_func=MagicMock(),
+            driver_dialect=driver_dialect,
+            host_info=instance_host,
+            props=svc.props,
+            is_initial_connection=True,
+            connect_func=_connect_func)
+
+    asyncio.run(_run())
+    svc.identify_connection.assert_not_awaited()
+    assert conn in tracker._tracked_for(instance_host)
+
+
+def test_connect_pins_writer_so_failover_invalidates_idle_conns():
+    """End-to-end Group 2 regression for
+    ``test_writer_failover_in_idle_connections``: the async connect flow does
+    not populate ``all_hosts``, so unless the tracker pins the writer at
+    connect, a post-failover writer reads as a *first observation* and the
+    demoted writer's idle connections are never invalidated. Pinning at
+    connect makes the failover a detectable transition (w1 -> w2)."""
+    plugin, svc, driver_dialect, tracker = _build()
+    writer1 = HostInfo(
+        host="test-pg-x-1.cvqiy8w244sz.us-east-2.rds.amazonaws.com",
+        port=5432, role=HostRole.WRITER)
+    writer2 = HostInfo(
+        host="test-pg-x-2.cvqiy8w244sz.us-east-2.rds.amazonaws.com",
+        port=5432, role=HostRole.WRITER)
+
+    async def _refresh_to_w1(*a, **k):
+        svc._all_hosts = (writer1,)
+    svc.refresh_host_list = AsyncMock(side_effect=_refresh_to_w1)
+
+    active_conn = _plain_conn("active")
+    idle_conn = _plain_conn("idle")
+
+    async def _connect_func():
+        return active_conn
+
+    async def _run():
+        # Connect pins _current_writer to writer1 via the connect-time refresh.
+        await plugin.connect(
+            target_driver_func=MagicMock(), driver_dialect=driver_dialect,
+            host_info=writer1, props=svc.props,
+            is_initial_connection=True, connect_func=_connect_func)
+        assert plugin._current_writer is not None
+        assert plugin._current_writer.host == writer1.host
+
+        # An idle connection to the same (old) writer.
+        tracker.track(writer1, idle_conn)
+
+        # Failover: execute raises FailoverError; refresh now reports writer2.
+        async def _refresh_to_w2(*a, **k):
+            svc._all_hosts = (writer2,)
+        svc.refresh_host_list = AsyncMock(side_effect=_refresh_to_w2)
+
+        async def _raising():
+            raise FailoverSuccessError("failover")
+        with pytest.raises(FailoverSuccessError):
+            await plugin.execute(MagicMock(), "Cursor.execute", _raising)
+        await asyncio.sleep(0.01)
+
+    asyncio.run(_run())
+    idle_conn.close.assert_called()
+
+
+def test_connect_does_not_pin_writer_for_non_rds_host():
+    """Non-RDS connections pay no connect-time topology round-trip."""
+    plugin, svc, driver_dialect, tracker = _build()
+    svc.refresh_host_list = AsyncMock()
+    conn = MagicMock(name="conn")
+
+    async def _connect_func():
+        return conn
+
+    async def _run():
+        await plugin.connect(
+            target_driver_func=MagicMock(), driver_dialect=driver_dialect,
+            host_info=HostInfo(host="plain.example.com", port=5432),
+            props=svc.props, is_initial_connection=True,
+            connect_func=_connect_func)
+
+    asyncio.run(_run())
+    svc.refresh_host_list.assert_not_awaited()
+    assert plugin._current_writer is None
+
+
 def test_tracker_returns_empty_set_for_unknown_host():
     tracker = AsyncOpenedConnectionTracker()
     h = HostInfo(host="ghost", port=5432)
@@ -70,10 +259,8 @@ def test_tracker_returns_empty_set_for_unknown_host():
 def test_invalidate_all_closes_tracked_connections():
     tracker = AsyncOpenedConnectionTracker()
     host = HostInfo(host="writer-1", port=5432, role=HostRole.WRITER)
-    c1 = MagicMock(name="c1")
-    c1.close = MagicMock()
-    c2 = MagicMock(name="c2")
-    c2.close = MagicMock()
+    c1 = _plain_conn("c1")
+    c2 = _plain_conn("c2")
     tracker.track(host, c1)
     tracker.track(host, c2)
 
@@ -86,10 +273,8 @@ def test_invalidate_all_closes_tracked_connections():
 def test_invalidate_all_survives_close_errors():
     tracker = AsyncOpenedConnectionTracker()
     host = HostInfo(host="writer-1", port=5432, role=HostRole.WRITER)
-    bad = MagicMock(name="bad")
-    bad.close = MagicMock(side_effect=RuntimeError("broken"))
-    good = MagicMock(name="good")
-    good.close = MagicMock()
+    bad = _plain_conn("bad", RuntimeError("broken"))
+    good = _plain_conn("good")
     tracker.track(host, bad)
     tracker.track(host, good)
 
@@ -102,8 +287,7 @@ def test_plugin_invalidates_old_writer_on_writer_change():
     plugin, svc, driver_dialect, tracker = _build()
     old_writer = HostInfo(host="old-w", port=5432, role=HostRole.WRITER)
     new_writer = HostInfo(host="new-w", port=5432, role=HostRole.WRITER)
-    conn_to_old = MagicMock(name="conn_to_old")
-    conn_to_old.close = MagicMock()
+    conn_to_old = _plain_conn("conn_to_old")
 
     svc._all_hosts = (old_writer,)
     tracker.track(old_writer, conn_to_old)
@@ -147,8 +331,7 @@ def test_plugin_invalidates_on_failover_error():
     plugin, svc, driver_dialect, tracker = _build()
     old_writer = HostInfo(host="old-w", port=5432, role=HostRole.WRITER)
     new_writer = HostInfo(host="new-w", port=5432, role=HostRole.WRITER)
-    conn_to_old = MagicMock(name="conn_to_old")
-    conn_to_old.close = MagicMock()
+    conn_to_old = _plain_conn("conn_to_old")
 
     svc._all_hosts = (old_writer,)
     tracker.track(old_writer, conn_to_old)
@@ -201,8 +384,7 @@ def test_tracker_state_is_shared_across_instances():
     tracker_a = AsyncOpenedConnectionTracker()
     tracker_b = AsyncOpenedConnectionTracker()
     host = HostInfo(host="shared-w", port=5432, role=HostRole.WRITER)
-    conn = MagicMock(name="shared_conn")
-    conn.close = MagicMock()
+    conn = _plain_conn("shared_conn")
 
     tracker_a.track(host, conn)
     # tracker_b should see it too
@@ -216,8 +398,7 @@ def test_tracker_state_is_shared_across_instances():
 def test_notify_converted_to_reader_invalidates_that_host():
     plugin, svc, driver_dialect, tracker = _build()
     host = HostInfo(host="demoted-w", port=5432, role=HostRole.WRITER)
-    conn = MagicMock(name="conn")
-    conn.close = MagicMock()
+    conn = _plain_conn("conn")
     tracker.track(host, conn)
 
     from aws_advanced_python_wrapper.utils.notifications import HostEvent
@@ -292,8 +473,7 @@ def test_release_resources_async_drains_pending_invalidations():
         await asyncio.sleep(0.05)
         close_finished.set()
 
-    conn = MagicMock(name="slow_conn")
-    conn.close = MagicMock(side_effect=lambda: _slow_close())
+    conn = _plain_conn("slow_conn", lambda: _slow_close())
     tracker.track(old, conn)
 
     svc._all_hosts = (old,)
@@ -320,8 +500,7 @@ def test_notify_host_list_changed_handles_ipv6_alias():
     plugin, svc, driver_dialect, tracker = _build()
     # Track a conn under an IPv6-shaped host
     ipv6_host = HostInfo(host="[::1]", port=5432, role=HostRole.WRITER)
-    conn = MagicMock(name="ipv6_conn")
-    conn.close = MagicMock()
+    conn = _plain_conn("ipv6_conn")
     tracker.track(ipv6_host, conn)
 
     from aws_advanced_python_wrapper.utils.notifications import HostEvent
@@ -375,8 +554,7 @@ def test_tracker_keys_by_instance_endpoint_for_cluster_connected_conn():
     # Add a known RDS instance alias
     cluster_host.add_alias("myinstance.abc123.us-east-1.rds.amazonaws.com:5432")
 
-    conn = MagicMock(name="conn")
-    conn.close = MagicMock()
+    conn = _plain_conn("conn")
     tracker.track(cluster_host, conn)
 
     # Canonical key is the instance alias, not the cluster host:port

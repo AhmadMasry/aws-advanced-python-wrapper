@@ -35,6 +35,7 @@ from aws_advanced_python_wrapper.aio.plugin_service import \
     AsyncPluginServiceImpl
 from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.notifications import ConnectionEvent
 from aws_advanced_python_wrapper.utils.properties import Properties
 
 # ---- Fakes --------------------------------------------------------------
@@ -161,6 +162,20 @@ class SubscribedOnlyConnectPlugin(AsyncPlugin):
             **kwargs: Any) -> Any:  # pragma: no cover - should not be called
         self.log.append(f"SubOnly:execute:{method_name}")
         return await execute_func()
+
+
+class _NotifyRecorderPlugin(AsyncPlugin):
+    """Records every notify_connection_changed call it receives."""
+
+    def __init__(self) -> None:
+        self.notified: List[Set[ConnectionEvent]] = []
+
+    @property
+    def subscribed_methods(self) -> Set[str]:
+        return {DbApiMethod.ALL.method_name}
+
+    def notify_connection_changed(self, changes: Set[ConnectionEvent]) -> None:
+        self.notified.append(set(changes))
 
 
 # ---- Helpers ------------------------------------------------------------
@@ -324,6 +339,41 @@ def test_plugin_service_impl_tracks_connection_and_host_info():
         await svc.set_current_connection(c2, HostInfo(host="host2", port=5432))
         assert svc.current_connection is c2
         assert await dialect.is_read_only(c2) is True
+
+    asyncio.run(_body())
+
+
+def test_notify_connection_changed_dispatches_to_all_plugins():
+    svc = _mk_service()
+    a = _NotifyRecorderPlugin()
+    b = _NotifyRecorderPlugin()
+    mgr = AsyncPluginManager(svc, _props(), plugins=[a, b])
+    mgr.notify_connection_changed({ConnectionEvent.CONNECTION_OBJECT_CHANGED})
+    assert a.notified == [{ConnectionEvent.CONNECTION_OBJECT_CHANGED}]
+    assert b.notified == [{ConnectionEvent.CONNECTION_OBJECT_CHANGED}]
+
+
+def test_set_current_connection_notifies_plugins_on_initial_and_swap():
+    # The connection-changed notification is what lets the EFM plugin reset its
+    # per-connection UNAVAILABLE flag after failover swaps the connection
+    # (test_fail_from_reader_to_writer). Verify the swap actually fires it.
+    async def _body() -> None:
+        svc = _mk_service()
+        rec = _NotifyRecorderPlugin()
+        svc.plugin_manager = AsyncPluginManager(svc, _props(), plugins=[rec])
+
+        c1 = _FakeAsyncConnection("host1")
+        await svc.set_current_connection(c1, HostInfo(host="host1", port=5432))
+        assert rec.notified == [{ConnectionEvent.INITIAL_CONNECTION}]
+
+        c2 = _FakeAsyncConnection("host2")
+        await svc.set_current_connection(c2, HostInfo(host="host2", port=5432))
+        assert rec.notified[-1] == {ConnectionEvent.CONNECTION_OBJECT_CHANGED}
+        assert len(rec.notified) == 2
+
+        # Re-setting the SAME connection must NOT notify (no real change).
+        await svc.set_current_connection(c2, HostInfo(host="host2", port=5432))
+        assert len(rec.notified) == 2
 
     asyncio.run(_body())
 

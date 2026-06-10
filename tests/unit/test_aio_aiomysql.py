@@ -48,11 +48,29 @@ def test_driver_dialect_prepare_connect_info_renames_database_to_db():
     })
     prepared = d.prepare_connect_info(HostInfo("h", 3306), props)
     assert prepared["host"] == "h"
-    assert prepared["port"] == "3306"
+    # Port must be an int: aiomysql/pymysql formats it with "%d" and a string
+    # raises "%d format: a real number is required, not str". The pooled
+    # provider's creator calls prepare_connect_info directly, so the cast must
+    # live here (not only in connect()).
+    assert prepared["port"] == 3306
     assert prepared["user"] == "u"
     assert prepared["password"] == "p"
     assert prepared["db"] == "mydb"
     assert "database" not in prepared
+
+
+def test_driver_dialect_casts_string_port_from_props_when_host_has_no_port():
+    # Regression for the MySQL env-1/env-2 async failures (every
+    # test_*_connection_async): when the port arrives as a STRING in props and
+    # host_info has NO explicit port, the connection-provider path calls
+    # prepare_connect_info directly (bypassing connect()'s coercion). The port
+    # must still be cast to int -- aiomysql formats it with "%d" and a string
+    # raises "%d format: a real number is required, not str" from connection.py.
+    d = AsyncAiomysqlDriverDialect()
+    props = Properties({"port": "3306", "user": "u", "password": "p"})
+    prepared = d.prepare_connect_info(HostInfo("h"), props)  # host_info: no port
+    assert prepared["port"] == 3306
+    assert isinstance(prepared["port"], int)
 
 
 def test_driver_dialect_preserves_db_key_if_already_present():

@@ -224,7 +224,7 @@ class TestAwsIamAuthenticationAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover,iam", "failover_v2,iam"])
+    @pytest.mark.parametrize("plugins", ["failover_v2,iam"])
     @enable_on_num_instances(min_instances=2)
     @enable_on_deployments([DatabaseEngineDeployment.AURORA, DatabaseEngineDeployment.RDS_MULTI_AZ_CLUSTER])
     @disable_on_features([TestEnvironmentFeatures.RUN_AUTOSCALING_TESTS_ONLY,

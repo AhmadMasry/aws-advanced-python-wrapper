@@ -129,7 +129,16 @@ class AsyncAuroraHostListProvider:
                 "SELECT SERVER_ID, SESSION_ID = 'MASTER_SESSION_ID' AS IS_WRITER "
                 "FROM aurora_replica_status() "
                 "WHERE EXTRACT(EPOCH FROM (NOW() - LAST_UPDATE_TIMESTAMP)) <= 300 "
-                "OR SESSION_ID = 'MASTER_SESSION_ID'"
+                "OR SESSION_ID = 'MASTER_SESSION_ID' "
+                # A reader whose replica status hasn't reported yet has a NULL
+                # LAST_UPDATE_TIMESTAMP -- the freshness check above is NULL
+                # (not TRUE) for it, so without this clause every such reader is
+                # dropped and the topology collapses to writer-only. The failover
+                # host list is then stranded at one host and a writer outage
+                # yields FailoverFailedError (fail_from_reader_to_writer,
+                # failover_with_iam, failover_with_secrets_manager). Mirrors the
+                # sync Aurora-PG topology query (database_dialect.py:505-511).
+                "OR LAST_UPDATE_TIMESTAMP IS NULL"
             ),
             cluster_id: Optional[str] = None,
             default_port: int = 5432) -> None:
@@ -288,8 +297,18 @@ class AsyncAuroraHostListProvider:
         # The underlying connection is a raw async driver connection
         # (psycopg.AsyncConnection at 3.0.0). It exposes a sync ``cursor()``
         # method that returns an async cursor.
-        cur = connection.cursor()
         try:
+            # ``connection.cursor()`` MUST stay inside the try. On a fully
+            # closed connection psycopg raises OperationalError('the connection
+            # is closed') from cursor() itself -- not just from execute(). If
+            # that escapes, force_refresh / _fetch_and_cache propagate it to the
+            # caller instead of falling back to the cached topology, which
+            # strands failover on the single seed host and yields a spurious
+            # FailoverFailedError (test_fail_from_reader_to_writer): the failover
+            # refreshes through the dead current connection, the probe raises
+            # rather than returning [], and the cached [writer, reader,...]
+            # topology is never consulted.
+            cur = connection.cursor()
             async with cur:
                 await cur.execute(self._topology_query)
                 return list(await cur.fetchall())
@@ -299,17 +318,21 @@ class AsyncAuroraHostListProvider:
             return []
 
     def _rows_to_topology(self, rows: List[tuple]) -> Topology:
+        # The instance host pattern may carry an explicit ``:port`` (proxied
+        # test endpoints do); use it for every topology host. See
+        # :meth:`_resolve_instance_pattern`.
+        _, pattern_port = self._resolve_instance_pattern()
+        port = pattern_port if pattern_port is not None else self._default_port
         hosts: List[HostInfo] = []
         for row in rows:
             if not row:
                 continue
             server_id = row[0]
             is_writer = bool(row[1]) if len(row) > 1 else False
-            host = self._host_from_server_id(server_id)
             hosts.append(
                 HostInfo(
-                    host=host,
-                    port=self._default_port,
+                    host=self._host_from_server_id(server_id),
+                    port=port,
                     role=HostRole.WRITER if is_writer else HostRole.READER,
                 )
             )
@@ -317,18 +340,56 @@ class AsyncAuroraHostListProvider:
         hosts.sort(key=lambda h: 0 if h.role == HostRole.WRITER else 1)
         return tuple(hosts)
 
-    def _host_from_server_id(self, server_id: str) -> str:
-        """Translate an Aurora server ID into a reachable host name.
+    def _resolve_instance_pattern(self) -> Tuple[Optional[str], Optional[int]]:
+        """Resolve the instance host pattern and its explicit port (if any).
 
-        Uses the ``cluster_instance_host_pattern`` connection property when
-        set (e.g., ``?.cluster-xyz.us-east-1.rds.amazonaws.com``). Falls
-        back to the server ID itself if unset.
+        Returns ``(host_pattern_with_'?', port)``; ``port`` is ``None`` when the
+        pattern carries no explicit ``:port`` suffix.
+
+        Prefers the ``cluster_instance_host_pattern`` connection property; when
+        unset, auto-derives the pattern from the connection endpoint via
+        ``RdsUtils.get_rds_instance_host_pattern`` -- exactly what the sync
+        ``AuroraHostListProvider`` does (host_list_provider.py:459).
+
+        The pattern may include a port -- proxied test endpoints use
+        ``?.<suffix>:8666``. That port MUST be split out (mirroring sync
+        ``AuroraHostListProvider.__init__`` at host_list_provider.py:445-449):
+        otherwise it stays baked into the hostname (``<id>.<suffix>:8666``,
+        which doesn't resolve) while the connection uses the wrong default
+        port, so every failover/reader connect to a topology host fails and
+        writer failover is stranded (test_fail_from_reader_to_writer).
         """
         pattern = WrapperProperties.CLUSTER_INSTANCE_HOST_PATTERN.get(
             self._props
         )
-        if pattern and "?" in pattern:
-            return pattern.replace("?", server_id)
+        if not (pattern and "?" in pattern):
+            from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
+            derived = RdsUtils().get_rds_instance_host_pattern(
+                self._props.get("host", "") or "")
+            if derived and "?" in derived:
+                pattern = derived
+        if not (pattern and "?" in pattern):
+            return None, None
+        port: Optional[int] = None
+        if ":" in pattern:
+            pattern, _, port_str = pattern.rpartition(":")
+            try:
+                port = int(port_str)
+            except ValueError:
+                port = None
+        return pattern, port
+
+    def _host_from_server_id(self, server_id: str) -> str:
+        """Translate an Aurora server ID into a reachable host name.
+
+        Builds ``<server_id>.<suffix>`` from the resolved instance host pattern
+        (see :meth:`_resolve_instance_pattern`). Falling back to the bare server
+        ID yields a non-resolvable name, so every reader/failover connect to a
+        topology host fails with "failed to resolve host '<server_id>'".
+        """
+        host_pattern, _ = self._resolve_instance_pattern()
+        if host_pattern:
+            return host_pattern.replace("?", server_id)
         return server_id
 
     async def stop(self) -> None:

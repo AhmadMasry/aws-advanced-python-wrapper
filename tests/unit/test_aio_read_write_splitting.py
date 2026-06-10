@@ -59,13 +59,15 @@ def _build(topology: Optional[tuple] = None):
         side_effect=lambda role, strategy, candidates: (
             next((h for h in (candidates or ()) if h.role == role), None)))
 
-    hlp = MagicMock()
-    hlp.refresh = AsyncMock(
-        return_value=topology or (
-            HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),
-            HostInfo(host="reader.example", port=5432, role=HostRole.READER),
-        )
+    _topology = topology or (
+        HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),
+        HostInfo(host="reader.example", port=5432, role=HostRole.READER),
     )
+    hlp = MagicMock()
+    hlp.refresh = AsyncMock(return_value=_topology)
+    # _switch_to_reader re-probes with force_refresh when a refresh returns no
+    # readers (transient writer-only topology); mirror refresh's result.
+    hlp.force_refresh = AsyncMock(return_value=_topology)
 
     plugin = AsyncReadWriteSplittingPlugin(svc, hlp, props)
     plugin._writer_conn = writer_conn
@@ -188,22 +190,31 @@ def test_set_read_only_true_reuses_cached_reader():
     asyncio.run(_body())
 
 
-def test_set_read_only_true_raises_when_no_reader_in_topology():
+def test_set_read_only_true_falls_back_when_no_reader_in_topology():
+    """A reader-less topology (Aurora's aurora_replica_status() transiently
+    drops the reader row) must NOT raise on set_read_only(True). Mirrors sync
+    ReadWriteSplittingPlugin.NoReadersFound: stay on the current connection and
+    warn. (Before the fix the async plugin raised
+    'No reader host available in the current topology.')"""
     async def _body() -> None:
-        plugin, *_ = _build(
+        plugin, svc, *_ = _build(
             topology=(HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),)
         )
+        before = svc.current_connection
 
         async def _work() -> None:
             return None
 
-        with pytest.raises(ReadWriteSplittingError):
-            await plugin.execute(
-                object(),
-                DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
-                _work,
-                True,
-            )
+        # Must NOT raise.
+        await plugin.execute(
+            object(),
+            DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _work,
+            True,
+        )
+        # Stayed on the current connection; no reader swap occurred.
+        assert svc.current_connection is before
+        assert plugin._reader_conn is None
 
     asyncio.run(_body())
 
@@ -332,23 +343,59 @@ def test_switch_to_reader_defaults_to_random_strategy():
     assert svc.get_host_info_by_strategy.call_args.args[1] == "random"
 
 
-def test_switch_to_reader_raises_when_strategy_returns_none():
-    """If the strategy can't pick a reader (empty candidates), raise."""
-    plugin, svc, hlp, _, _ = _build(topology=(
-        HostInfo(host="w", port=5432, role=HostRole.WRITER),
-    ))  # no readers
-    svc.get_host_info_by_strategy = MagicMock(return_value=None)
+def test_switch_to_reader_recovers_via_force_refresh_on_transient_no_reader():
+    """A transient writer-only refresh is retried with force_refresh; when the
+    retry surfaces the reader, the switch succeeds (no fallback, no raise)."""
+    async def _body() -> None:
+        plugin, svc, hlp, dd, _ = _build()
+        writer_only = (
+            HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),)
+        full = (
+            HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),
+            HostInfo(host="reader.example", port=5432, role=HostRole.READER),
+        )
+        hlp.refresh = AsyncMock(return_value=writer_only)
+        hlp.force_refresh = AsyncMock(return_value=full)
+        # get_host_role is now consulted twice: execute()'s gate probes the
+        # CURRENT (writer) connection -> WRITER so the switch proceeds, and the
+        # reader-role recheck inside _switch_to_reader probes the freshly-opened
+        # reader -> READER so it's accepted. So make it connection-aware.
+        _writer_conn = svc.current_connection
 
-    async def _run():
-        async def _set_ro():
+        async def _role(conn=None, *a, **k):
+            return HostRole.WRITER if conn is _writer_conn else HostRole.READER
+
+        svc.get_host_role = _role
+
+        async def _work() -> None:
             return None
 
         await plugin.execute(
-            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
-            _set_ro, True)
+            object(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _work, True)
 
+        hlp.force_refresh.assert_awaited()  # the transient retry happened
+        assert plugin._reader_host_info is not None
+        assert plugin._reader_host_info.role == HostRole.READER
+
+    asyncio.run(_body())
+
+
+def test_switch_to_reader_raises_when_strategy_returns_none():
+    """When readers EXIST in topology but the strategy can't pick one, raise
+    'Could not open a reader connection...' (distinct from the reader-less
+    fallback path)."""
+    plugin, svc, hlp, dd, _ = _build(topology=(
+        HostInfo(host="w", port=5432, role=HostRole.WRITER),
+        HostInfo(host="r", port=5432, role=HostRole.READER),
+    ))
+    svc.get_host_info_by_strategy = MagicMock(return_value=None)
+
+    # Test _switch_to_reader's internal raise directly; execute()'s sync-parity
+    # fallback-to-current is covered by
+    # test_set_read_only_true_falls_back_to_current_when_no_reader.
     with pytest.raises(ReadWriteSplittingError):
-        asyncio.run(_run())
+        asyncio.run(plugin._switch_to_reader(dd, svc.current_connection))
 
 
 def test_switch_to_reader_silently_no_ops_mid_transaction():
@@ -373,6 +420,9 @@ def test_switch_to_writer_refuses_mid_transaction():
     """Mid-txn writer swap raises ReadWriteSplittingError (sync parity:261-265)."""
     plugin, svc, hlp, dd, _ = _build()
     dd.is_in_transaction = AsyncMock(return_value=True)
+    # A writer swap only triggers when we're NOT already on the writer, so start
+    # on a reader; flipping read_only=False mid-txn must then raise.
+    svc._current_host_info = HostInfo(host="reader.example", port=5432, role=HostRole.READER)
     # Seed a different conn so a real writer swap would be attempted
     writer_conn = MagicMock(name="writer")
     plugin._writer_conn = writer_conn
@@ -405,6 +455,49 @@ def test_switch_to_reader_allowed_when_not_in_transaction():
 
     asyncio.run(_run())  # no exception
     assert plugin._reader_conn is not None
+
+
+def test_set_read_only_true_falls_back_to_current_when_no_reader():
+    """When no reader can be opened but the current connection is usable,
+    set_read_only(True) stays on it and warns rather than raising (sync parity:
+    read_write_splitting_plugin.py:209-221)."""
+    plugin, svc, hlp, dd, writer_conn = _build()
+    dd.is_in_transaction = AsyncMock(return_value=False)
+    dd.is_closed = AsyncMock(return_value=False)  # current connection still usable
+    # No reader can be opened.
+    plugin._switch_to_reader = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ReadWriteSplittingError("Could not open a reader connection"))
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    asyncio.run(_run())  # must NOT raise -- falls back to the current connection
+    assert svc.current_connection is writer_conn
+
+
+def test_set_read_only_true_propagates_when_current_also_dead():
+    """If reader switching fails AND the current connection is dead, propagate."""
+    plugin, svc, hlp, dd, _ = _build()
+    dd.is_in_transaction = AsyncMock(return_value=False)
+    dd.is_closed = AsyncMock(return_value=True)  # current connection is dead too
+    plugin._switch_to_reader = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ReadWriteSplittingError("Could not open a reader connection"))
+
+    async def _run():
+        async def _set_ro():
+            return None
+
+        await plugin.execute(
+            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+            _set_ro, True)
+
+    with pytest.raises(ReadWriteSplittingError):
+        asyncio.run(_run())
 
 
 def test_reader_switch_retries_next_candidate_on_connect_failure():
@@ -450,16 +543,10 @@ def test_reader_switch_raises_when_all_candidates_fail():
     svc.get_host_info_by_strategy = MagicMock(side_effect=[r, None])
     dd.connect = AsyncMock(side_effect=OSError("dead"))
 
-    async def _run():
-        async def _set_ro():
-            return None
-
-        await plugin.execute(
-            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
-            _set_ro, True)
-
+    # _switch_to_reader itself raises when no candidate connects; execute()'s
+    # fallback-to-current is covered separately.
     with pytest.raises(ReadWriteSplittingError):
-        asyncio.run(_run())
+        asyncio.run(plugin._switch_to_reader(dd, svc.current_connection))
 
 
 def test_reader_switch_bounded_by_2x_hosts():
@@ -477,16 +564,8 @@ def test_reader_switch_bounded_by_2x_hosts():
             candidates[0] if candidates else None))
     dd.connect = AsyncMock(side_effect=OSError("always fail"))
 
-    async def _run():
-        async def _set_ro():
-            return None
-
-        await plugin.execute(
-            MagicMock(), DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
-            _set_ro, True)
-
     with pytest.raises(ReadWriteSplittingError):
-        asyncio.run(_run())
+        asyncio.run(plugin._switch_to_reader(dd, svc.current_connection))
     # 2 readers in topology -> max 2 attempts (since we remove dead ones
     # each iteration, the 4 iterations of sync's loop become 2 effective
     # attempts). Verify we didn't spin more than necessary.
@@ -536,6 +615,7 @@ def test_switch_to_writer_discards_cached_conn_when_host_not_in_topology():
     # Start as if we're on a reader -- flipping read_only=False triggers writer swap
     current_reader_conn = MagicMock(name="current_reader_conn")
     svc._current_connection = current_reader_conn
+    svc._current_host_info = reader
 
     async def _run():
         async def _set_ro():
@@ -690,13 +770,15 @@ def _build_with_counters(topology=None):
     fake_tf.create_counter = MagicMock(side_effect=_create_counter)
     svc.set_telemetry_factory(fake_tf)
 
-    hlp = MagicMock()
-    hlp.refresh = AsyncMock(
-        return_value=topology or (
-            HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),
-            HostInfo(host="reader.example", port=5432, role=HostRole.READER),
-        )
+    _topology = topology or (
+        HostInfo(host="writer.example", port=5432, role=HostRole.WRITER),
+        HostInfo(host="reader.example", port=5432, role=HostRole.READER),
     )
+    hlp = MagicMock()
+    hlp.refresh = AsyncMock(return_value=_topology)
+    # _switch_to_reader re-probes with force_refresh when a refresh returns no
+    # readers (transient writer-only topology); mirror refresh's result.
+    hlp.force_refresh = AsyncMock(return_value=_topology)
 
     plugin = AsyncReadWriteSplittingPlugin(svc, hlp, props)
     plugin._writer_conn = writer_conn

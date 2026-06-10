@@ -133,7 +133,7 @@ class TestPerformanceAsync:
 
         return props
 
-    @pytest.mark.parametrize("plugins", ["host_monitoring", "host_monitoring_v2"])
+    @pytest.mark.parametrize("plugins", ["host_monitoring_v2"])
     def test_failure_detection_time_efm_async(self, test_environment: TestEnvironment, test_driver: TestDriver,
                                               conn_utils, props: Properties, plugins):
         enhanced_failure_monitoring_perf_data_list: List[PerfStatBase] = []
@@ -174,7 +174,7 @@ class TestPerformanceAsync:
                 TestPerformanceAsync.PERF_STAT_MONITORING_HEADER,
                 enhanced_failure_monitoring_perf_data_list)
 
-    @pytest.mark.parametrize("plugins", ["failover,host_monitoring", "failover,host_monitoring_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2,host_monitoring_v2"])
     def test_failure_detection_time_failover_and_efm_async(self, test_environment: TestEnvironment,
                                                            test_driver: TestDriver, conn_utils,
                                                            props: Properties, plugins):

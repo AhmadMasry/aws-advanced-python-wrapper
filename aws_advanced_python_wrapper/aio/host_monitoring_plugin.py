@@ -217,7 +217,16 @@ class AsyncHostMonitoringPlugin(AsyncPlugin):
         self._plugin_service.set_availability(
             self._monitored_aliases, HostAvailability.UNAVAILABLE)
         try:
-            await driver_dialect.abort_connection(conn)
+            # Reach the underlying raw driver connection before aborting. The
+            # monitored connection may be a ``_PooledAsyncConnectionProxy``
+            # whose ``close()`` merely returns it to the pool -- the socket
+            # stays open, so aborting the proxy never severs an in-flight
+            # (e.g. blackholed) query and it hangs until the kernel/test
+            # timeout. ``driver_connection`` unwraps the proxy to the real
+            # connection; for a non-pooled connection the getattr falls back to
+            # ``conn`` itself, so behavior there is unchanged.
+            target = getattr(conn, "driver_connection", conn)
+            await driver_dialect.abort_connection(target)
         except Exception:  # noqa: BLE001 - abort is best-effort (socket may be dead)
             pass
         self._host_unavailable = True

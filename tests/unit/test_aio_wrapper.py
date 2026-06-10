@@ -104,9 +104,17 @@ def _make_mock_async_conn() -> MagicMock:
     conn.rollback = AsyncMock()
     conn.closed = False
     conn.autocommit = True
+    # A raw driver connection unwraps to itself (it is not a pool proxy); the
+    # plugin manager's old-connection guard unwraps via ``driver_connection``,
+    # and a bare MagicMock would otherwise auto-fabricate a *different* object.
+    conn.driver_connection = conn
 
     def _cursor(*args: Any, **kwargs: Any) -> MagicMock:
-        return _make_mock_async_cursor()
+        cur = _make_mock_async_cursor()
+        # psycopg/aiomysql cursors expose ``.connection`` as the conn they were
+        # created on; the old-connection guard compares it to current_connection.
+        cur.connection = conn
+        return cur
 
     conn.cursor = MagicMock(side_effect=_cursor)
     return conn
@@ -230,6 +238,225 @@ def test_cursor_execute_routes_through_plugin_pipeline():
         "execute:Cursor.fetchall",
         "execute:Cursor.close",
     ]
+
+
+def _connected_wrapper(raw_conn: Any) -> AsyncAwsWrapperConnection:
+    async def _body() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+        )
+
+    return asyncio.run(_body())
+
+
+def test_is_closed_psycopg_uses_closed_attr():
+    # psycopg.AsyncConnection exposes a sync `closed` bool. The wrapper's
+    # is_closed property mirrors the sync wrapper so parity tests can assert
+    # `conn.is_closed is False/True` without it falling through __getattr__ to
+    # the raw conn (which lacks `is_closed`).
+    raw_conn = _make_mock_async_conn()  # has .closed = False
+    wrapper = _connected_wrapper(raw_conn)
+    assert wrapper.is_closed is False
+    raw_conn.closed = True
+    assert wrapper.is_closed is True
+
+
+def test_connect_selects_psycopg_dialect_for_psycopg_target():
+    from aws_advanced_python_wrapper.aio.driver_dialect.psycopg import \
+        AsyncPsycopgDriverDialect
+    wrapper = _connected_wrapper(_make_mock_async_conn())  # default mock target
+    assert isinstance(
+        wrapper._plugin_service.driver_dialect, AsyncPsycopgDriverDialect)
+
+
+def test_connect_selects_aiomysql_dialect_for_aiomysql_target():
+    # Regression for the broad MySQL-async failures: the wrapper must pick the
+    # aiomysql driver dialect when the target connect callable is aiomysql's
+    # (module 'aiomysql.*'), NOT hardcode psycopg. Using psycopg's dialect for
+    # MySQL left a string port (aiomysql '%d format' crash) and mismatched
+    # cursor/transaction semantics across every env.
+    from aws_advanced_python_wrapper.aio.driver_dialect.aiomysql import \
+        AsyncAiomysqlDriverDialect
+    raw_conn = _make_mock_async_conn()
+    target = _build_mock_psycopg_connect(raw_conn)
+    target.__module__ = "aiomysql.connection"  # tag the target as aiomysql
+
+    async def _body() -> None:
+        wrapper = await AsyncAwsWrapperConnection.connect(
+            target=target, host="h", port="3306", user="u",
+            password="p", dbname="d")
+        assert isinstance(
+            wrapper._plugin_service.driver_dialect, AsyncAiomysqlDriverDialect)
+
+    asyncio.run(_body())
+
+
+def test_is_closed_aiomysql_uses_open_attr():
+    # aiomysql Connection exposes `open` (inverse of closed), not `closed`.
+    raw_conn = _make_mock_async_conn()
+    del raw_conn.closed
+    raw_conn.open = True
+    wrapper = _connected_wrapper(raw_conn)
+    assert wrapper.is_closed is False
+    raw_conn.open = False
+    assert wrapper.is_closed is True
+
+
+def test_read_only_normalizes_psycopg_none_to_false():
+    # psycopg exposes read_only as a tri-state (None == unset/server default).
+    # A bare passthrough would return None and fail `assert conn.read_only is
+    # False`; the wrapper normalizes to a plain bool.
+    raw_conn = _make_mock_async_conn()
+    del raw_conn._aws_read_only  # psycopg-shape: no aiomysql intent stash
+    raw_conn.read_only = None
+    wrapper = _connected_wrapper(raw_conn)
+    assert wrapper.read_only is False
+    raw_conn.read_only = True
+    assert wrapper.read_only is True
+
+
+def test_set_read_only_on_closed_connection_raises():
+    # set_read_only on a closed connection must raise AwsWrapperError, not let
+    # the RWS plugin silently open a fresh reader.
+    raw_conn = _make_mock_async_conn()
+    wrapper = _connected_wrapper(raw_conn)
+    raw_conn.closed = True
+
+    async def _body() -> None:
+        with pytest.raises(AwsWrapperError):
+            await wrapper.set_read_only(True)
+
+    asyncio.run(_body())
+
+
+def test_set_read_only_in_user_transaction_does_not_rollback_and_propagates():
+    # When the USER is in a transaction (tracked by the plugin service before
+    # this op), set_read_only(True) must NOT silently roll it back -- the driver
+    # (psycopg) rejects the mid-txn change and that error must propagate to the
+    # caller (regression for test_set_read_only_true_in_transaction).
+    raw_conn = _make_mock_async_conn()
+    wrapper = _connected_wrapper(raw_conn)
+    svc = wrapper._plugin_service
+    svc._is_in_transaction = True  # user txn started by a PRIOR op
+    svc._driver_dialect.is_in_transaction = AsyncMock(return_value=True)
+    svc._driver_dialect.set_read_only = AsyncMock(
+        side_effect=Exception("can't change 'read_only' now: INTRANS"))
+    svc._session_state_service.setup_pristine_readonly = AsyncMock()
+    svc._session_state_service.set_read_only = MagicMock()
+
+    async def _body() -> None:
+        with pytest.raises(Exception):
+            await wrapper.set_read_only(True)
+        raw_conn.rollback.assert_not_called()  # user txn NOT rolled back
+
+    asyncio.run(_body())
+
+
+def test_set_read_only_rolls_back_transient_non_user_transaction():
+    # A transient (non-user) transaction -- left by an RWS switch probe or
+    # SQLAlchemy's pool-reset -- IS rolled back so the read_only flip can apply.
+    # No user txn is tracked, but the driver reports INTRANS.
+    raw_conn = _make_mock_async_conn()
+    wrapper = _connected_wrapper(raw_conn)
+    svc = wrapper._plugin_service
+    svc._is_in_transaction = False  # no user txn
+    svc._driver_dialect.is_in_transaction = AsyncMock(return_value=True)
+    svc._driver_dialect.set_read_only = AsyncMock()
+    svc._session_state_service.setup_pristine_readonly = AsyncMock()
+    svc._session_state_service.set_read_only = MagicMock()
+
+    async def _body() -> None:
+        await wrapper.set_read_only(False)
+        raw_conn.rollback.assert_awaited()  # transient txn rolled back
+        svc._driver_dialect.set_read_only.assert_awaited_once()
+
+    asyncio.run(_body())
+
+
+def test_execute_on_old_cursor_after_switch_raises():
+    # Old-connection guard (parity with sync): a cursor created on the original
+    # connection must not silently run after the wrapper's current connection
+    # switched (RWS reader/writer swap or failover) -> AwsWrapperError.
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    raw_conn = _make_mock_async_conn()
+    wrapper = _connected_wrapper(raw_conn)
+    cur = wrapper.cursor()  # bound to raw_conn
+
+    new_conn = _make_mock_async_conn()
+    svc = wrapper._plugin_service
+    svc._driver_dialect.transfer_session_state = AsyncMock()
+    svc._session_state_service.apply_current_session_state = AsyncMock()
+
+    async def _body() -> None:
+        await svc.set_current_connection(new_conn, HostInfo("new-host", 5432))
+        with pytest.raises(AwsWrapperError):
+            await cur.execute("SELECT 1")
+        # A freshly-created cursor (bound to the new current conn) works fine.
+        fresh = wrapper.cursor()
+        await fresh.execute("SELECT 1")
+
+    asyncio.run(_body())
+
+
+def test_read_only_falls_back_to_aiomysql_stash():
+    # aiomysql has no native read_only flag; the async aiomysql driver dialect
+    # stashes intent on _aws_read_only. The wrapper reads it back when the
+    # native attr is absent/None.
+    raw_conn = _make_mock_async_conn()
+    del raw_conn.read_only
+    raw_conn._aws_read_only = True
+    wrapper = _connected_wrapper(raw_conn)
+    assert wrapper.read_only is True
+
+
+def test_autocommit_getter_returns_sync_bool_psycopg():
+    # Parity with the sync wrapper / read_only: a plain bool, no await needed
+    # (psycopg exposes autocommit as a sync bool property).
+    raw_conn = _make_mock_async_conn()  # autocommit = True (bool)
+    wrapper = _connected_wrapper(raw_conn)
+    assert wrapper.autocommit is True
+    raw_conn.autocommit = False
+    assert wrapper.autocommit is False
+
+
+def test_autocommit_getter_aiomysql_uses_get_autocommit():
+    # aiomysql exposes autocommit as a setter *method*; read via get_autocommit().
+    raw_conn = _make_mock_async_conn()
+    raw_conn.autocommit = MagicMock(name="autocommit-setter")  # callable
+    raw_conn.get_autocommit = MagicMock(return_value=False)
+    wrapper = _connected_wrapper(raw_conn)
+    assert wrapper.autocommit is False
+
+
+def test_wrapper_target_follows_connection_switch():
+    # Core failover / RWS fix: when the plugin service switches the current
+    # connection, the owning wrapper's cached target connection must follow,
+    # so subsequent cursor() / commit() hit the NEW connection -- not the old,
+    # often-closed one. Without the registration + rebind, RWS never redirects
+    # and failover retries hit "the connection is closed".
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    raw_conn = _make_mock_async_conn()
+    wrapper = _connected_wrapper(raw_conn)
+    assert wrapper.target_connection is raw_conn
+
+    new_conn = _make_mock_async_conn()
+    svc = wrapper._plugin_service
+    # Stub the session-state transfer machinery; we're testing the rebind.
+    svc._driver_dialect.transfer_session_state = AsyncMock()
+    svc._session_state_service.apply_current_session_state = AsyncMock()
+
+    async def _switch() -> None:
+        await svc.set_current_connection(new_conn, HostInfo("new-host", 5432))
+
+    asyncio.run(_switch())
+
+    assert wrapper.target_connection is new_conn
+    # New cursors bind to the switched connection.
+    wrapper.cursor()
+    new_conn.cursor.assert_called()
 
 
 def test_connection_commit_rollback_close_route_through_pipeline():
@@ -421,6 +648,9 @@ def _make_wrapper_and_cursor() -> tuple:
     mock was called."""
     raw_conn = _make_mock_async_conn()
     target_cur = _make_mock_async_cursor()
+    # Cursor reports the conn it was created on (psycopg/aiomysql semantics) so
+    # the plugin manager's old-connection guard sees a match for valid ops.
+    target_cur.connection = raw_conn
     raw_conn.cursor = MagicMock(return_value=target_cur)
 
     async def _body() -> AsyncAwsWrapperConnection:
@@ -510,10 +740,11 @@ def test_cursor_setoutputsize_is_sync_passthrough():
 # ---- Phase I.2: Connection autocommit + isolation_level -----------------
 
 
-def test_connection_autocommit_property_reads_from_driver_dialect():
-    """The autocommit getter should delegate to
-    ``plugin_service.driver_dialect.get_autocommit``, passing the raw
-    target connection."""
+def test_connection_autocommit_getter_reads_target_connection_directly():
+    """The autocommit getter reads the target connection's autocommit
+    SYNCHRONOUSLY (parity with the sync wrapper / read_only), not via the async
+    dialect's coroutine get_autocommit -- so ``conn.autocommit is False`` works
+    without an await."""
     raw_conn = _make_mock_async_conn()
 
     async def _body() -> AsyncAwsWrapperConnection:
@@ -523,13 +754,10 @@ def test_connection_autocommit_property_reads_from_driver_dialect():
         )
 
     wrapper = asyncio.run(_body())
-    # Swap in a mock dialect whose get_autocommit returns a sentinel so
-    # we can assert both the delegation and the argument.
-    fake_dialect = MagicMock()
-    fake_dialect.get_autocommit = MagicMock(return_value="sentinel")
-    wrapper._plugin_service._driver_dialect = fake_dialect
-    assert wrapper.autocommit == "sentinel"
-    fake_dialect.get_autocommit.assert_called_once_with(raw_conn)
+    raw_conn.autocommit = True
+    assert wrapper.autocommit is True
+    raw_conn.autocommit = False
+    assert wrapper.autocommit is False
 
 
 def test_connection_set_autocommit_awaits_driver_dialect():

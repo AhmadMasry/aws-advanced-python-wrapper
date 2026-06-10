@@ -30,7 +30,8 @@ if TYPE_CHECKING:
         AsyncDriverDialect
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
     from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
-    from aws_advanced_python_wrapper.utils.notifications import HostEvent
+    from aws_advanced_python_wrapper.utils.notifications import (ConnectionEvent,
+                                                                 HostEvent)
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -75,6 +76,13 @@ class AsyncPlugin(ABC):
         return await execute_func()
 
     def notify_host_list_changed(self, changes: Dict[str, Set[HostEvent]]) -> None:
+        return
+
+    def notify_connection_changed(self, changes: Set[ConnectionEvent]) -> None:
+        """Notified when the current connection OBJECT changes -- e.g. failover
+        or read/write-splitting swaps the underlying connection. Default no-op;
+        plugins that hold per-connection state (the EFM monitor) override this
+        to reset/re-point it."""
         return
 
     def accepts_strategy(self, role: HostRole, strategy: str) -> bool:

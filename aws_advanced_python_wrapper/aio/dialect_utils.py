@@ -52,6 +52,8 @@ class AsyncDialectUtils:
         ``asyncio.wait_for`` for the timeout. Probe runs best-effort;
         an empty result or transaction failure raises AwsWrapperError.
         """
+        was_in_txn = await AsyncDialectUtils._safe_in_transaction(
+            conn, driver_dialect)
         try:
             result = await asyncio.wait_for(
                 AsyncDialectUtils._execute_is_reader_query(conn, is_reader_query),
@@ -63,6 +65,8 @@ class AsyncDialectUtils:
         except Exception as e:
             raise AwsWrapperError(
                 Messages.get("DialectUtils.ErrorGettingHostRole")) from e
+        finally:
+            await AsyncDialectUtils._restore_idle(conn, was_in_txn)
 
         if result is None:
             raise AwsWrapperError(
@@ -82,6 +86,8 @@ class AsyncDialectUtils:
         to topology resolution by host_id). Mirrors sync
         DialectUtils.get_instance_id at database_dialect.py.
         """
+        was_in_txn = await AsyncDialectUtils._safe_in_transaction(
+            conn, driver_dialect)
         try:
             result = await asyncio.wait_for(
                 AsyncDialectUtils._execute_scalar_query(conn, host_id_query),
@@ -91,12 +97,49 @@ class AsyncDialectUtils:
             return None
         except Exception:  # noqa: BLE001 - identification is best-effort
             return None
+        finally:
+            await AsyncDialectUtils._restore_idle(conn, was_in_txn)
         if not result:
             return None
         first = result[0]
         if first is None:
             return None
         return str(first)
+
+    @staticmethod
+    async def _safe_in_transaction(
+            conn: Any, driver_dialect: AsyncDriverDialect) -> bool:
+        """Best-effort 'is the connection mid-transaction?' probe. On error,
+        return True so :meth:`_restore_idle` won't roll back a state we
+        couldn't read."""
+        try:
+            return await driver_dialect.is_in_transaction(conn)
+        except Exception:  # noqa: BLE001
+            return True
+
+    @staticmethod
+    async def _restore_idle(conn: Any, was_in_txn: bool) -> None:
+        """Roll back the transient transaction a probe query opened, so the
+        connection returns to its pre-probe idle state.
+
+        A SELECT probe (is_reader / host_id) on an autocommit=False connection
+        opens a transaction (psycopg status INTRANS). Leaving it open then
+        makes a subsequent ``set_read_only`` / ``set_autocommit`` on that
+        connection raise ProgrammingError("can't change ... now: ... INTRANS")
+        -- exactly what breaks the RWS reader-switch + failover session-state
+        transfer (test_sqlalchemy_creator_read_write_splitting). Mirrors sync
+        ``DialectUtils.get_host_role`` running under
+        ``preserve_transaction_status_with_timeout``. No-op when the connection
+        was already in a transaction (don't disturb the caller's txn).
+        """
+        if was_in_txn:
+            return
+        try:
+            result = conn.rollback()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:  # noqa: BLE001 - best-effort restore
+            pass
 
     @staticmethod
     async def _execute_scalar_query(

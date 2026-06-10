@@ -49,6 +49,55 @@ from typing import ClassVar, Optional, Type
 from aws_advanced_python_wrapper.errors import FailoverSuccessError
 
 
+def _normalize_driver_error(e, driver_error_module):
+    """Translate a raw driver-native DBAPI error into the wrapper's PEP-249
+    equivalent so SQLAlchemy's classifier recognizes it.
+
+    SA wraps an exception into ``sqlalchemy.exc.DBAPIError`` (enabling
+    ``has_table`` / ``is_disconnect`` / retry handling) only when
+    ``isinstance(e, dialect.dbapi.Error)`` -- and ``dialect.dbapi.Error`` is the
+    wrapper's PEP-249 ``Error``. Plugin chains that re-wrap driver errors as
+    ``AwsWrapperError`` (e.g. failover) are already recognized, but auth-only
+    chains (``iam`` / ``aws_secrets_manager`` / no plugins) let the raw driver
+    error (``mysql.connector.errors.*``, ``psycopg.*``, ``pymysql.*``) escape --
+    which SA cannot classify, so e.g. ``has_table`` never catches a 1146
+    "table doesn't exist" and ``create_all`` fails.
+
+    Returns an equivalent wrapper PEP-249 error (same PEP-249 subtype matched by
+    name; ``errno`` / ``sqlstate`` / ``pgcode`` preserved so the dialect's
+    ``_extract_error_code`` still reads the numeric code; original chained via
+    ``__cause__``), or ``None`` if ``e`` is already a wrapper error or not a
+    recognizable driver error (caller should re-raise the original).
+    """
+    from aws_advanced_python_wrapper import pep249
+    if isinstance(e, pep249.Error):
+        return None  # already a wrapper PEP-249 error (incl. AwsWrapperError)
+    if driver_error_module is None:
+        return None
+    base = getattr(driver_error_module, "Error", None)
+    if base is None or not isinstance(e, base):
+        return None  # not a driver-native DBAPI error -- leave it alone
+    target_cls = pep249.Error
+    # Most-specific PEP-249 subtype first; DatabaseError (the common parent)
+    # last so e.g. a ProgrammingError isn't mis-mapped to it.
+    for name in ("DataError", "IntegrityError", "InternalError",
+                 "NotSupportedError", "OperationalError", "ProgrammingError",
+                 "InterfaceError", "DatabaseError"):
+        drv_cls = getattr(driver_error_module, name, None)
+        if drv_cls is not None and isinstance(e, drv_cls):
+            target_cls = getattr(pep249, name, pep249.Error)
+            break
+    wrapped = target_cls(str(e))
+    for attr in ("errno", "sqlstate", "pgcode"):
+        val = getattr(e, attr, None)
+        if val is not None:
+            try:
+                setattr(wrapped, attr, val)
+            except Exception:  # noqa: BLE001 - best-effort metadata copy
+                pass
+    return wrapped
+
+
 class _FailoverSuccessRewrapMixin:
     """Re-raise ``FailoverSuccessError`` as the driver-native OperationalError.
 
@@ -70,6 +119,16 @@ class _FailoverSuccessRewrapMixin:
     # Subclasses MUST set this to the driver-native OperationalError class.
     _failover_success_target_cls: ClassVar[Optional[Type[BaseException]]] = None
 
+    def _driver_error_module(self):
+        """Driver-native DBAPI exception namespace (module exposing PEP-249
+        error classes: ``Error``, ``OperationalError``, ``ProgrammingError``,
+        ...). Concrete dialects override to enable normalizing raw driver
+        errors into wrapper PEP-249 errors (see :func:`_normalize_driver_error`)
+        so SA's classifier works on plugin chains that don't re-wrap driver
+        errors (iam / secrets / no-plugins). Default ``None`` => no-op.
+        """
+        return None
+
     def do_execute(  # type: ignore[no-untyped-def]
             self, cursor, statement, parameters, context=None):
         try:
@@ -80,6 +139,11 @@ class _FailoverSuccessRewrapMixin:
             if target is None:
                 raise  # mis-configured dialect; surface the raw error
             raise target(str(e)) from e
+        except Exception as e:
+            normalized = _normalize_driver_error(e, self._driver_error_module())
+            if normalized is not None:
+                raise normalized from e
+            raise
 
     def do_executemany(  # type: ignore[no-untyped-def]
             self, cursor, statement, parameters, context=None):
@@ -91,38 +155,67 @@ class _FailoverSuccessRewrapMixin:
             if target is None:
                 raise
             raise target(str(e)) from e
+        except Exception as e:
+            normalized = _normalize_driver_error(e, self._driver_error_module())
+            if normalized is not None:
+                raise normalized from e
+            raise
 
 
 class _AsyncFailoverSuccessRewrapMixin:
     """Async counterpart of :class:`_FailoverSuccessRewrapMixin`.
 
-    SA async dialects use ``await cursor.execute(...)``; the parent's
-    ``do_execute`` is a coroutine and must be awaited inside the try block.
+    IMPORTANT: ``do_execute`` / ``do_executemany`` MUST be SYNCHRONOUS even for
+    async dialects. SQLAlchemy's execution context calls
+    ``dialect.do_execute(...)`` synchronously inside a greenlet; the async work
+    is bridged *inside* SA's ``AsyncAdapt_*_cursor.execute`` (a sync method that
+    uses ``await_only``). An ``async def do_execute`` here would merely build a
+    coroutine that SA never awaits -- the query would never run, leaving the
+    cursor with no result, so ``description`` is ``None`` and SA raises
+    ``ResourceClosedError`` ("This result object does not return rows") from
+    ``dialect.initialize``'s ``SELECT version()`` (the ``sqlalchemy_creator_*``
+    integration tests). So this mixin is functionally identical to the sync
+    one; it exists as a distinct class only so async dialects can be wired to a
+    different ``_failover_success_target_cls`` / ``_driver_error_module``.
     """
 
     _failover_success_target_cls: ClassVar[Optional[Type[BaseException]]] = None
 
-    async def do_execute(  # type: ignore[no-untyped-def]
-            self, cursor, statement, parameters, context=None):
-        try:
-            await super().do_execute(  # type: ignore[misc]
-                cursor, statement, parameters, context)
-        except FailoverSuccessError as e:
-            target = self._failover_success_target_cls
-            if target is None:
-                raise
-            raise target(str(e)) from e
+    def _driver_error_module(self):
+        """See :meth:`_FailoverSuccessRewrapMixin._driver_error_module`."""
+        return None
 
-    async def do_executemany(  # type: ignore[no-untyped-def]
+    def do_execute(  # type: ignore[no-untyped-def]
             self, cursor, statement, parameters, context=None):
         try:
-            await super().do_executemany(  # type: ignore[misc]
+            super().do_execute(  # type: ignore[misc]
                 cursor, statement, parameters, context)
         except FailoverSuccessError as e:
             target = self._failover_success_target_cls
             if target is None:
                 raise
             raise target(str(e)) from e
+        except Exception as e:
+            normalized = _normalize_driver_error(e, self._driver_error_module())
+            if normalized is not None:
+                raise normalized from e
+            raise
+
+    def do_executemany(  # type: ignore[no-untyped-def]
+            self, cursor, statement, parameters, context=None):
+        try:
+            super().do_executemany(  # type: ignore[misc]
+                cursor, statement, parameters, context)
+        except FailoverSuccessError as e:
+            target = self._failover_success_target_cls
+            if target is None:
+                raise
+            raise target(str(e)) from e
+        except Exception as e:
+            normalized = _normalize_driver_error(e, self._driver_error_module())
+            if normalized is not None:
+                raise normalized from e
+            raise
 
 
 __all__ = ["_FailoverSuccessRewrapMixin", "_AsyncFailoverSuccessRewrapMixin"]

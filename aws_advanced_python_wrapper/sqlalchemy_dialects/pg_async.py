@@ -146,6 +146,13 @@ class AwsWrapperPGPsycopgAsyncDialect(
     _failover_success_target_cls = _PEP249OperationalError
     is_async = True
 
+    def _driver_error_module(self):
+        # psycopg (async) exposes PEP-249 error classes at top level; lets
+        # _normalize_driver_error translate a raw psycopg error into the
+        # wrapper's PEP-249 type so SA classifies it (see _exception_handling).
+        import psycopg
+        return psycopg
+
     def is_disconnect(self, e, connection, cursor):
         # Mirror sync pg.py / mysql.py for explicit symmetry across all
         # 4 dialects:
@@ -155,12 +162,16 @@ class AwsWrapperPGPsycopgAsyncDialect(
         #   - FailoverFailedError → True (no usable connection).
         # Complements _AsyncFailoverSuccessRewrapMixin for the
         # cursor-creation path that runs before do_execute.
-        from aws_advanced_python_wrapper.errors import (FailoverFailedError,
-                                                        FailoverSuccessError)
-        if isinstance(e, FailoverSuccessError):
-            return False
-        if isinstance(e, FailoverFailedError):
-            return True
+        from aws_advanced_python_wrapper.errors import (FailoverError,
+                                                        FailoverFailedError)
+        # Catch the whole FailoverError family -- including
+        # TransactionResolutionUnknownError -- before upstream probes
+        # attributes the wrapper errors don't carry. Only FailoverFailedError
+        # means no usable connection (-> True, SA invalidates);
+        # FailoverSuccessError and TransactionResolutionUnknownError both mean
+        # the wrapper reconnected to a new writer (-> False).
+        if isinstance(e, FailoverError):
+            return isinstance(e, FailoverFailedError)
         return super().is_disconnect(e, connection, cursor)
 
     def _type_info_fetch(self, connection: Any, name: str) -> Any:

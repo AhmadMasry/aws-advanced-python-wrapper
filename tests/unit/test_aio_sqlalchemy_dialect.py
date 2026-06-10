@@ -243,6 +243,65 @@ def test_async_dialect_type_info_fetch_unwraps_target_connection(mocker):
     assert fetch_mock.call_args.args[1] == "hstore"
 
 
+# ---- do_execute sync-contract (SA-creator ResourceClosedError) ----------
+
+
+def test_async_failover_rewrap_do_execute_is_synchronous():
+    """Regression guard for the ``sqlalchemy_creator_*`` ResourceClosedError.
+
+    SQLAlchemy calls ``dialect.do_execute(...)`` SYNCHRONOUSLY inside a
+    greenlet (the async work is bridged inside SA's ``AsyncAdapt_*_cursor
+    .execute``, itself a sync method using ``await_only``). If our async
+    mixin's ``do_execute`` were ``async def`` it would only build a coroutine
+    SA never awaits -- the query would never run, the cursor would have no
+    result, ``description`` would be ``None`` and SA raises ResourceClosedError
+    from ``dialect.initialize``'s ``SELECT version()``. So these MUST be sync.
+    """
+    import inspect
+
+    from aws_advanced_python_wrapper.sqlalchemy_dialects._exception_handling import \
+        _AsyncFailoverSuccessRewrapMixin
+    assert not inspect.iscoroutinefunction(
+        _AsyncFailoverSuccessRewrapMixin.do_execute)
+    assert not inspect.iscoroutinefunction(
+        _AsyncFailoverSuccessRewrapMixin.do_executemany)
+
+
+def test_async_failover_rewrap_runs_parent_and_rewraps_failover_success():
+    import pytest
+
+    from aws_advanced_python_wrapper.errors import FailoverSuccessError
+    from aws_advanced_python_wrapper.sqlalchemy_dialects._exception_handling import \
+        _AsyncFailoverSuccessRewrapMixin
+
+    class _Target(Exception):
+        pass
+
+    calls = []
+
+    class _Parent:
+        def do_execute(self, cursor, statement, parameters, context=None):
+            calls.append((statement, parameters))
+
+    class _Dialect(_AsyncFailoverSuccessRewrapMixin, _Parent):
+        _failover_success_target_cls = _Target
+
+    # Synchronous call actually invokes the parent => the query runs.
+    _Dialect().do_execute(MagicMock(), "select 1", None)
+    assert calls == [("select 1", None)]
+
+    class _ParentRaises:
+        def do_execute(self, *a, **k):
+            raise FailoverSuccessError("failover")
+
+    class _DialectRaises(_AsyncFailoverSuccessRewrapMixin, _ParentRaises):
+        _failover_success_target_cls = _Target
+
+    # FailoverSuccessError from the driver is rewrapped to the target class.
+    with pytest.raises(_Target):
+        _DialectRaises().do_execute(MagicMock(), "select 1", None)
+
+
 def test_async_dialect_type_info_fetch_falls_through_without_wrapper(mocker):
     """If ``driver_connection`` is already a native psycopg AsyncConnection
     (no wrapper in the middle), pass it through unchanged -- don't break

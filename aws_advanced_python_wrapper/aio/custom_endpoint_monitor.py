@@ -28,6 +28,8 @@ on connect and stops it on :func:`release_resources_async`.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
                     Set, Tuple)
 
@@ -35,9 +37,12 @@ from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 # Reuse the sync data classes -- they're pure holders, no I/O.
 from aws_advanced_python_wrapper.custom_endpoint_plugin import (
     CustomEndpointInfo, CustomEndpointRoleType)
+from aws_advanced_python_wrapper.allowed_and_blocked_hosts import \
+    AllowedAndBlockedHosts
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
+from aws_advanced_python_wrapper.utils.region_utils import RegionUtils
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -51,30 +56,46 @@ if TYPE_CHECKING:
 class AsyncCustomEndpointMonitor:
     """Periodically fetches the instance list for an Aurora custom endpoint.
 
-    Uses boto3 ``rds.describe_db_cluster_endpoints`` in
-    ``asyncio.to_thread`` so the sync AWS SDK doesn't block the event
-    loop. Caches the result as a tuple of instance IDs; plugin code
-    reads it via :meth:`get_member_instance_ids`.
+    Polls boto3 ``rds.describe_db_cluster_endpoints`` from a **background
+    daemon thread** (not an asyncio task) -- mirroring the sync
+    ``CustomEndpointMonitor`` -- so a caller that blocks the event loop (e.g.
+    a test's synchronous ``wait_until_endpoint_has_members``, or any
+    sync-over-async bridge) cannot starve the refresh. An asyncio-task monitor
+    silently stops updating ``allowed_and_blocked_hosts`` whenever the loop is
+    blocked, which left the custom-endpoint "changes" tests switching against a
+    stale member set. Caches the result as a tuple of instance IDs.
     """
 
     def __init__(
             self,
-            cluster_identifier: str,
             custom_endpoint_identifier: str,
             region: Optional[str] = None,
-            refresh_interval_sec: float = 30.0) -> None:
-        self._cluster_id = cluster_identifier
+            refresh_interval_sec: float = 30.0,
+            cluster_identifier: Optional[str] = None,
+            plugin_service: Optional[Any] = None) -> None:
         self._endpoint_id = custom_endpoint_identifier
         self._region = region
+        # Plugin service whose allowed_and_blocked_hosts we update on each
+        # refresh so failover / RWS / connect host-selection is restricted to
+        # the custom endpoint's members (mirrors sync CustomEndpointMonitor).
+        self._plugin_service = plugin_service
+        # Retained for logging/compat only. The RDS describe call resolves the
+        # endpoint by its own identifier + custom-type filter (see
+        # _fetch_members_blocking); it does NOT use a DBClusterIdentifier,
+        # because the wrapper's CLUSTER_ID is an internal alias, not the real
+        # RDS cluster id.
+        self._cluster_id = cluster_identifier
         # Lower-bound of 10 ms prevents a misconfigured 0 or negative
         # interval from burning CPU; the production default is 30 s.
         self._interval_sec = max(0.01, float(refresh_interval_sec))
-        self._task: Optional[asyncio.Task[None]] = None
-        self._stop_event = asyncio.Event()
+        # Background polling thread + threading primitives (NOT asyncio) so the
+        # monitor keeps refreshing even while the event loop is blocked.
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
         # Set after the first successful non-empty member refresh. Plugins
         # wait on this event via wait_for_info() so the initial query can
         # see a populated allowed-hosts filter.
-        self._info_ready_event = asyncio.Event()
+        self._info_ready_event = threading.Event()
         self._member_instance_ids: Tuple[str, ...] = ()
         self._last_refresh_ns: int = 0
 
@@ -84,54 +105,56 @@ class AsyncCustomEndpointMonitor:
         return self._member_instance_ids
 
     def is_running(self) -> bool:
-        return self._task is not None and not self._task.done()
+        return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
         if self.is_running():
             return
         self._stop_event.clear()
-        self._task = asyncio.create_task(self._run())
+        self._thread = threading.Thread(
+            target=self._run,
+            name="AsyncCustomEndpointMonitor",
+            daemon=True)
+        self._thread.start()
 
-    async def _run(self) -> None:
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    members = await self._fetch_members()
-                    if members:
-                        self._member_instance_ids = tuple(members)
-                        self._last_refresh_ns = int(
-                            asyncio.get_event_loop().time() * 1_000_000_000
-                        )
-                        # Unblock any plugin.connect() awaiting
-                        # wait_for_info(). Idempotent -- .set() on an
-                        # already-set event is a no-op.
-                        self._info_ready_event.set()
-                except Exception:
-                    # Transient AWS failures must not kill the monitor.
-                    pass
-                # Sleep the refresh interval, but wake early if stop_event
-                # is set. Using asyncio.sleep + is_set check instead of
-                # wait_for(event.wait()) sidesteps wait_for's cancellation
-                # timing quirks under heavy load.
-                slept = 0.0
-                step = min(0.02, self._interval_sec)
-                while slept < self._interval_sec and not self._stop_event.is_set():
-                    await asyncio.sleep(step)
-                    slept += step
-        except asyncio.CancelledError:
-            return
-
-    async def _fetch_members(self) -> List[str]:
-        return await asyncio.to_thread(
-            self._fetch_members_blocking,
-            self._cluster_id,
-            self._endpoint_id,
-            self._region,
-        )
+    def _run(self) -> None:
+        # Runs in a background daemon thread (see start()). Synchronous on
+        # purpose: it must not depend on the event loop being free.
+        while not self._stop_event.is_set():
+            try:
+                members = self._fetch_members_blocking(
+                    self._endpoint_id, self._region)
+                if members:
+                    self._member_instance_ids = tuple(members)
+                    self._last_refresh_ns = time.monotonic_ns()
+                    # Enforce membership: restrict the host list used by
+                    # failover / RWS / connect to the endpoint's members.
+                    # StaticMembers map to allowed host ids (mirrors sync
+                    # CustomEndpointMonitor:193-194). Setting an attribute from
+                    # this thread is GIL-atomic; filter_hosts reads it on the
+                    # event loop (eventual consistency is fine).
+                    if self._plugin_service is not None:
+                        self._plugin_service.allowed_and_blocked_hosts = \
+                            AllowedAndBlockedHosts(set(members), None)
+                    # Unblock any plugin.connect() awaiting wait_for_info().
+                    self._info_ready_event.set()
+            except Exception:  # noqa: BLE001
+                # Transient AWS failures must not kill the monitor.
+                pass
+            # Until the first successful (non-empty) refresh, poll aggressively
+            # (cap at 1s) so the initial wait_for_info() resolves promptly --
+            # RDS can take a few seconds to surface a freshly-created/modified
+            # endpoint's StaticMembers, and the steady-state interval (30s) is
+            # far longer than the connect-time wait budget. After the first
+            # refresh, use the configured interval. stop_event.wait makes the
+            # sleep interruptible.
+            interval = self._interval_sec
+            if not self._info_ready_event.is_set():
+                interval = min(self._interval_sec, 1.0)
+            self._stop_event.wait(interval)
 
     @staticmethod
     def _fetch_members_blocking(
-            cluster_id: str,
             endpoint_id: str,
             region: Optional[str]) -> List[str]:
         import boto3
@@ -139,9 +162,15 @@ class AsyncCustomEndpointMonitor:
         if region:
             kwargs["region_name"] = region
         client = boto3.client("rds", **kwargs)
+        # Resolve the endpoint by its own identifier + a custom-type filter,
+        # mirroring the sync CustomEndpointMonitor. Do NOT pass a
+        # DBClusterIdentifier: it would have to be the real RDS cluster id, but
+        # the wrapper's CLUSTER_ID is an internal alias (e.g. "cluster1"), and
+        # supplying it makes describe_db_cluster_endpoints resolve nothing --
+        # the monitor then never produces members and connect() fails.
         resp = client.describe_db_cluster_endpoints(
-            DBClusterIdentifier=cluster_id,
             DBClusterEndpointIdentifier=endpoint_id,
+            Filters=[{"Name": "db-cluster-endpoint-type", "Values": ["custom"]}],
         )
         members: List[str] = []
         for endpoint in resp.get("DBClusterEndpoints", []):
@@ -153,29 +182,23 @@ class AsyncCustomEndpointMonitor:
         successful refresh (non-empty member_instance_ids). Returns True
         if info arrived; False on timeout.
 
-        Uses an ``asyncio.Event`` set by the monitor task after the first
-        successful fetch. Safe to call multiple times -- once set, the
-        event stays set for the monitor's lifetime, so subsequent callers
-        return immediately.
+        The flag is a ``threading.Event`` set by the polling thread. We wait on
+        it via run_in_executor so this coroutine yields the event loop while a
+        worker thread does the blocking wait. Safe to call multiple times --
+        once set the event stays set for the monitor's lifetime.
         """
-        try:
-            await asyncio.wait_for(
-                self._info_ready_event.wait(), timeout=timeout_sec)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._info_ready_event.wait, timeout_sec)
 
     async def stop(self) -> None:
         self._stop_event.set()
-        if self._task is None:
-            return
-        if not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._task = None
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            # Join off the event loop so a slow in-flight fetch can't block it.
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, thread.join, 5.0)
 
 
 class AsyncCustomEndpointPlugin(AsyncPlugin):
@@ -234,7 +257,13 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
-        conn = await connect_func()
+        # Start the monitor and wait for the first member refresh BEFORE
+        # connecting, so allowed_and_blocked_hosts is set and the initial
+        # connection / failover host-selection is restricted to the custom
+        # endpoint's members. (Connecting first -- as this did originally --
+        # lets the chain pick a NON-member instance before the filter exists,
+        # which is exactly the bug. Mirrors sync custom_endpoint_plugin, which
+        # waits for info before connect_func().)
         if is_initial_connection and self._monitor is None:
             monitor = self._build_monitor(host_info, props)
             if monitor is not None:
@@ -247,10 +276,8 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
 
                 # N.3: realign with sync's hard-failure contract. Block
                 # up to WAIT_FOR_CUSTOM_ENDPOINT_INFO_TIMEOUT_MS for the
-                # first refresh; on timeout, abort the connection and
-                # raise AwsWrapperError so callers don't silently see
-                # stale allowed-hosts. Matches sync custom_endpoint_plugin
-                # behavior.
+                # first refresh; on timeout, raise AwsWrapperError so callers
+                # don't silently see stale/empty allowed-hosts.
                 wait_enabled = WrapperProperties.WAIT_FOR_CUSTOM_ENDPOINT_INFO.get_bool(props)
                 if wait_enabled is None:
                     wait_enabled = True
@@ -263,13 +290,6 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
                     info_ready = await monitor.wait_for_info(
                         timeout_ms / 1000.0)
                     if not info_ready:
-                        # Abort the half-established connection; the
-                        # monitor may still finish refresh on a later
-                        # retry but THIS connect() must fail.
-                        try:
-                            await driver_dialect.abort_connection(conn)
-                        except Exception:  # noqa: BLE001
-                            pass
                         raise AwsWrapperError(
                             "Custom endpoint monitor did not produce "
                             "member instance info within "
@@ -277,13 +297,21 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
                             "wait_for_custom_endpoint_info_timeout_ms or "
                             "disable wait_for_custom_endpoint_info to "
                             "accept unfiltered connections.")
-        return conn
+        return await connect_func()
 
     def _build_monitor(
             self,
             host_info: HostInfo,
             props: Properties) -> Optional[AsyncCustomEndpointMonitor]:
-        """Extract cluster + custom endpoint IDs from host info / props."""
+        """Extract the custom endpoint identifier + region from the host.
+
+        The endpoint is resolved by its OWN identifier and the region is
+        derived from the hostname (the host encodes it), mirroring the sync
+        CustomEndpointPlugin -- NOT from a DBClusterIdentifier / IAM_REGION.
+        The wrapper's CLUSTER_ID is an internal alias (not the real RDS cluster
+        id) and IAM_REGION is usually unset, so relying on them for the RDS
+        describe call made it resolve nothing.
+        """
         # Aurora custom endpoint host format:
         # <endpoint-name>.cluster-custom-<hash>.<region>.rds.amazonaws.com
         host = host_info.host
@@ -292,19 +320,24 @@ class AsyncCustomEndpointPlugin(AsyncPlugin):
         endpoint_id = host.split(".", 1)[0]
         cluster_id = WrapperProperties.CLUSTER_ID.get(props)
         if not cluster_id or cluster_id == "1":  # default placeholder
-            # Fall back to deriving from the cluster- prefix in the host.
             cluster_id = None
         if not cluster_id:
-            # Can't monitor without a cluster identifier.
+            # Without a configured cluster id we fail open (no monitor, no
+            # custom-endpoint filtering) rather than guess.
             return None
-        region_prop = WrapperProperties.IAM_REGION.get(props)
-        # IAM_REGION is the closest shared property; custom endpoint
-        # monitoring would benefit from a dedicated `rds_region` prop but
-        # reusing IAM_REGION keeps config surface small.
+        region = RegionUtils().get_region_from_hostname(host)
+        if not region:
+            # Fall back to the IAM region prop if the host didn't encode one.
+            region_prop = WrapperProperties.IAM_REGION.get(props)
+            region = str(region_prop) if region_prop else None
+        if not region:
+            # Can't query RDS describe_db_cluster_endpoints without a region.
+            return None
         return AsyncCustomEndpointMonitor(
-            cluster_identifier=str(cluster_id),
             custom_endpoint_identifier=endpoint_id,
-            region=str(region_prop) if region_prop else None,
+            region=region,
+            cluster_identifier=str(cluster_id),
+            plugin_service=self._plugin_service,
         )
 
 

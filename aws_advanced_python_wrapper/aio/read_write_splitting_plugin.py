@@ -30,7 +30,10 @@ from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import ReadWriteSplittingError
 from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
+
+logger = Logger(__name__)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -40,6 +43,7 @@ if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.plugin_service import \
         AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo
+    from aws_advanced_python_wrapper.utils.notifications import ConnectionEvent
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -76,6 +80,32 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
     def subscribed_methods(self) -> Set[str]:
         return set(self._SUBSCRIBED)
 
+    def notify_connection_changed(
+            self, changes: Set[ConnectionEvent]) -> None:
+        """Re-cache the current connection under its role whenever the
+        connection OBJECT changes (failover or an RWS swap).
+
+        Without this, a reader-failover moves the live connection to a NEW
+        reader but the RWS reader cache still points at the OLD reader, so a
+        later set_read_only(True) does not return to the failover reader
+        (test_failover_to_new_reader__switch_read_only_async). Sync parity:
+        ReadWriteSplittingPlugin.notify_connection_changed ->
+        _update_internal_connection_info. Uses the already-known host role (no
+        query), so it is safe in this synchronous hook. The reuse checks in
+        _switch_to_reader/_switch_to_writer still validate the cached
+        connection (not closed + in topology) before reusing it.
+        """
+        current_conn = self._plugin_service.current_connection
+        current_host = self._plugin_service.current_host_info
+        if current_conn is None or current_host is None:
+            return
+        if current_host.role == HostRole.WRITER:
+            self._writer_conn = current_conn
+            self._writer_host_info = current_host
+        elif current_host.role == HostRole.READER:
+            self._reader_conn = current_conn
+            self._reader_host_info = current_host
+
     async def connect(
             self,
             target_driver_func: Callable,
@@ -85,11 +115,34 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
         conn = await connect_func()
-        # Seed the writer cache on the initial connection so the first
-        # set_read_only flip doesn't need to re-open the writer later.
-        if is_initial_connection and self._writer_conn is None:
-            self._writer_conn = conn
-            self._writer_host_info = host_info
+        if is_initial_connection:
+            # aio/wrapper.py builds the initial HostInfo with no role, so it
+            # defaults to HostRole.WRITER even when the app connected straight to
+            # a reader instance. Verify the ACTUAL role via the data plane and
+            # correct the host info, otherwise a reader is mistaken for the
+            # writer: it gets cached as the writer below and a later
+            # set_read_only(False) "reuses" it and never switches. Sync parity:
+            # read_write_splitting_plugin.connect (lines 459-486).
+            try:
+                actual_role = await self._plugin_service.get_host_role(conn)
+            except Exception:  # noqa: BLE001 - role probe is best-effort
+                actual_role = None
+            if (actual_role is not None
+                    and actual_role != HostRole.UNKNOWN
+                    and host_info.role != actual_role):
+                host_info.role = actual_role
+                initial = self._plugin_service.initial_connection_host_info
+                if initial is not None and initial.host == host_info.host:
+                    initial.role = actual_role
+
+            # Seed the connection cache under the correct role only (seed the
+            # writer cache only when this really is the writer).
+            if self._writer_conn is None and host_info.role == HostRole.WRITER:
+                self._writer_conn = conn
+                self._writer_host_info = host_info
+            elif self._reader_conn is None and host_info.role == HostRole.READER:
+                self._reader_conn = conn
+                self._reader_host_info = host_info
         return conn
 
     async def execute(
@@ -109,23 +162,62 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         if current is None:
             return await execute_func()
 
+        # Current host role gates the switch: don't swap (and risk reusing a
+        # stale cache) when we are already on the right kind of host. Mirrors
+        # sync _set_read_only's `not _is_reader/_is_writer(current_host)` guards
+        # (read_write_splitting_plugin.py:204-222). connect() above corrects the
+        # initial role, and set_current_connection keeps it accurate after swaps.
+        current_host = self._plugin_service.current_host_info
+        current_role = current_host.role if current_host is not None else None
+
+        # current_host.role is cached metadata and can be stale or wrong --
+        # notably for a reader-CLUSTER (cluster-ro) endpoint connection, whose
+        # host_info.host is the endpoint name (not a topology instance), so the
+        # role correction at connect() doesn't reliably stick under load. Gate
+        # the switch on a FRESH data-plane probe (a reliable local is_reader
+        # query, e.g. pg_is_in_recovery) so we never switch off a connection
+        # that is already on the correct kind of host -- this is the flaky
+        # test_connect_to_reader_cluster__switch_read_only_async. Fall back to
+        # the cached role only if the probe fails.
+        try:
+            live_role = await self._plugin_service.get_host_role(current)
+        except Exception:  # noqa: BLE001 - probe is best-effort
+            live_role = None
+        if live_role is not None and live_role != HostRole.UNKNOWN:
+            current_role = live_role
+
         if read_only:
             # Sync parity (read_write_splitting_plugin.py:243-249): mid-txn
             # reader swap silently no-ops; caller's set_read_only(True) still
             # proceeds on the writer connection. The swap happens only when
             # safe.
-            if not await driver_dialect.is_in_transaction(current):
-                await self._switch_to_reader(driver_dialect, current)
+            if (current_role != HostRole.READER
+                    and not await driver_dialect.is_in_transaction(current)):
+                try:
+                    await self._switch_to_reader(driver_dialect, current)
+                except Exception:  # noqa: BLE001
+                    # Sync parity (read_write_splitting_plugin.py:209-221): if no
+                    # reader can be opened (e.g. every reader is in topology but
+                    # unreachable) but the current connection is still usable, stay
+                    # on it and warn rather than failing the set_read_only(True)
+                    # call. Only propagate when the current connection is also dead.
+                    if await driver_dialect.is_closed(current):
+                        raise
+                    host = self._plugin_service.current_host_info
+                    logger.warning(
+                        "ReadWriteSplittingPlugin.FallbackToCurrentConnection",
+                        host.url if host is not None else "current")
         else:
             # Sync parity (read_write_splitting_plugin.py:261-265): mid-txn
             # writer swap raises -- the transaction's fate is undefined if we
             # swap connections underneath it.
-            if await driver_dialect.is_in_transaction(current):
-                raise ReadWriteSplittingError(
-                    "Cannot switch back to the writer while in a transaction. "
-                    "Commit or roll back before setting the connection "
-                    "read-write.")
-            await self._switch_to_writer(driver_dialect, current)
+            if current_role != HostRole.WRITER:
+                if await driver_dialect.is_in_transaction(current):
+                    raise ReadWriteSplittingError(
+                        "Cannot switch back to the writer while in a transaction. "
+                        "Commit or roll back before setting the connection "
+                        "read-write.")
+                await self._switch_to_writer(driver_dialect, current)
         return await execute_func()
 
     @staticmethod
@@ -190,6 +282,18 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             self,
             driver_dialect: AsyncDriverDialect,
             current: Any) -> None:
+        # Fast path: if we're literally on our cached reader connection, stay.
+        # The authoritative "is the current connection already a reader" decision
+        # is made by execute() via a FRESH get_host_role probe before it calls
+        # us, so we deliberately do NOT re-check the (possibly stale)
+        # current_host.role here -- doing so conflicted with execute()'s
+        # live-role gate (it would early-return on stale READER metadata even
+        # when execute() correctly decided to switch).
+        if (self._reader_conn is not None
+                and self._reader_conn is current
+                and not await driver_dialect.is_closed(current)):
+            return
+
         # Cache the writer we came from so we can bounce back quickly.
         if self._writer_conn is None:
             self._writer_conn = current
@@ -197,6 +301,9 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
                 self._writer_host_info = self._plugin_service.current_host_info
 
         topology = await self._host_list_provider.refresh(current)
+        # Restrict to custom-endpoint members (no-op when none set), so RWS
+        # never switches to a host outside the endpoint.
+        topology = tuple(self._plugin_service.filter_hosts(list(topology)))
 
         # Try to reuse cached reader if (a) it's not closed AND (b) its
         # host is still in topology.
@@ -217,8 +324,36 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
 
         reader_candidates = [h for h in topology if h.role == HostRole.READER]
         if not reader_candidates:
-            raise ReadWriteSplittingError(
-                "No reader host available in the current topology.")
+            # Aurora's ``aurora_replica_status()`` transiently omits a reader
+            # row when the replica's LAST_UPDATE_TIMESTAMP lags the query's
+            # 300s freshness window, yielding a writer-only topology. Re-probe
+            # once with a forced refresh (bypasses the cache the transient may
+            # have just poisoned) before giving up.
+            topology = await self._host_list_provider.force_refresh(current)
+            topology = tuple(self._plugin_service.filter_hosts(list(topology)))
+            reader_candidates = [h for h in topology if h.role == HostRole.READER]
+        if not reader_candidates:
+            if self._plugin_service.allowed_and_blocked_hosts is not None:
+                # A custom endpoint constrains the host set and it has no
+                # reader member: switching to a reader is genuinely impossible,
+                # so fail (the caller's set_read_only(True) must raise) rather
+                # than silently staying. (Distinct from a transient
+                # reader-less topology below.)
+                raise ReadWriteSplittingError(
+                    "No reader host is available within the custom endpoint's "
+                    "member instances; cannot switch to read-only.")
+            # Still no readers. Mirror sync
+            # ``ReadWriteSplittingPlugin._initialize_reader_connection``
+            # (read_write_splitting_plugin.py:533-542): stay on the current
+            # connection and warn rather than raise -- a momentary reader-less
+            # topology must not break a ``set_read_only(True)`` call. (When the
+            # current connection is itself a reader, this also keeps the caller
+            # on a reader, which is the desired read-only routing.)
+            host = self._plugin_service.current_host_info
+            logger.warning(
+                "ReadWriteSplittingPlugin.NoReadersFound",
+                host.url if host is not None else "current")
+            return
 
         strategy = (WrapperProperties.READER_HOST_SELECTOR_STRATEGY.get(self._props)
                     or "random")
@@ -287,7 +422,12 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             self,
             driver_dialect: AsyncDriverDialect,
             current: Any) -> None:
-        topology = await self._host_list_provider.refresh(current)
+        raw_topology = await self._host_list_provider.refresh(current)
+        # Restrict to custom-endpoint members (no-op when none set). If the
+        # endpoint has no writer member, the writer pick below is None and we
+        # raise -- the caller's set_read_only(False) must fail rather than
+        # switch to a non-member writer.
+        topology = tuple(self._plugin_service.filter_hosts(list(raw_topology)))
 
         # Try to reuse cached writer if valid + in topology + not closed.
         if (self._writer_conn is not None
@@ -335,6 +475,21 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         props_copy["host"] = target.host
         if target.is_port_specified():
             props_copy["port"] = str(target.port)
-        return await driver_dialect.connect(
-            target, props_copy, psycopg.AsyncConnection.connect
+        # Route through the connection provider manager so a registered provider
+        # (e.g. the pooled provider) actually owns the reader/writer connection.
+        # The least_connections strategy ranks readers by pool checkout count, so
+        # reader connections MUST go through the pool or every host reads as 0 and
+        # the same reader is always picked. Mirrors aio/default_plugin.connect.
+        manager = self._plugin_service.get_connection_provider_manager()
+        provider = manager.get_connection_provider(target, props_copy)
+        database_dialect = self._plugin_service.database_dialect
+        if database_dialect is None:
+            return await driver_dialect.connect(
+                target, props_copy, psycopg.AsyncConnection.connect)
+        return await provider.connect(
+            psycopg.AsyncConnection.connect,
+            driver_dialect,
+            database_dialect,
+            target,
+            props_copy,
         )

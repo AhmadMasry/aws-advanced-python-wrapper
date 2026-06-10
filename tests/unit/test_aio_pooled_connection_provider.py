@@ -171,6 +171,41 @@ def test_pool_concurrent_acquire_release_keeps_checkedout_correct():
 # ---------- _PooledAsyncConnectionProxy tests ----------
 
 
+def test_proxy_invalidate_accepts_soft_kwarg():
+    # The failover plugin's _invalidate_current_connection calls
+    # invalidate(soft=True). Without the kwarg it raised TypeError and the dead
+    # conn was returned to the pool instead of being evicted.
+    proxy = _PooledAsyncConnectionProxy(MagicMock(), MagicMock())
+    proxy.invalidate(soft=True)
+    assert proxy._invalidated is True
+
+
+def test_proxy_invalidated_close_actually_closes_raw():
+    async def inner():
+        raw = AsyncMock()
+        raw.close = AsyncMock()
+        creator = AsyncMock(return_value=raw)
+        pool = _AsyncPool(creator=creator, max_size=2, max_overflow=0)
+        conn = await pool.acquire()
+        proxy = _PooledAsyncConnectionProxy(conn, pool)
+        proxy.invalidate(soft=True)
+        await proxy.close()
+        # Invalidated -> raw is actually closed (evicted), not returned to idle.
+        raw.close.assert_awaited()
+
+    asyncio.run(inner())
+
+
+def test_proxy_driver_connection_returns_raw():
+    # Parity with SQLAlchemy's PoolProxiedConnection.driver_connection: the
+    # proxy exposes the underlying raw driver connection so callers can assert
+    # the pool handed out a fresh one after eviction (RWS pooled-failover tests).
+    raw = MagicMock(name="raw")
+    pool = MagicMock()
+    proxy = _PooledAsyncConnectionProxy(raw, pool)
+    assert proxy.driver_connection is raw
+
+
 def test_proxy_close_returns_to_pool_not_actual_close():
     async def inner():
         raw = AsyncMock()
@@ -305,15 +340,17 @@ def test_get_host_info_by_strategy_least_connections_picks_lowest_checkedout():
         provider = AsyncPooledConnectionProvider()
         h1 = _make_host_info(host="h1")
         h2 = _make_host_info(host="h2")
-        # Pre-seed pools with known checkout counts via direct manipulation
+        # Pre-seed pools with known checkout counts via direct manipulation.
+        # Cache entries are (pool, Properties) tuples -- the same shape
+        # ``connect`` stores and ``_num_connections`` unpacks (pool, _).
         pool_h1 = _AsyncPool(creator=AsyncMock(return_value="c"))
         pool_h2 = _AsyncPool(creator=AsyncMock(return_value="c"))
         pool_h1._checkedout = 5
         pool_h2._checkedout = 1
         await AsyncPooledConnectionProvider._database_pools.put(
-            PoolKey(h1.url, "user"), pool_h1, 10**12)
+            PoolKey(h1.url, "user"), (pool_h1, _make_props()), 10**12)
         await AsyncPooledConnectionProvider._database_pools.put(
-            PoolKey(h2.url, "user"), pool_h2, 10**12)
+            PoolKey(h2.url, "user"), (pool_h2, _make_props()), 10**12)
         chosen = provider.get_host_info_by_strategy(
             (h1, h2), HostRole.WRITER, "least_connections", _make_props())
         assert chosen is h2
@@ -440,7 +477,37 @@ def test_pool_configurator_kwargs_applied():
         # Inspect the created pool
         items = list(AsyncPooledConnectionProvider._database_pools.items())
         assert len(items) == 1
-        pool = items[0][1].item
+        # Cache entry is a (pool, Properties) tuple.
+        pool, _ = items[0][1].item
+        assert pool._max_size == 7
+        assert pool._max_overflow == 3
+        assert pool._timeout_seconds == 1.5
+
+    asyncio.run(inner())
+
+
+def test_pool_configurator_sqlalchemy_aliases_map_to_native():
+    # Parity with the sync SqlAlchemyPooledConnectionProvider: a single
+    # pool_configurator returning SQLAlchemy QueuePool-style keys (pool_size /
+    # timeout) must work against the async provider too. _create_pool
+    # translates pool_size -> max_size and timeout -> timeout_seconds.
+    async def inner():
+        _reset_class_state()
+
+        def configurator(host_info, props):
+            return {"pool_size": 7, "max_overflow": 3, "timeout": 1.5}
+
+        provider = AsyncPooledConnectionProvider(pool_configurator=configurator)
+        target = AsyncMock(return_value="raw-conn")
+        driver_dialect = MagicMock()
+        driver_dialect.prepare_connect_info = MagicMock(side_effect=lambda h, p: p)
+        database_dialect = MagicMock()
+        database_dialect.prepare_conn_props = MagicMock()
+
+        await provider.connect(target, driver_dialect, database_dialect, _make_host_info(), _make_props())
+        items = list(AsyncPooledConnectionProvider._database_pools.items())
+        assert len(items) == 1
+        pool, _ = items[0][1].item
         assert pool._max_size == 7
         assert pool._max_overflow == 3
         assert pool._timeout_seconds == 1.5

@@ -101,7 +101,7 @@ class TestAuroraFailoverAsync:
         WrapperProperties.CLUSTER_INSTANCE_HOST_PATTERN.set(props_copy, f"?.{endpoint_suffix}:{conn_utils.proxy_port}")
         return props_copy
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_to_new_writer_fail_on_connection_invocation_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -136,7 +136,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_to_new_writer_fail_on_connection_bound_object_invocation_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -171,8 +171,15 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover,host_monitoring", "failover,host_monitoring_v2",
-                                         "failover_v2,host_monitoring", "failover_v2,host_monitoring_v2"])
+    # Async ships a single failover plugin and a single host-monitoring
+    # plugin, both with v2 semantics; the ``failover``/``host_monitoring``
+    # registry codes are aliases for those same implementations (see
+    # aio/plugin_factory.py PLUGIN_FACTORIES). The async test matrix therefore
+    # triggers tests with the v2 codes only -- the v1 aliases would re-run
+    # identical plugins. (Sync keeps distinct v1/v2 implementations and
+    # parametrizes both, except where v1 was dropped for a libpq teardown
+    # race -- commit e713459.)
+    @pytest.mark.parametrize("plugins", ["failover_v2,host_monitoring_v2"])
     @enable_on_features([TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
     def test_fail_from_reader_to_writer_async(
@@ -211,7 +218,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_with_session_states_autocommit_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -268,7 +275,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_with_session_states_readonly_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -311,7 +318,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_writer_fail_within_transaction_set_autocommit_false_async(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility,
@@ -367,7 +374,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     @pytest.mark.timeout(FAILOVER_WITHIN_TRANSACTION_PYTEST_TIMEOUT_SEC)
     def test_writer_fail_within_transaction_start_transaction_async(
@@ -424,7 +431,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["aurora_connection_tracker,failover", "aurora_connection_tracker,failover_v2"])
+    @pytest.mark.parametrize("plugins", ["aurora_connection_tracker,failover_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     @pytest.mark.repeat(5)  # Run this test case a few more times since it is a flakey test
     def test_writer_failover_in_idle_connections_async(

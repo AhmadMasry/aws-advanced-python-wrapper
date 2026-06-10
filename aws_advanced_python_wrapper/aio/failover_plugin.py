@@ -32,7 +32,7 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, NoReturn,
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import (
-    AwsWrapperError, FailoverFailedError, FailoverSuccessError,
+    FailoverFailedError, FailoverSuccessError,
     TransactionResolutionUnknownError)
 from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
@@ -97,6 +97,10 @@ class AsyncFailoverPlugin(AsyncPlugin):
         timeout = WrapperProperties.FAILOVER_TIMEOUT_SEC.get_float(props)
         self._failover_timeout_sec = float(timeout) if timeout is not None else 300.0
         self._mode = self._determine_mode(props)
+        # Snapshot of plugin_service.is_in_transaction taken at the start of
+        # each execute, so a failover triggered by this op knows whether the
+        # caller was mid-transaction (see execute / _raise_*).
+        self._is_in_transaction: bool = False
 
         # Telemetry counters -- match sync failover_plugin.py:103-113.
         # NullTelemetryFactory returns a no-op counter object, but real
@@ -133,11 +137,37 @@ class AsyncFailoverPlugin(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
-        # Initial connect just passes through; failover only kicks in on
-        # later errors. When async grows connect-time failover, it will be
-        # gated by ``self._enabled and self._enable_connect_failover``,
-        # matching the sync v2 path at ``failover_v2_plugin.py:140``.
-        return await connect_func()
+        # Connect-time failover is not implemented yet; the initial connect
+        # itself passes straight through. When async grows connect-time
+        # failover it will be gated by ``self._enabled and
+        # self._enable_connect_failover``, matching sync v2 at
+        # ``failover_v2_plugin.py:140``.
+        conn = await connect_func()
+
+        # Eagerly populate the topology cache from the LIVE initial connection,
+        # mirroring sync failover_v2_plugin.py:177-178
+        # (``if is_initial_connection: self._plugin_service.refresh_host_list(conn)``).
+        #
+        # Without this the host list stays at the single seed host until the
+        # background topology monitor's first refresh. If the app loses that
+        # connection before the monitor has run -- e.g. a reader is disabled
+        # within milliseconds of connecting in test_fail_from_reader_to_writer --
+        # failover has only the seed host to work with: force_refresh through the
+        # now-dead connection returns nothing, _do_failover falls back to the lone
+        # initial host (defaulted to WRITER), and the writer loop retries the dead
+        # host until the failover timeout instead of discovering the real writer.
+        # Refreshing here means the full [writer, reader,...] topology is cached
+        # before any failure, so a later force_refresh can fall back to it.
+        #
+        # Best-effort: a topology probe failure must not fail the initial connect
+        # (the monitor / a later force_refresh will repopulate it).
+        if is_initial_connection and self._enabled:
+            try:
+                await self._plugin_service.refresh_host_list(conn)
+            except Exception:  # noqa: BLE001 - topology will be (re)fetched later
+                pass
+
+        return conn
 
     async def execute(
             self,
@@ -148,6 +178,12 @@ class AsyncFailoverPlugin(AsyncPlugin):
             **kwargs: Any) -> Any:
         if not self._enabled:
             return await execute_func()
+        # Capture transaction state BEFORE running this op (parity with sync
+        # failover_v2.execute:101). After failover the connection is a fresh,
+        # idle writer, so probing it post-failover always reports "not in a
+        # transaction"; the pre-op flag (maintained by the DefaultPlugin) is
+        # what determines whether the transaction's fate is unknown.
+        self._is_in_transaction = self._plugin_service.is_in_transaction
         try:
             return await execute_func()
         except Exception as exc:
@@ -170,8 +206,69 @@ class AsyncFailoverPlugin(AsyncPlugin):
             return False
         if self._plugin_service.is_network_exception(error=exc):
             return True
+        # Async-specific connection-loss signal. When the EFM monitor (or a
+        # network-outage proxy) closes the connection's socket while a query is
+        # awaiting on its file descriptor, psycopg's asyncio wait surfaces a raw
+        # OSError (e.g. ``[Errno 9] Bad file descriptor``) from the event-loop
+        # selector rather than a psycopg ``OperationalError``. Sync never hits
+        # this: it aborts from a separate thread, so the blocked query returns a
+        # clean OperationalError that ``is_network_exception`` already classifies
+        # (test_fail_from_reader_to_writer). The failover plugin only wraps DB
+        # operations, where an OSError means the underlying socket is gone -- a
+        # failover-worthy connection failure.
+        if self._is_connection_os_error(exc):
+            return True
+        # Async-specific connection-loss MESSAGE. The shared PG exception handler
+        # (utils/pg_exception_handler.py) classifies "the connection is closed",
+        # "connection socket closed", etc. as network errors -- but NOT "the
+        # connection is lost", which is precisely the message psycopg's
+        # AsyncConnection raises when the socket dies mid-failover (sync psycopg
+        # surfaces different wording, so the shared list never needed it). Without
+        # this, a writer-change failover where the connection drops on the next
+        # query lets that OperationalError propagate raw instead of triggering
+        # failover (test_fail_from_writer_to_new_writer_*).
+        if self._is_connection_lost_error(exc):
+            return True
         return (self._mode == FailoverMode.STRICT_WRITER
                 and self._plugin_service.is_read_only_connection_exception(error=exc))
+
+    @staticmethod
+    def _is_connection_os_error(exc: BaseException) -> bool:
+        """True if ``exc`` (or anything it was raised ``from``) is an OSError.
+
+        Walks the explicit ``__cause__`` chain so a connection-loss OSError
+        wrapped by an inner layer still counts; ``__context__`` is deliberately
+        ignored to avoid implicit-chaining false positives.
+        """
+        seen: set = set()
+        cur: Optional[BaseException] = exc
+        while cur is not None and id(cur) not in seen:
+            if isinstance(cur, OSError):
+                return True
+            seen.add(id(cur))
+            cur = cur.__cause__
+        return False
+
+    @staticmethod
+    def _is_connection_lost_error(exc: BaseException) -> bool:
+        """True if ``exc`` (or anything it was raised ``from``) carries the
+        async-psycopg "the connection is lost" message.
+
+        Walks the ``__cause__`` chain (like :meth:`_is_connection_os_error`) and
+        matches the message text. Kept narrow -- a single specific phrase the
+        shared handler omits -- to avoid broadening failover triggers.
+        """
+        seen: set = set()
+        cur: Optional[BaseException] = exc
+        while cur is not None and id(cur) not in seen:
+            args = getattr(cur, "args", None)
+            if args:
+                msg = args[0]
+                if isinstance(msg, str) and "the connection is lost" in msg:
+                    return True
+            seen.add(id(cur))
+            cur = cur.__cause__
+        return False
 
     async def _raise_failover_success_or_txn_unknown(
             self, original_exc: Exception) -> NoReturn:
@@ -183,14 +280,19 @@ class AsyncFailoverPlugin(AsyncPlugin):
         TransactionResolutionUnknownError so they don't blindly retry.
         Otherwise raise FailoverSuccessError so they can retry cleanly.
         """
-        in_txn = False
-        current = self._plugin_service.current_connection
-        if current is not None:
-            try:
-                in_txn = await self._plugin_service.driver_dialect.is_in_transaction(current)
-            except Exception:  # noqa: BLE001 - probe is best-effort
-                in_txn = False
+        # Use the transaction state captured BEFORE failover (in execute) or
+        # the service's tracked flag -- NOT a probe of current_connection,
+        # which post-failover is a fresh idle writer and would always say
+        # "not in a transaction". Mirrors sync _throw_failover_success_exception
+        # (failover_v2_plugin.py:313).
+        in_txn = self._is_in_transaction or self._plugin_service.is_in_transaction
         if in_txn:
+            # The transaction was rolled back by the failover; clear the flag so
+            # the caller's next op starts clean.
+            try:
+                await self._plugin_service.update_in_transaction(False)
+            except Exception:  # noqa: BLE001
+                pass
             raise TransactionResolutionUnknownError(
                 "Failover succeeded mid-transaction; transaction state is unknown."
             ) from original_exc
@@ -214,8 +316,10 @@ class AsyncFailoverPlugin(AsyncPlugin):
         last_error: Optional[BaseException] = None
 
         try:
-            topology = await self._host_list_provider.force_refresh(
-                self._plugin_service.current_connection)
+            topology = await self._within_deadline(
+                self._host_list_provider.force_refresh(
+                    self._plugin_service.current_connection),
+                deadline)
         except Exception as e:  # noqa: BLE001 - refresh failure is recoverable
             topology = ()
             last_error = e
@@ -229,6 +333,26 @@ class AsyncFailoverPlugin(AsyncPlugin):
             await self._failover_writer(topology, driver_dialect, deadline, last_error)
         else:
             await self._failover_reader(topology, driver_dialect, deadline, last_error)
+
+    async def _within_deadline(self, coro: Any, deadline: float) -> Any:
+        """Await ``coro`` but never past ``deadline``.
+
+        The reader/writer loops check ``deadline`` only between iterations, so
+        an individual await -- topology ``force_refresh`` or a per-candidate
+        ``_open_connection`` -- can block indefinitely on a blackholed /
+        unreachable host (no connect timeout) and never return to the deadline
+        check, hanging until the socket / pytest timeout. Bounding each await by
+        the remaining budget keeps ``failover_timeout_sec`` real; on expiry it
+        raises ``asyncio.TimeoutError``, which the loops treat like any other
+        failed attempt and fall through to ``FailoverFailedError``.
+        """
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()  # avoid 'coroutine was never awaited' warning
+            raise asyncio.TimeoutError()
+        return await asyncio.wait_for(coro, timeout=remaining)
 
     async def _failover_reader(
             self,
@@ -279,7 +403,8 @@ class AsyncFailoverPlugin(AsyncPlugin):
                     break
 
                 try:
-                    new_conn = await self._open_connection(candidate, driver_dialect)
+                    new_conn = await self._within_deadline(
+                        self._open_connection(candidate, driver_dialect), deadline)
                 except Exception as e:  # noqa: BLE001
                     self._plugin_service.set_availability(
                         candidate.as_aliases(), HostAvailability.UNAVAILABLE)
@@ -300,7 +425,8 @@ class AsyncFailoverPlugin(AsyncPlugin):
                     and self._mode != FailoverMode.STRICT_READER
                     and asyncio.get_event_loop().time() < deadline):
                 try:
-                    new_conn = await self._open_connection(original_writer, driver_dialect)
+                    new_conn = await self._within_deadline(
+                        self._open_connection(original_writer, driver_dialect), deadline)
                 except Exception as e:  # noqa: BLE001
                     self._plugin_service.set_availability(
                         original_writer.as_aliases(), HostAvailability.UNAVAILABLE)
@@ -358,23 +484,71 @@ class AsyncFailoverPlugin(AsyncPlugin):
                 (h for h in topology if h.role == HostRole.WRITER), None)
             if writer is not None:
                 try:
-                    new_conn = await self._open_connection(writer, driver_dialect)
+                    new_conn = await self._within_deadline(
+                        self._open_connection(writer, driver_dialect), deadline)
                 except Exception as e:  # noqa: BLE001
                     self._plugin_service.set_availability(
                         writer.as_aliases(), HostAvailability.UNAVAILABLE)
                     last_error = e
                 else:
+                    # Connected -> the host is reachable.
                     self._plugin_service.set_availability(
                         writer.as_aliases(), HostAvailability.AVAILABLE)
-                    await self._plugin_service.set_current_connection(new_conn, writer)
-                    if self._failover_writer_completed is not None:
-                        self._failover_writer_completed.inc()
-                    return
+                    # Verify the candidate is ACTUALLY the writer via the data
+                    # plane. Right after a failover the topology can still label
+                    # the just-demoted old writer as WRITER; accepting it would
+                    # land us on a reader (its pg_is_in_recovery() is still
+                    # true), which is exactly what the writer-failover tests
+                    # catch. Mirror sync failover_v2 _failover_writer's
+                    # get_host_role re-check -- but here we additionally drop the
+                    # stale connection and loop+refresh until the real writer
+                    # appears, rather than failing outright on the first pass.
+                    role = None
+                    try:
+                        role = await self._plugin_service.get_host_role(new_conn)
+                    except Exception as e:  # noqa: BLE001
+                        last_error = e
+                    if role == HostRole.WRITER:
+                        await self._plugin_service.set_current_connection(new_conn, writer)
+                        if self._failover_writer_completed is not None:
+                            self._failover_writer_completed.inc()
+                        return
+                    # Stale topology: the topology-labeled "writer" is really a
+                    # reader. Refresh the topology THROUGH THIS LIVE connection
+                    # before dropping it -- a reader can still query
+                    # aurora_replica_status() and observe the real current
+                    # writer, whereas the bottom-of-loop refresh goes through
+                    # the dead current_connection and keeps returning stale data
+                    # (which would loop until the failover timeout). Refreshing
+                    # via the live reader lets the next iteration pick the real
+                    # writer and converge in seconds.
+                    try:
+                        refreshed = await self._within_deadline(
+                            self._host_list_provider.force_refresh(new_conn),
+                            deadline)
+                        if refreshed:
+                            topology = refreshed
+                    except Exception as e:  # noqa: BLE001
+                        last_error = e
+                    # Drop the reader connection (sever the raw socket; a pool
+                    # proxy's close would only return it to the pool).
+                    try:
+                        await driver_dialect.abort_connection(
+                            getattr(new_conn, "driver_connection", new_conn))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # Short pause to let Aurora finish promoting, then retry
+                    # immediately with the freshly-refreshed topology (skip the
+                    # bottom-of-loop refresh, which uses the dead connection).
+                    await asyncio.sleep(0.5)
+                    continue
 
             await asyncio.sleep(1.0)
             try:
-                topology = await self._host_list_provider.force_refresh(
-                    self._plugin_service.current_connection)
+                topology = await self._within_deadline(
+                    self._host_list_provider.force_refresh(
+                        self._plugin_service.current_connection),
+                    deadline)
             except Exception as e:  # noqa: BLE001
                 last_error = e
 
@@ -449,21 +623,29 @@ class AsyncFailoverPlugin(AsyncPlugin):
             self,
             target: HostInfo,
             driver_dialect: AsyncDriverDialect) -> Any:
-        """Open a raw driver connection to ``target`` bypassing the
-        pipeline to avoid recursive failover-on-failover."""
-        props = self._build_target_props(target)
-        # Fetch the target connect callable from the plugin service.
-        # For SP-4 we assume psycopg.AsyncConnection.connect; SP-6 / SP-8
-        # will generalize via the driver-dialect registry.
-        try:
-            import psycopg
-            target_func = psycopg.AsyncConnection.connect
-        except ImportError as e:  # pragma: no cover - psycopg is required
-            raise AwsWrapperError(
-                "psycopg is required for async failover"
-            ) from e
+        """Open a connection to ``target`` through the plugin pipeline,
+        skipping THIS failover plugin to avoid recursive failover-on-failover.
 
-        return await driver_dialect.connect(target, props, target_func)
+        Routes through ``plugin_service.force_connect(target, props, self)`` --
+        NOT ``connect`` and NOT a raw ``driver_dialect.connect``. ``force_connect``
+        still runs the plugin pipeline, so the auth plugins (IAM, Secrets,
+        Federated, Okta) re-apply on the reconnect -- a raw connect would omit
+        the IAM token (the IAM plugin generates it per-connect; it is NOT stored
+        in props), failing the writer reconnect with ``PAM authentication
+        failed`` (test_failover_with_iam). But unlike ``connect``, ``force_connect``
+        uses the DEFAULT driver provider, bypassing any custom (pooled) provider.
+        The failover reconnect must yield a fresh, non-pooled connection: routing
+        it through the pooled provider creates internal pools on the failover
+        target, which breaks the pooled-failover tests -- a cluster-URL
+        connection must stay unpooled even after failover
+        (test_pooled_connection__cluster_url_failover) and a pooled connection
+        must be replaced by a non-pooled one after failover
+        (test_pooled_connection__failover). ``self`` as plugin_to_skip excludes
+        the failover plugin from this connect so a connect failure can't
+        recursively trigger failover.
+        """
+        return await self._plugin_service.force_connect(
+            target, self._plugin_service.props, self)
 
     def _build_target_props(self, target: HostInfo) -> Properties:
         props_copy = self._plugin_service.props.copy()  # type: ignore[attr-defined]

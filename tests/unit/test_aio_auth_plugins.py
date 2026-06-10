@@ -356,7 +356,10 @@ def test_base_plugin_retries_on_login_exception_when_cached():
 
 
 def test_base_plugin_does_not_retry_when_credentials_were_fresh():
-    """Fresh credentials + login exception -> propagate (no retry spin)."""
+    """Fresh credentials + login exception -> no retry, wrapped in
+    AwsWrapperError (parity with the sync IAM/secrets _connect, which wrap a
+    fresh-credential login failure rather than letting the raw driver error
+    escape)."""
     from aws_advanced_python_wrapper.aio.auth_plugins import \
         AsyncAuthPluginBase
 
@@ -369,6 +372,7 @@ def test_base_plugin_does_not_retry_when_credentials_were_fresh():
 
     props = Properties({"host": "h", "port": "5432"})
     svc = _svc(props)
+    svc.is_network_exception = MagicMock(return_value=False)
     svc.is_login_exception = MagicMock(return_value=True)
     plugin = _Stub(svc, props)
 
@@ -376,9 +380,67 @@ def test_base_plugin_does_not_retry_when_credentials_were_fresh():
         raise Exception("auth failed")
 
     host = HostInfo(host="h", port=5432)
-    with pytest.raises(Exception, match="auth failed"):
+    with pytest.raises(AwsWrapperError, match="auth failed"):
         asyncio.run(plugin.connect(
             MagicMock(), MagicMock(), host, props, True, _connect_func))
+
+
+def test_base_plugin_propagates_network_exception_unwrapped():
+    """Network / failover exceptions must NOT be wrapped -- the failover
+    plugin needs the raw exception to drive the failover decision."""
+    from aws_advanced_python_wrapper.aio.auth_plugins import \
+        AsyncAuthPluginBase
+
+    class _NetErr(Exception):
+        pass
+
+    class _Stub(AsyncAuthPluginBase):
+        async def _resolve_credentials(self, host_info, props):
+            return ("u", "p", False)
+
+        def _invalidate_cache(self, host_info, props):
+            pass
+
+    props = Properties({"host": "h", "port": "5432"})
+    svc = _svc(props)
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_login_exception = MagicMock(return_value=False)
+    plugin = _Stub(svc, props)
+
+    async def _connect_func():
+        raise _NetErr("net down")
+
+    host = HostInfo(host="h", port=5432)
+    with pytest.raises(_NetErr, match="net down"):
+        asyncio.run(plugin.connect(
+            MagicMock(), MagicMock(), host, props, True, _connect_func))
+
+
+def test_secrets_manager_wraps_botocore_fetch_errors():
+    """A raw botocore ClientError from get_secret_value (e.g. a bad secret id)
+    must surface as AwsWrapperError, not the raw botocore exception (#8a)."""
+    from botocore.exceptions import ClientError
+
+    from aws_advanced_python_wrapper.aio.auth_plugins import \
+        AsyncAwsSecretsManagerPlugin
+
+    props = Properties({
+        "secrets_manager_secret_id": "bad-id",
+        "secrets_manager_region": "us-east-1",
+    })
+    svc = _svc(props)
+    plugin = AsyncAwsSecretsManagerPlugin(svc, props)
+
+    def _boom(secret_id, region, endpoint=None):
+        raise ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "nope"}},
+            "GetSecretValue")
+
+    plugin._fetch_secret_blocking = _boom  # type: ignore[assignment]
+
+    host = HostInfo(host="h", port=5432)
+    with pytest.raises(AwsWrapperError):
+        asyncio.run(plugin._resolve_credentials(host, props))
 
 
 def test_base_plugin_does_not_retry_on_non_login_exceptions():

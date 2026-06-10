@@ -14,20 +14,18 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Set
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Set
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.pep249 import Connection
 
-from concurrent.futures import TimeoutError
 from inspect import signature
 
 from aws_advanced_python_wrapper.driver_dialect import DriverDialect
 from aws_advanced_python_wrapper.driver_dialect_codes import DriverDialectCodes
 from aws_advanced_python_wrapper.errors import UnsupportedOperationError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
-from aws_advanced_python_wrapper.utils.decorators import timeout
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           PropertiesUtils,
@@ -95,16 +93,51 @@ class MySQLDriverDialect(DriverDialect):
             if self.can_execute_query(conn):
                 socket_timeout = WrapperProperties.SOCKET_TIMEOUT_SEC.get_float(self._props)
                 timeout_sec = socket_timeout if socket_timeout > 0 else MySQLDriverDialect.IS_CLOSED_TIMEOUT_SEC
-                is_connected_with_timeout = timeout(
-                    self._thread_pool, timeout_sec)(conn.is_connected)  # type: ignore[attr-defined]
-
+                # Run the liveness ping on the CALLING thread, never a worker
+                # thread. mysql.connector connections are not safe for concurrent
+                # use. The previous implementation offloaded conn.is_connected()
+                # (a COM_PING == SSL I/O) to a thread pool and, on timeout,
+                # abandoned the still-running ping on the pool thread while the
+                # caller went on to use/close the same connection -- two threads
+                # doing SSL read/write on one socket, a use-after-free in
+                # OpenSSL/libmysqlclient that crashes the process with SIGSEGV.
+                # Bound the ping with a temporary socket read timeout instead so
+                # it cannot hang, and never touch the connection from a second
+                # thread.
+                restore_timeout = MySQLDriverDialect._set_socket_timeout(conn, timeout_sec)
                 try:
-                    return not is_connected_with_timeout()
-                except TimeoutError:
-                    return False
+                    return not conn.is_connected()  # type: ignore[attr-defined]
+                finally:
+                    if restore_timeout is not None:
+                        restore_timeout()
             return False
 
         raise UnsupportedOperationError(Messages.get_formatted("DriverDialect.UnsupportedOperationError", self._driver_name, "is_connected"))
+
+    @staticmethod
+    def _set_socket_timeout(conn: Connection, timeout_sec: float) -> Optional[Callable[[], None]]:
+        """Temporarily set a read timeout on the connection's underlying socket so
+        that a liveness ping issued on the calling thread cannot block forever.
+
+        Returns a callable that restores the previous timeout, or None when the
+        socket is not reachable (e.g. the C-extension connection, whose ping is
+        instead bounded by its connect-time read_timeout)."""
+        sock = getattr(getattr(conn, "_socket", None), "sock", None)
+        if sock is None:
+            return None
+        try:
+            previous = sock.gettimeout()
+            sock.settimeout(timeout_sec)
+        except OSError:
+            return None
+
+        def _restore() -> None:
+            try:
+                sock.settimeout(previous)
+            except OSError:
+                pass
+
+        return _restore
 
     def get_autocommit(self, conn: Connection) -> bool:
         if MySQLDriverDialect._is_mysql_connection(conn):

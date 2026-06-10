@@ -54,6 +54,22 @@ def _build_plugin(
     driver_dialect.transfer_session_state = AsyncMock()
 
     svc = AsyncPluginServiceImpl(props, driver_dialect)
+    # Writer-failover now re-verifies the connected candidate's role via
+    # get_host_role (rejecting a stale-topology reader). The real impl needs a
+    # dialect+connection we don't have in unit tests, so default it to WRITER;
+    # individual tests override it (e.g. to READER) to exercise the reject path.
+    svc.get_host_role = AsyncMock(return_value=HostRole.WRITER)  # type: ignore[method-assign]
+    # _open_connection routes the failover reconnect through
+    # plugin_service.force_connect (so auth plugins re-apply -- IAM token etc. --
+    # while BYPASSING the pooled provider so the reconnect is non-pooled),
+    # skipping the failover plugin to avoid recursion. Mock it here; tests that
+    # care about the reconnect assert on svc.force_connect rather than
+    # driver_dialect.connect.
+    svc.force_connect = AsyncMock(  # type: ignore[method-assign]
+        return_value=MagicMock(name="new_conn"))
+    # Keep a connect mock too in case any path consults it.
+    svc.connect = AsyncMock(  # type: ignore[method-assign]
+        return_value=MagicMock(name="new_conn"))
 
     host_list_provider = MagicMock()
     host_list_provider.force_refresh = AsyncMock(
@@ -135,7 +151,7 @@ def test_enabled_failover_converts_network_error_to_failover_success():
                 execute_func=_raiser,
             )
         host_list_provider.force_refresh.assert_awaited()
-        driver_dialect.connect.assert_awaited()
+        svc.force_connect.assert_awaited()  # reconnect routes via plugin_service.force_connect
         # Plugin service was rebound to the new connection.
         assert svc.current_connection is not None
 
@@ -152,12 +168,33 @@ def test_enabled_failover_picks_writer_by_default():
 
         with pytest.raises(FailoverSuccessError):
             await plugin.execute(object(), "Cursor.execute", _raiser)
-        _, called_kwargs = driver_dialect.connect.call_args
-        connect_args, _, _ = driver_dialect.connect.call_args[0]
-        # First positional arg is the chosen HostInfo.
-        chosen_host = connect_args
+        # _open_connection -> plugin_service.connect(host_info, props, self);
+        # first positional arg is the chosen HostInfo.
+        chosen_host = svc.force_connect.call_args[0][0]
         assert chosen_host.role == HostRole.WRITER
         assert chosen_host.host == "writer.example.com"
+
+    asyncio.run(_body())
+
+
+def test_writer_failover_rejects_stale_reader_labeled_as_writer():
+    # Right after a failover the topology can still label the demoted old writer
+    # as WRITER. Writer failover must re-verify via get_host_role and refuse to
+    # accept a reader -- otherwise the connection lands on a reader, which is
+    # the bug the fail_from_writer_to_new_writer_* integration tests caught.
+    async def _body() -> None:
+        plugin, svc, host_list_provider, driver_dialect = _build_plugin(
+            mode="strict_writer", timeout_sec=0.2)
+        driver_dialect.abort_connection = AsyncMock()
+        # Topology labels writer.example.com WRITER, but the data-plane probe
+        # reports READER (stale topology) -- must be rejected.
+        svc.get_host_role = AsyncMock(return_value=HostRole.READER)
+        svc.set_current_connection = AsyncMock()  # spy: must never be called
+
+        with pytest.raises(FailoverFailedError):
+            await plugin._do_failover(driver_dialect=driver_dialect)
+
+        svc.set_current_connection.assert_not_called()
 
     asyncio.run(_body())
 
@@ -178,8 +215,7 @@ def test_enabled_failover_picks_reader_in_strict_reader_mode():
 
         with pytest.raises(FailoverSuccessError):
             await plugin.execute(object(), "Cursor.execute", _raiser)
-        connect_positional = driver_dialect.connect.call_args[0]
-        chosen_host = connect_positional[0]
+        chosen_host = svc.force_connect.call_args[0][0]
         assert chosen_host.role == HostRole.READER
         assert chosen_host.host == "reader.example.com"
 
@@ -300,6 +336,69 @@ def test_should_failover_strict_reader_does_not_trigger_on_read_only():
     assert plugin._should_failover(Exception("read only")) is False
 
 
+def test_should_failover_triggers_on_raw_oserror():
+    """A raw OSError (e.g. EBADF) -- the async manifestation of an EFM/proxy
+    abort closing the socket fd under an awaiting query -- triggers failover
+    even though the dialect handler doesn't classify it as a network exception
+    (regression for test_fail_from_reader_to_writer)."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    exc = OSError(9, "Bad file descriptor")
+    assert plugin._should_failover(exc) is True
+
+
+def test_should_failover_triggers_on_oserror_in_cause_chain():
+    """An OSError reached via the explicit __cause__ chain still counts."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    wrapped = RuntimeError("wrapped")
+    wrapped.__cause__ = OSError(9, "Bad file descriptor")
+    assert plugin._should_failover(wrapped) is True
+
+
+def test_should_failover_ignores_oserror_in_implicit_context():
+    """An OSError only in __context__ (implicit chaining) is NOT treated as a
+    failover trigger -- avoids false positives from unrelated handled errors."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    unrelated = ValueError("not a connection error")
+    unrelated.__context__ = OSError(2, "No such file")  # implicit, not 'from'
+    assert plugin._should_failover(unrelated) is False
+
+
+def test_should_failover_triggers_on_connection_is_lost_message():
+    """psycopg's AsyncConnection raises OperationalError('the connection is
+    lost') when the socket dies mid-failover. The shared PG handler classifies
+    'the connection is closed' but NOT 'the connection is lost', so the async
+    failover plugin must catch this message itself -- otherwise a writer-change
+    failover lets it propagate raw (regression for
+    test_fail_from_writer_to_new_writer_*)."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+
+    exc = Exception("the connection is lost")
+    assert plugin._should_failover(exc) is True
+    # Also via the __cause__ chain.
+    wrapped = RuntimeError("wrapped")
+    wrapped.__cause__ = Exception("the connection is lost")
+    assert plugin._should_failover(wrapped) is True
+
+
+def test_should_not_failover_on_unrelated_message():
+    """A non-connection error message is not promoted to a failover trigger."""
+    plugin, svc, *_ = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=False)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+    assert plugin._should_failover(ValueError("syntax error at or near")) is False
+
+
 def test_should_not_failover_on_self_raised_signals():
     """FailoverSuccessError / FailoverFailedError must not re-enter failover."""
     plugin, svc, *_ = _build_plugin()
@@ -314,16 +413,19 @@ def test_should_not_failover_on_self_raised_signals():
 
 
 def test_failover_raises_transaction_unknown_when_mid_transaction():
-    """Mid-txn failover -> TransactionResolutionUnknownError."""
+    """Mid-txn failover -> TransactionResolutionUnknownError.
+
+    Driven by the *tracked* transaction flag (maintained by the DefaultPlugin),
+    captured at execute-start -- NOT a probe of the post-failover connection
+    (which is always idle).
+    """
     plugin, svc, host_list_provider, driver_dialect = _build_plugin()
     svc.is_network_exception = MagicMock(return_value=True)
     svc.is_read_only_connection_exception = MagicMock(return_value=False)
+    # A prior op established a transaction (the DefaultPlugin would have set
+    # this while the connection was healthy).
+    svc._is_in_transaction = True
 
-    # Seed current connection so the probe has something to call against
-    svc._current_connection = MagicMock(name="old_conn")
-    driver_dialect.is_in_transaction = AsyncMock(return_value=True)
-
-    # Stub _do_failover: assume it swaps the connection successfully.
     plugin._do_failover = AsyncMock()  # type: ignore[method-assign]
 
     async def _raising():
@@ -334,7 +436,27 @@ def test_failover_raises_transaction_unknown_when_mid_transaction():
 
 
 def test_failover_raises_failover_success_when_not_in_transaction():
-    """Outside a txn -> FailoverSuccessError (caller can retry cleanly)."""
+    """Idle (autocommit) failover -> FailoverSuccessError, even though the
+    post-failover connection is also idle. Guards against regressing to a
+    connection-probe that can't distinguish the two."""
+    plugin, svc, host_list_provider, driver_dialect = _build_plugin()
+    svc.is_network_exception = MagicMock(return_value=True)
+    svc.is_read_only_connection_exception = MagicMock(return_value=False)
+    svc._is_in_transaction = False  # not mid-transaction
+
+    plugin._do_failover = AsyncMock()  # type: ignore[method-assign]
+
+    async def _raising():
+        raise Exception("network failure")
+
+    with pytest.raises(FailoverSuccessError):
+        asyncio.run(plugin.execute(MagicMock(), "Cursor.execute", _raising))
+
+
+def test_failover_raises_failover_success_when_dialect_reports_not_in_transaction():
+    """Outside a txn (per the driver dialect probe) -> FailoverSuccessError
+    (caller can retry cleanly). Distinct from the sibling test above, which
+    drives the decision via the service's tracked ``_is_in_transaction`` flag."""
     plugin, svc, host_list_provider, driver_dialect = _build_plugin()
     svc.is_network_exception = MagicMock(return_value=True)
     svc.is_read_only_connection_exception = MagicMock(return_value=False)
@@ -600,6 +722,9 @@ def _build_plugin_with_counters(mode: str = "strict_writer"):
 
     svc = AsyncPluginServiceImpl(props, driver_dialect)
     svc.set_telemetry_factory(fake_tf)
+    # Writer-failover re-verifies the candidate role via get_host_role; default
+    # to WRITER so the success path is exercised (see _build_plugin).
+    svc.get_host_role = AsyncMock(return_value=HostRole.WRITER)  # type: ignore[method-assign]
 
     host_list_provider = MagicMock()
     host_list_provider.force_refresh = AsyncMock(return_value=(
@@ -659,3 +784,55 @@ def test_failover_emits_writer_failed_counter_on_exhausted_deadline():
     assert counters["writer_failover.triggered.count"].inc.called
     assert counters["writer_failover.completed.failed.count"].inc.called
     assert not counters["writer_failover.completed.success.count"].inc.called
+
+
+def test_within_deadline_bounds_a_hanging_await():
+    # A candidate connect / topology refresh that never returns (blackholed
+    # host with no connect timeout) must not block failover past the deadline.
+    plugin, *_ = _build_plugin_with_counters(mode="strict_writer")
+
+    async def _run() -> None:
+        async def _hang() -> None:
+            await asyncio.sleep(30)
+
+        deadline = asyncio.get_event_loop().time() + 0.2
+        with pytest.raises(asyncio.TimeoutError):
+            await plugin._within_deadline(_hang(), deadline)
+
+    asyncio.run(_run())
+
+
+def test_within_deadline_past_deadline_raises_immediately():
+    plugin, *_ = _build_plugin_with_counters(mode="strict_writer")
+
+    async def _run() -> None:
+        async def _hang() -> None:
+            await asyncio.sleep(30)
+
+        deadline = asyncio.get_event_loop().time() - 1.0  # already expired
+        with pytest.raises(asyncio.TimeoutError):
+            await plugin._within_deadline(_hang(), deadline)
+
+    asyncio.run(_run())
+
+
+def test_failover_does_not_hang_when_open_connection_blocks():
+    # End-to-end: even if _open_connection blocks indefinitely, _do_failover
+    # gives up at failover_timeout_sec with FailoverFailedError rather than
+    # hanging (this is the bug the env-3 pooled-failover-failed test exposed).
+    import time
+
+    plugin, svc, hlp, driver_dialect, counters = _build_plugin_with_counters(
+        mode="strict_writer")
+    plugin._failover_timeout_sec = 0.3
+
+    async def _hang(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(30)
+
+    plugin._open_connection = _hang  # type: ignore[method-assign]
+
+    start = time.monotonic()
+    with pytest.raises(FailoverFailedError):
+        asyncio.run(plugin._do_failover(driver_dialect=driver_dialect))
+    # Bounded: ~timeout + one inter-attempt sleep, nowhere near 30s.
+    assert time.monotonic() - start < 5.0

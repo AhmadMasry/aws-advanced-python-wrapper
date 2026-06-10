@@ -60,6 +60,28 @@ class AwsWrapperMySQLConnectorDialect(
             kwargs["plugins"] = wrapper_plugins
         return args, kwargs
 
+    def _extract_error_code(self, exception: BaseException) -> int:
+        # Plugins such as failover re-raise the underlying driver error
+        # wrapped in an ``AwsWrapperError``, which hides the numeric MySQL
+        # error code that SA's ``has_table`` / ``is_disconnect`` logic keys
+        # off. In particular ``has_table`` must see 1146 ("table doesn't
+        # exist") to return False so ``create_all`` can proceed -- otherwise
+        # the wrapped error propagates and ORM table setup fails. Unwrap to
+        # the underlying mysql-connector error so the stock classifier can
+        # read ``.errno``. Restores the override that main's
+        # SqlAlchemyOrmMysqlDialect carried before it was dropped in the merge.
+        from aws_advanced_python_wrapper.errors import AwsWrapperError
+        if isinstance(exception, AwsWrapperError) and exception.driver_error is not None:
+            exception = exception.driver_error
+        return super()._extract_error_code(exception)
+
+    def _driver_error_module(self):
+        # mysql-connector-python's PEP-249 exception namespace; lets
+        # _normalize_driver_error translate a raw mysql.connector error into the
+        # wrapper's PEP-249 type so SA classifies it (see _exception_handling).
+        import mysql.connector.errors as _err
+        return _err
+
     def _detect_charset(self, connection):
         # SA's MySQLDialect_mysqlconnector._detect_charset does
         # ``return connection.connection.charset``. That ``.charset`` walks
@@ -94,10 +116,18 @@ class AwsWrapperMySQLConnectorDialect(
         # _FailoverSuccessRewrapMixin still handles the do_execute path;
         # this method handles the cursor-creation path which runs before
         # do_execute reaches the mixin.
-        from aws_advanced_python_wrapper.errors import (FailoverFailedError,
-                                                        FailoverSuccessError)
-        if isinstance(e, FailoverSuccessError):
-            return False
-        if isinstance(e, FailoverFailedError):
-            return True
+        from aws_advanced_python_wrapper.errors import (FailoverError,
+                                                        FailoverFailedError)
+        # Catch the whole FailoverError family (FailoverSuccessError,
+        # FailoverFailedError, AND TransactionResolutionUnknownError) before the
+        # upstream is_disconnect probes ``e.errno`` -- none of them carry the
+        # mysql-connector errno attribute, so falling through raises
+        # ``AttributeError: 'TransactionResolutionUnknownError' object has no
+        # attribute 'errno'`` (seen on mid-transaction failover, env-3/env-4).
+        # Only FailoverFailedError means there is no usable connection -> True
+        # (SA invalidates the slot). FailoverSuccessError and
+        # TransactionResolutionUnknownError both mean the wrapper reconnected to
+        # a new writer and the pool slot's wrapper is valid -> False.
+        if isinstance(e, FailoverError):
+            return isinstance(e, FailoverFailedError)
         return super().is_disconnect(e, connection, cursor)

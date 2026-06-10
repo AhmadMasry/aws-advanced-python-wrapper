@@ -136,7 +136,7 @@ class TestCustomEndpointAsync:
     @pytest.fixture(scope='class')
     def props_with_failover(self, default_props):
         p = default_props.copy()
-        p["plugins"] = "custom_endpoint,read_write_splitting,failover"
+        p["plugins"] = "custom_endpoint,read_write_splitting,failover_v2"
         return p
 
     @pytest.fixture(scope='class')

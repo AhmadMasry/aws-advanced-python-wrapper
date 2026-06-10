@@ -112,6 +112,58 @@ def test_aurora_provider_cluster_id_uses_explicit_cluster_id_prop():
     assert prov.get_cluster_id() == "my-cluster"
 
 
+def test_host_from_server_id_auto_derives_instance_fqdn_from_cluster_endpoint():
+    # Without an explicit cluster_instance_host_pattern, the instance FQDN must
+    # be derived from the connection endpoint -- otherwise hosts are bare
+    # server ids, which are not resolvable, and every reader/failover connect
+    # to a topology host fails with "failed to resolve host '<server_id>'".
+    prov = AsyncAuroraHostListProvider(
+        _props(host="mydb.cluster-abc123.us-east-2.rds.amazonaws.com"),
+        driver_dialect=MagicMock())
+    assert (prov._host_from_server_id("test-pg-x-2")
+            == "test-pg-x-2.abc123.us-east-2.rds.amazonaws.com")
+
+
+def test_host_from_server_id_uses_explicit_pattern_when_set():
+    prov = AsyncAuroraHostListProvider(
+        _props(cluster_instance_host_pattern="?.custom.example.com"),
+        driver_dialect=MagicMock())
+    assert prov._host_from_server_id("inst-1") == "inst-1.custom.example.com"
+
+
+def test_host_from_server_id_strips_port_suffix_from_pattern():
+    # Proxied test endpoints set the pattern with an explicit port, e.g.
+    # "?.<suffix>:8666". The port must be split out of the pattern: the host
+    # must NOT carry ":8666" (it would be an unresolvable hostname), and the
+    # parsed port is what topology hosts connect on
+    # (test_fail_from_reader_to_writer). Mirrors sync host_list_provider.py:447.
+    prov = AsyncAuroraHostListProvider(
+        _props(cluster_instance_host_pattern="?.cvqiy8.us-east-2.rds.amazonaws.com.proxied:8666"),
+        driver_dialect=MagicMock())
+    assert (prov._host_from_server_id("inst-1")
+            == "inst-1.cvqiy8.us-east-2.rds.amazonaws.com.proxied")
+    host_pattern, port = prov._resolve_instance_pattern()
+    assert host_pattern == "?.cvqiy8.us-east-2.rds.amazonaws.com.proxied"
+    assert port == 8666
+
+
+def test_topology_hosts_use_pattern_port_and_clean_host():
+    async def _body() -> None:
+        conn = _build_conn([("instance-1", True), ("instance-2", False)])
+        prov = AsyncAuroraHostListProvider(
+            _props(cluster_instance_host_pattern="?.cluster-xyz.us-east-1.rds.amazonaws.com:8666"),
+            driver_dialect=MagicMock())
+        topo = await prov.force_refresh(conn)
+        assert len(topo) == 2
+        # Every topology host carries the pattern's port, not the default 5432,
+        # and the ":8666" is NOT baked into the hostname.
+        assert all(h.port == 8666 for h in topo)
+        assert all(":8666" not in h.host for h in topo)
+        assert topo[0].host == "instance-1.cluster-xyz.us-east-1.rds.amazonaws.com"
+
+    asyncio.run(_body())
+
+
 def test_aurora_provider_force_refresh_queries_and_caches():
     async def _body() -> None:
         conn = _build_conn([
@@ -187,6 +239,34 @@ def test_aurora_provider_query_failure_yields_empty_topology_without_raising():
         prov = AsyncAuroraHostListProvider(_props(), driver_dialect=MagicMock())
         topo = await prov.force_refresh(conn)
         assert topo == ()
+
+    asyncio.run(_body())
+
+
+def test_aurora_provider_cursor_raises_falls_back_to_cache_without_raising():
+    # Regression for test_fail_from_reader_to_writer: on a FULLY CLOSED
+    # connection psycopg raises OperationalError('the connection is closed')
+    # from connection.cursor() itself -- not from execute(). _run_topology_query
+    # must still swallow it (cursor() lives inside its try), so a failover
+    # refresh through the dead current connection returns the CACHED topology
+    # instead of raising. If it raises, _do_failover discards the cached
+    # [writer, reader] list and is stranded on the lone seed host.
+    async def _body() -> None:
+        prov = AsyncAuroraHostListProvider(
+            _props(cluster_instance_host_pattern="?.cluster-xyz.us-east-1.rds.amazonaws.com"),
+            driver_dialect=MagicMock(),
+        )
+        # 1) Populate the cache from a healthy connection.
+        good = _build_conn([("instance-1", True), ("instance-2", False)])
+        cached = await prov.force_refresh(good)
+        assert len(cached) == 2
+        # 2) Refresh through a connection whose cursor() raises (closed conn).
+        dead = MagicMock()
+        dead.cursor = MagicMock(
+            side_effect=Exception("the connection is closed"))
+        topo = await prov.force_refresh(dead)
+        # Must NOT raise, and must fall back to the cached topology.
+        assert topo == cached
 
     asyncio.run(_body())
 

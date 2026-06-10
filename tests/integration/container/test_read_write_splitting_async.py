@@ -36,13 +36,12 @@ import gc
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import PoolProxiedConnection
 
 from aws_advanced_python_wrapper import release_resources
 from aws_advanced_python_wrapper.aio.connection_provider import \
     AsyncConnectionProviderManager
-from aws_advanced_python_wrapper.aio.pooled_connection_provider import \
-    AsyncPooledConnectionProvider
+from aws_advanced_python_wrapper.aio.pooled_connection_provider import (
+    AsyncPooledConnectionProvider, _PooledAsyncConnectionProxy)
 from aws_advanced_python_wrapper.errors import (
     AwsWrapperError, FailoverFailedError, FailoverSuccessError,
     ReadWriteSplittingError, TransactionResolutionUnknownError)
@@ -186,7 +185,7 @@ class TestReadWriteSplittingAsync:
     def failover_props(self, plugin_config, conn_utils):
         plugin_name, plugin_value = plugin_config
         props = {
-            "plugins": f"{plugin_value},failover",
+            "plugins": f"{plugin_value},failover_v2",
             "socket_timeout": 10,
             "connect_timeout": 10,
             "autocommit": True,
@@ -687,7 +686,7 @@ class TestReadWriteSplittingAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["read_write_splitting,failover,host_monitoring", "read_write_splitting,failover,host_monitoring_v2"])
+    @pytest.mark.parametrize("plugins", ["read_write_splitting,failover_v2,host_monitoring_v2"])
     @enable_on_features([TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
     @enable_on_num_instances(min_instances=3)
@@ -765,7 +764,7 @@ class TestReadWriteSplittingAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover,host_monitoring", "failover,host_monitoring_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2,host_monitoring_v2"])
     @enable_on_features([TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
     @enable_on_num_instances(min_instances=3)
@@ -894,24 +893,24 @@ class TestReadWriteSplittingAsync:
             try:
                 # Set autocommit to False on writer
                 await conn.set_autocommit(False)
-                assert await conn.autocommit is False
+                assert conn.autocommit is False
                 writer_connection_id = await query_instance_id_async(conn, rds_utils)
                 await conn.commit()
 
                 # Switch to reader - autocommit should remain False
                 await conn.set_read_only(True)
-                assert await conn.autocommit is False
+                assert conn.autocommit is False
                 reader_connection_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_connection_id != reader_connection_id
                 await conn.commit()
 
                 # Change autocommit on reader
                 await conn.set_autocommit(True)
-                assert await conn.autocommit is True
+                assert conn.autocommit is True
 
                 # Switch back to writer - autocommit should be True
                 await conn.set_read_only(False)
-                assert await conn.autocommit is True
+                assert conn.autocommit is True
                 final_writer_connection_id = await query_instance_id_async(conn, rds_utils)
                 assert writer_connection_id == final_writer_connection_id
             finally:
@@ -933,7 +932,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=conn_utils.get_connect_params(),
                     **dict(props),
                 )
-                assert isinstance(conn1.target_connection, PoolProxiedConnection)
+                assert isinstance(conn1.target_connection, _PooledAsyncConnectionProxy)
                 driver_conn1 = conn1.target_connection.driver_connection
                 await conn1.close()
 
@@ -942,7 +941,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=conn_utils.get_connect_params(),
                     **dict(props),
                 )
-                assert isinstance(conn2.target_connection, PoolProxiedConnection)
+                assert isinstance(conn2.target_connection, _PooledAsyncConnectionProxy)
                 driver_conn2 = conn2.target_connection.driver_connection
                 await conn2.close()
 
@@ -967,7 +966,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=conn_utils.get_connect_params(),
                     **dict(failover_props),
                 )
-                assert isinstance(conn.target_connection, PoolProxiedConnection)
+                assert isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 initial_driver_conn = conn.target_connection.driver_connection
                 initial_writer_id = await query_instance_id_async(conn, rds_utils)
 
@@ -978,7 +977,7 @@ class TestReadWriteSplittingAsync:
                 new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert initial_writer_id != new_writer_id
 
-                assert not isinstance(conn.target_connection, PoolProxiedConnection)
+                assert not isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 new_driver_conn = conn.target_connection
                 assert initial_driver_conn is not new_driver_conn
                 await conn.close()
@@ -992,7 +991,7 @@ class TestReadWriteSplittingAsync:
                 current_id = await query_instance_id_async(conn2, rds_utils)
                 assert initial_writer_id == current_id
 
-                assert isinstance(conn2.target_connection, PoolProxiedConnection)
+                assert isinstance(conn2.target_connection, _PooledAsyncConnectionProxy)
                 current_driver_conn = conn2.target_connection.driver_connection
                 # The initial connection should have been evicted from the pool when failover occurred,
                 # so this should be a new connection even though it is connected to the same instance.
@@ -1021,7 +1020,7 @@ class TestReadWriteSplittingAsync:
                 assert 0 == len(AsyncPooledConnectionProvider._database_pools)
 
                 initial_writer_id = await query_instance_id_async(conn, rds_utils)
-                assert not isinstance(conn.target_connection, PoolProxiedConnection)
+                assert not isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 initial_driver_conn = conn.target_connection
 
                 rds_utils.failover_cluster_and_wait_until_writer_changed()
@@ -1032,7 +1031,7 @@ class TestReadWriteSplittingAsync:
                 assert initial_writer_id != new_writer_id
                 assert 0 == len(AsyncPooledConnectionProvider._database_pools)
 
-                assert not isinstance(conn.target_connection, PoolProxiedConnection)
+                assert not isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 new_driver_conn = conn.target_connection
                 assert initial_driver_conn is not new_driver_conn
                 await conn.close()
@@ -1041,7 +1040,7 @@ class TestReadWriteSplittingAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover,host_monitoring", "failover,host_monitoring_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2,host_monitoring_v2"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED,
                          TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
@@ -1078,7 +1077,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=conn_utils.get_proxy_connect_params(),
                     **dict(proxied_failover_props),
                 )
-                assert isinstance(conn.target_connection, PoolProxiedConnection)
+                assert isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 initial_driver_conn = conn.target_connection.driver_connection
                 writer_id = await query_instance_id_async(conn, rds_utils)
 
@@ -1096,7 +1095,7 @@ class TestReadWriteSplittingAsync:
                 current_writer_id = await query_instance_id_async(conn2, rds_utils)
                 assert writer_id == current_writer_id
 
-                assert isinstance(conn2.target_connection, PoolProxiedConnection)
+                assert isinstance(conn2.target_connection, _PooledAsyncConnectionProxy)
                 current_driver_conn = conn2.target_connection.driver_connection
                 # The initial connection should have been evicted from the pool when failover occurred,
                 # so this should be a new connection even though it is connected to the same instance.
@@ -1121,7 +1120,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=conn_utils.get_connect_params(),
                     **dict(failover_props),
                 )
-                assert isinstance(conn.target_connection, PoolProxiedConnection)
+                assert isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 initial_driver_conn = conn.target_connection.driver_connection
                 initial_writer_id = await query_instance_id_async(conn, rds_utils)
 
@@ -1136,7 +1135,7 @@ class TestReadWriteSplittingAsync:
                 new_writer_id = await query_instance_id_async(conn, rds_utils)
                 assert initial_writer_id != new_writer_id
 
-                assert not isinstance(conn.target_connection, PoolProxiedConnection)
+                assert not isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 new_driver_conn = conn.target_connection
                 assert initial_driver_conn is not new_driver_conn
                 await conn.close()
@@ -1153,7 +1152,7 @@ class TestReadWriteSplittingAsync:
                 current_id = await query_instance_id_async(conn2, rds_utils)
                 assert initial_writer_id == current_id
 
-                assert isinstance(conn2.target_connection, PoolProxiedConnection)
+                assert isinstance(conn2.target_connection, _PooledAsyncConnectionProxy)
                 current_driver_conn = conn2.target_connection.driver_connection
                 # The initial connection should have been evicted from the pool when failover occurred,
                 # so this should be a new connection even though it is connected to the same instance.
@@ -1193,7 +1192,7 @@ class TestReadWriteSplittingAsync:
                     connect_params=privileged_user_props,
                     **dict(props),
                 )
-                assert isinstance(conn.target_connection, PoolProxiedConnection)
+                assert isinstance(conn.target_connection, _PooledAsyncConnectionProxy)
                 privileged_driver_conn = conn.target_connection.driver_connection
 
                 async with conn.cursor() as cursor:
@@ -1214,7 +1213,7 @@ class TestReadWriteSplittingAsync:
                         connect_params=limited_user_props,
                         **dict(props),
                     )
-                    assert isinstance(conn2.target_connection, PoolProxiedConnection)
+                    assert isinstance(conn2.target_connection, _PooledAsyncConnectionProxy)
                     limited_driver_conn = conn2.target_connection.driver_connection
                     assert privileged_driver_conn is not limited_driver_conn
 

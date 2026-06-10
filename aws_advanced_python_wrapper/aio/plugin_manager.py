@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.plugin_service import \
         AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
+    from aws_advanced_python_wrapper.utils.notifications import ConnectionEvent
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 
@@ -116,6 +117,36 @@ class AsyncPluginManager:
             plugin_to_skip,
         )
 
+    @staticmethod
+    def _unwrap_conn(conn: Any) -> Any:
+        """Reduce a connection-ish object to its underlying raw driver
+        connection: a pool proxy -> its ``driver_connection``; anything else
+        -> itself."""
+        if conn is None:
+            return None
+        return getattr(conn, "driver_connection", conn)
+
+    def _target_connection(self, target: object) -> Any:
+        """The raw driver connection a cursor/connection target is bound to.
+
+        Cursor: the raw cursor's ``connection`` (the conn it was created on).
+        Connection wrapper: its current ``_target_conn``. Both are unwrapped
+        to the underlying driver connection for a like-for-like comparison.
+
+        Uses ``isinstance`` rather than ``getattr`` probing: the connection
+        wrapper's ``__getattr__`` forwards unknown attributes to the driver
+        connection, so a plain ``getattr(target, "_target_cursor")`` would
+        wrongly resolve (and a MagicMock target would even fabricate it).
+        """
+        # Lazy import to avoid the wrapper<->plugin_manager import cycle.
+        from aws_advanced_python_wrapper.aio.wrapper import (
+            AsyncAwsWrapperConnection, AsyncAwsWrapperCursor)
+        if isinstance(target, AsyncAwsWrapperCursor):
+            return self._unwrap_conn(getattr(target._target_cursor, "connection", None))
+        if isinstance(target, AsyncAwsWrapperConnection):
+            return self._unwrap_conn(target._target_conn)
+        return None
+
     async def execute(
             self,
             target: object,
@@ -123,6 +154,17 @@ class AsyncPluginManager:
             target_driver_func: Callable[..., Awaitable[Any]],
             *args: Any,
             **kwargs: Any) -> Any:
+        # Old-connection guard (parity with sync plugin_service.execute:987).
+        # A cursor/connection bound to a connection that is no longer the
+        # current one -- e.g. an old cursor reused after an RWS reader/writer
+        # swap or a failover -- must not silently run against the stale
+        # connection. CLOSE methods are exempt (they clean up old objects).
+        if method not in (DbApiMethod.CURSOR_CLOSE, DbApiMethod.CONNECTION_CLOSE):
+            obj_conn = self._target_connection(target)
+            current = self._unwrap_conn(self._plugin_service.current_connection)
+            if obj_conn is not None and current is not None and obj_conn is not current:
+                raise AwsWrapperError(Messages.get_formatted(
+                    "PluginManager.MethodInvokedAgainstOldConnection", target))
         return await self._dispatch(
             method,
             lambda plugin, next_func: plugin.execute(
@@ -155,6 +197,23 @@ class AsyncPluginManager:
                 if host is not None:
                     return host
         return None
+
+    def notify_connection_changed(self, changes: Set[ConnectionEvent]) -> None:
+        """Notify every plugin that the current connection object changed.
+
+        Mirrors sync ``PluginManager.notify_connection_changed``. The
+        host-monitoring (EFM) plugin resets its per-connection failure state in
+        this hook; without the call, after failover swaps the connection the
+        monitor keeps the OLD (dead) host's UNAVAILABLE flag set and re-raises
+        "Host ... is unavailable" on the next query, even though the new
+        connection is healthy (test_fail_from_reader_to_writer). Each plugin's
+        hook is best-effort -- a raising hook must not abort the switch.
+        """
+        for plugin in self._plugins:
+            try:
+                plugin.notify_connection_changed(changes)
+            except Exception:  # noqa: BLE001 - a notify hook must not break the switch
+                pass
 
     # ------------------------------------------------------------------
     # Pipeline mechanics
