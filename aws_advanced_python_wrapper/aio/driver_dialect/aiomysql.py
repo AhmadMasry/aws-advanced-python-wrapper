@@ -176,13 +176,26 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
         conn.close()
 
     async def is_in_transaction(self, conn: Any) -> bool:
-        # aiomysql tracks transaction state via autocommit + query
-        # history. We approximate by checking autocommit: if
-        # autocommit is False AND the connection has issued at least
-        # one statement, we're in a transaction. Without a
-        # statement-history hook, we conservatively treat
-        # autocommit-off connections as potentially in a transaction.
-        return not conn.get_autocommit()
+        # aiomysql tracks the REAL transaction state via MySQL's
+        # SERVER_STATUS_IN_TRANS flag (refreshed from every statement's OK
+        # packet), exposed as ``get_transaction_status()``. Use it. The old
+        # ``not get_autocommit()`` approximation was wrong both ways: it MISSED
+        # an explicit ``START TRANSACTION`` issued while autocommit was on -- so
+        # RWS ``set_read_only(False)`` failed to raise mid-transaction
+        # (test_set_read_only_false__read_only_transaction_async,
+        # test_writer_fail_within_transaction_start_transaction_async) -- and it
+        # false-positived on an idle autocommit=False connection. SQLAlchemy's
+        # AsyncAdapt_aiomysql_connection nests the real connection at
+        # ``._connection``, so reach through it when the adapter lacks the method.
+        get_txn = getattr(conn, "get_transaction_status", None)
+        if not callable(get_txn):
+            real = getattr(conn, "_connection", None)
+            if real is not None:
+                get_txn = getattr(real, "get_transaction_status", None)
+        if callable(get_txn):
+            return bool(get_txn())
+        ga = getattr(conn, "get_autocommit", None)
+        return (not ga()) if callable(ga) else False
 
     async def get_autocommit(self, conn: Any) -> bool:
         return bool(conn.get_autocommit())

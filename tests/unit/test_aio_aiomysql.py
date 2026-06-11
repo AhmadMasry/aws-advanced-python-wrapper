@@ -124,11 +124,14 @@ def test_driver_dialect_lifecycle_ops_against_mock_conn():
         # can_execute_query read that.
         conn.closed = False
         conn.get_autocommit = MagicMock(return_value=True)
+        # is_in_transaction now reads MySQL's SERVER_STATUS_IN_TRANS via
+        # aiomysql's get_transaction_status() (not the autocommit heuristic).
+        conn.get_transaction_status = MagicMock(return_value=False)
         conn.autocommit = AsyncMock()
         conn.ping = AsyncMock()
 
         assert await d.is_closed(conn) is False
-        assert await d.is_in_transaction(conn) is False  # autocommit true
+        assert await d.is_in_transaction(conn) is False  # not in a transaction
         assert await d.can_execute_query(conn) is True
         assert await d.get_autocommit(conn) is True
 
