@@ -186,12 +186,9 @@ async def _upgrade_database_dialect_after_connect(
             and isinstance(host_list_provider, AsyncAuroraHostListProvider)):
         host_list_provider.reconfigure_topology_query(
             database_dialect.topology_query, default_port=3306)
-        # Prime the cache through the live connection so failover (which probes
-        # through the now-dead connection) can fall back to a real topology.
-        try:
-            await host_list_provider.force_refresh(target_conn)
-        except Exception:  # noqa: BLE001 - cache will be (re)built on demand
-            pass
+        # The caller (connect) primes both the provider cache AND
+        # plugin_service.all_hosts via force_refresh_host_list right after this
+        # returns, so the topology is fetched once with the corrected query.
     return database_dialect
 
 
@@ -918,6 +915,20 @@ class AsyncAwsWrapperConnection:
         database_dialect = await _upgrade_database_dialect_after_connect(
             database_dialect, target_conn, driver_dialect, host_list_provider)
         plugin_service.database_dialect = database_dialect
+
+        # Prime plugin_service.all_hosts with the correct (post-upgrade)
+        # topology. Plugins' own connect hooks ran during plugin_manager.connect
+        # -- BEFORE the dialect upgrade above -- so on an instance-endpoint
+        # MySQL connect their eager refresh saw the un-upgraded (no-topology)
+        # dialect and left all_hosts empty. Without a populated all_hosts BEFORE
+        # the first failover, the aurora_connection_tracker observes the new
+        # writer as its FIRST writer (not a change) and never invalidates the
+        # demoted writer's idle connections (test_writer_failover_in_idle_
+        # connections_async). Best-effort: static/no-topology providers no-op.
+        try:
+            await plugin_service.force_refresh_host_list(target_conn)
+        except Exception:  # noqa: BLE001 - topology is (re)fetched on demand
+            pass
 
         await plugin_service.set_current_connection(target_conn, host_info)
         wrapper = AsyncAwsWrapperConnection(plugin_service, plugin_manager, target_conn)
