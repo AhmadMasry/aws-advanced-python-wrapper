@@ -459,7 +459,25 @@ class AsyncAwsWrapperConnection:
         Awaited counterpart of the :attr:`autocommit` getter. See that
         docstring for the reason this isn't an ``@autocommit.setter``.
         """
+        # Record the desired autocommit in the session-state service so a
+        # plugin-driven connection switch (RWS reader/writer swap, failover)
+        # re-applies it on the new connection via apply_current_session_state.
+        # Mirrors sync wrapper._set_autocommit. Without this, a reader opened by
+        # set_read_only(True) keeps its default autocommit and loses the
+        # caller's setting (test_autocommit_state_preserved_across_connection_
+        # switches_async). Best-effort: state-tracking must not fail the set.
+        ss = getattr(self._plugin_service, "session_state_service", None)
+        if ss is not None:
+            try:
+                await ss.setup_pristine_autocommit(value)
+            except Exception:  # noqa: BLE001
+                pass
         await self._plugin_service.driver_dialect.set_autocommit(self._target_conn, value)
+        if ss is not None:
+            try:
+                ss.set_autocommit(value)
+            except Exception:  # noqa: BLE001
+                pass
 
     @property
     def isolation_level(self) -> Any:
