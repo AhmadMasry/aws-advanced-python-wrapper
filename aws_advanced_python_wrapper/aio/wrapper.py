@@ -59,7 +59,8 @@ _TOPOLOGY_REQUIRING_PLUGINS = frozenset({
 def _build_host_list_provider(
         props: Properties,
         driver_dialect: AsyncDriverDialect,
-        database_dialect: Any = None) -> AsyncHostListProvider:
+        database_dialect: Any = None,
+        monitor_connection_factory: Any = None) -> AsyncHostListProvider:
     """Pick an async host list provider based on plugins + DB dialect.
 
     Selection order, matching sync database_dialect.py:
@@ -110,7 +111,9 @@ def _build_host_list_provider(
                 return AsyncGlobalAuroraHostListProvider(
                     props, driver_dialect, topology_query=topology_q)
 
-    return AsyncAuroraHostListProvider(props, driver_dialect)
+    return AsyncAuroraHostListProvider(
+        props, driver_dialect,
+        monitor_connection_factory=monitor_connection_factory)
 
 
 def _resolve_database_dialect(
@@ -125,6 +128,71 @@ def _resolve_database_dialect(
     """
     manager = DatabaseDialectManager(props)
     return manager.get_dialect(driver_dialect.dialect_code, props)
+
+
+async def _upgrade_database_dialect_after_connect(
+        database_dialect: Any,
+        target_conn: Any,
+        driver_dialect: AsyncDriverDialect,
+        host_list_provider: AsyncHostListProvider) -> Any:
+    """Async parity for ``DatabaseDialectManager.query_for_dialect`` (MySQL).
+
+    ``_resolve_database_dialect`` only does the pattern-based initial guess, so
+    an Aurora MySQL *instance*-endpoint connection resolves to ``RdsMysqlDialect``
+    (no topology query; inherits ``@@read_only``, which does NOT flip on Aurora
+    failover). The async connect path never ran the post-connect upgrade probe,
+    so topology discovery used the PostgreSQL-default query (-> empty topology ->
+    failover stranded on the seed host) and ``get_host_role`` used ``@@read_only``
+    (-> the demoted old writer still reports WRITER).
+
+    Probe the live connection for Aurora MySQL and, when present, switch to the
+    Aurora MySQL dialect and wire its ``information_schema.replica_host_status``
+    topology query + MySQL port into the provider, then prime the topology cache
+    through the (still live) connection. PostgreSQL is untouched -- the provider's
+    default topology query already matches Aurora-PG. Best-effort: any probe/
+    refresh failure leaves the initial dialect in place.
+
+    Returns the (possibly upgraded) database_dialect.
+    """
+    if getattr(driver_dialect, "_driver_name", None) != "aiomysql":
+        return database_dialect
+    from aws_advanced_python_wrapper.aio.host_list_provider import \
+        AsyncAuroraHostListProvider
+    from aws_advanced_python_wrapper.database_dialect import (
+        AuroraMysqlDialect, DatabaseDialectManager, DialectCode,
+        MysqlDatabaseDialect)
+
+    # A base/RDS MySQL dialect needs a live probe; a cluster-endpoint connect
+    # already resolved to AuroraMysqlDialect by pattern and skips the probe
+    # (but still needs the provider wired below).
+    if (not isinstance(database_dialect, AuroraMysqlDialect)
+            and isinstance(database_dialect, MysqlDatabaseDialect)):
+        try:
+            async with target_conn.cursor() as cur:
+                await cur.execute("SHOW VARIABLES LIKE 'aurora_version'")
+                # fetchall (not fetchone) so the result set is fully drained --
+                # a partially-read result leaves the shared aiomysql connection
+                # dirty and the app's next query reads the leftover row.
+                is_aurora = len(await cur.fetchall()) > 0
+            if is_aurora:
+                aurora = DatabaseDialectManager._known_dialects_by_code.get(
+                    DialectCode.AURORA_MYSQL)
+                if aurora is not None:
+                    database_dialect = aurora
+        except Exception:  # noqa: BLE001 - keep initial dialect on probe failure
+            pass
+
+    if (isinstance(database_dialect, AuroraMysqlDialect)
+            and isinstance(host_list_provider, AsyncAuroraHostListProvider)):
+        host_list_provider.reconfigure_topology_query(
+            database_dialect.topology_query, default_port=3306)
+        # Prime the cache through the live connection so failover (which probes
+        # through the now-dead connection) can fall back to a real topology.
+        try:
+            await host_list_provider.force_refresh(target_conn)
+        except Exception:  # noqa: BLE001 - cache will be (re)built on demand
+            pass
+    return database_dialect
 
 
 class AsyncAwsWrapperCursor:
@@ -777,11 +845,26 @@ class AsyncAwsWrapperConnection:
         # dialect class indicates it (matches sync's behavior).
         database_dialect = _resolve_database_dialect(driver_dialect, props)
 
+        # Dedicated topology-monitor connection factory: opens a FRESH raw
+        # monitoring connection (no plugins) to the seed host with
+        # topology-monitoring props. The background topology monitor uses this
+        # instead of the shared app connection -- driver connections (aiomysql)
+        # can't service concurrent queries, so a background refresh on the app's
+        # connection corrupts the app's in-flight query. Mirrors sync's monitor,
+        # which force_connects its own connection.
+        async def _monitor_conn_factory() -> Any:
+            from aws_advanced_python_wrapper.utils.properties import \
+                PropertiesUtils
+            mon_props = PropertiesUtils.create_topology_monitoring_properties(
+                Properties(dict(props)))
+            return await driver_dialect.connect(host_info, mon_props, target_func)
+
         # Host-list-provider selection: if `plugins=...` references any
         # topology-requiring plugin (failover, rws), build a topology
         # provider matching the dialect; otherwise static is enough.
         host_list_provider = _build_host_list_provider(
-            props, driver_dialect, database_dialect)
+            props, driver_dialect, database_dialect,
+            monitor_connection_factory=_monitor_conn_factory)
 
         plugin_service = AsyncPluginServiceImpl(
             props=props,
@@ -827,6 +910,14 @@ class AsyncAwsWrapperConnection:
             raise AwsWrapperError(
                 Messages.get("AwsWrapperConnection.ConnectionNotOpen")
             )
+
+        # Post-connect dialect upgrade (async parity for the sync
+        # query_for_dialect step _resolve_database_dialect skips): detect Aurora
+        # MySQL on the live connection and wire its topology/role queries before
+        # any topology-dependent plugin (failover, RWS) acts on the connection.
+        database_dialect = await _upgrade_database_dialect_after_connect(
+            database_dialect, target_conn, driver_dialect, host_list_provider)
+        plugin_service.database_dialect = database_dialect
 
         await plugin_service.set_current_connection(target_conn, host_info)
         wrapper = AsyncAwsWrapperConnection(plugin_service, plugin_manager, target_conn)

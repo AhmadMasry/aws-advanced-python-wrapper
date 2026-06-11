@@ -33,8 +33,8 @@ A background refresh loop (:class:`AsyncClusterTopologyMonitor`) lives in
 from __future__ import annotations
 
 import asyncio
-from typing import (TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple,
-                    runtime_checkable)
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List,
+                    Optional, Protocol, Tuple, runtime_checkable)
 
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
@@ -141,11 +141,14 @@ class AsyncAuroraHostListProvider:
                 "OR LAST_UPDATE_TIMESTAMP IS NULL"
             ),
             cluster_id: Optional[str] = None,
-            default_port: int = 5432) -> None:
+            default_port: int = 5432,
+            monitor_connection_factory: Optional[
+                Callable[[], Awaitable[Any]]] = None) -> None:
         self._props = props
         self._driver_dialect = driver_dialect
         self._topology_query = topology_query
         self._default_port = default_port
+        self._monitor_connection_factory = monitor_connection_factory
         self._cluster_id = cluster_id or self._derive_cluster_id(props)
         self._topology_cache: Optional[Topology] = None
         self._last_refresh_ns: int = 0
@@ -159,6 +162,25 @@ class AsyncAuroraHostListProvider:
         # provider construction stays cheap and test-friendly.
         self._monitor: Optional[Any] = None  # AsyncClusterTopologyMonitor
         self._last_conn: Optional[Any] = None
+
+    def reconfigure_topology_query(
+            self, topology_query: str, default_port: Optional[int] = None) -> None:
+        """Re-point the provider at a (post-connect) resolved dialect's query.
+
+        The provider is built BEFORE the connection exists, so an
+        instance-endpoint MySQL connection starts with the PostgreSQL-default
+        topology query + port (the ctor default). Once the database dialect is
+        resolved/upgraded to the Aurora MySQL dialect we swap in its topology
+        query and the MySQL port so discovery actually works. Clears the cache
+        so the next refresh re-probes with the new query (any cached PG-query
+        result is stale/empty).
+        """
+        if topology_query:
+            self._topology_query = topology_query
+        if default_port:
+            self._default_port = default_port
+        self._topology_cache = None
+        self._last_refresh_ns = 0
 
     @staticmethod
     def _derive_cluster_id(props: Properties) -> str:
@@ -250,6 +272,9 @@ class AsyncAuroraHostListProvider:
             refresh_interval_sec=self._refresh_ns / 1_000_000_000,
             high_refresh_rate_sec=(
                 (high_refresh_ms / 1000.0) if high_refresh_ms else 1.0),
+            # Dedicated monitoring connection so background topology queries
+            # never race the app's queries on the shared driver connection.
+            connection_factory=self._monitor_connection_factory,
         )
         monitor.start()
         self._monitor = monitor
@@ -308,8 +333,14 @@ class AsyncAuroraHostListProvider:
             # refreshes through the dead current connection, the probe raises
             # rather than returning [], and the cached [writer, reader,...]
             # topology is never consulted.
-            cur = connection.cursor()
-            async with cur:
+            # Bind the ENTERED cursor: psycopg's ``cursor()`` returns the
+            # cursor directly, but aiomysql's returns a ``_ContextManager``
+            # whose ``__aenter__`` yields the real cursor -- ``async with X
+            # as cur`` gets the right object for both. Using the bare
+            # ``_ContextManager`` (no ``as``) would call ``.execute`` on the
+            # manager and raise AttributeError on aiomysql, so every MySQL
+            # topology probe returned [] (failover then stranded on the seed).
+            async with connection.cursor() as cur:
                 await cur.execute(self._topology_query)
                 return list(await cur.fetchall())
         except Exception:
@@ -464,8 +495,10 @@ class AsyncMultiAzHostListProvider(AsyncAuroraHostListProvider):
         :meth:`AsyncAuroraHostListProvider._run_topology_query`.
         """
         try:
-            cur = connection.cursor()
-            async with cur:
+            # Bind the ENTERED cursor (``as cur``) -- aiomysql's cursor() is a
+            # _ContextManager whose __aenter__ yields the real cursor; the bare
+            # manager has no ``.execute``. See AsyncAuroraHostListProvider.
+            async with connection.cursor() as cur:
                 # Step 1: writer host query. Empty row => we're the writer
                 # (MySQL), fall back to host_id_query.
                 await cur.execute(self._writer_host_query)

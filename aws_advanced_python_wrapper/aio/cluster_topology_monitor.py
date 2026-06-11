@@ -72,6 +72,7 @@ class AsyncClusterTopologyMonitor:
             high_refresh_rate_sec: float = 1.0,
             probe_host: Optional[
                 Callable[[HostInfo], Awaitable[Tuple[Any, HostRole]]]] = None,
+            connection_factory: Optional[Callable[[], Awaitable[Any]]] = None,
     ) -> None:
         """
         :param provider: the host list provider whose ``force_refresh`` to
@@ -89,9 +90,20 @@ class AsyncClusterTopologyMonitor:
             mode is disabled (backwards compatible). Production wiring
             constructs it from ``AsyncDialectUtils.get_host_role`` plus a
             connection-opener helper.
+        :param connection_factory: optional zero-arg async callable that opens
+            a FRESH dedicated monitoring connection. When provided, the
+            background loop uses its own connection instead of the shared app
+            connection (``connection_getter``) -- driver connections such as
+            aiomysql cannot service concurrent queries, so refreshing on the
+            app's connection corrupts the app's in-flight query. Mirrors sync's
+            dedicated-thread monitor, which opens its own connection via
+            ``plugin_service.force_connect(initial_host, monitoring_props)``.
+            When ``None``, falls back to ``connection_getter`` (test/back-compat).
         """
         self._provider = provider
         self._connection_getter = connection_getter
+        self._connection_factory = connection_factory
+        self._owned_conn: Optional[Any] = None
         self._interval_sec = max(0.005, float(refresh_interval_sec))
         self._high_refresh_rate_sec = max(0.005, float(high_refresh_rate_sec))
         self._probe_host = probe_host
@@ -153,10 +165,33 @@ class AsyncClusterTopologyMonitor:
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run())
 
+    async def _get_monitoring_connection(self) -> Any:
+        """Return the connection the background loop should query.
+
+        Prefer a dedicated monitor-owned connection (opened via
+        ``connection_factory``) so we never run a topology query on the shared
+        app connection concurrently with the app's own query. Reuse it across
+        ticks; reopen lazily after a failure drops it. Falls back to the shared
+        ``connection_getter`` when no factory was wired.
+        """
+        if self._connection_factory is None:
+            return self._connection_getter()
+        if self._owned_conn is None:
+            try:
+                self._owned_conn = await self._connection_factory()
+            except Exception:  # noqa: BLE001 - retry on a later tick
+                self._owned_conn = None
+        return self._owned_conn
+
+    async def _drop_owned_connection(self) -> None:
+        if self._owned_conn is not None:
+            await self._close_best_effort(self._owned_conn)
+            self._owned_conn = None
+
     async def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
-                conn = self._connection_getter()
+                conn = await self._get_monitoring_connection()
                 if conn is not None:
                     try:
                         # Use the provider's direct-DB path to avoid
@@ -166,9 +201,11 @@ class AsyncClusterTopologyMonitor:
                         self._last_topology = topology
                         self._check_for_writer_change(topology)
                     except Exception:
-                        # Monitor failures shouldn't crash the task;
-                        # cached topology remains usable.
-                        pass
+                        # Monitor failures shouldn't crash the task; the cached
+                        # topology remains usable. A failure may mean the owned
+                        # connection died (e.g. its instance was failed over) --
+                        # drop it so the next tick reopens to a live host.
+                        await self._drop_owned_connection()
                 elif self._should_panic():
                     self._spawn_panic_probes()
 
@@ -192,6 +229,9 @@ class AsyncClusterTopologyMonitor:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             self._probe_tasks.clear()
+            # Close the monitor's dedicated connection (if any) so we don't
+            # leak it past task shutdown.
+            await self._drop_owned_connection()
 
     def _should_panic(self) -> bool:
         """Enter panic mode iff ``probe_host`` is wired, we have a known
