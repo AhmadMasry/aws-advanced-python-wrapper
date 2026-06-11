@@ -38,14 +38,52 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import util
 from sqlalchemy.dialects.mysql.aiomysql import (AsyncAdapt_aiomysql_connection,
                                                 MySQLDialect_aiomysql)
+from sqlalchemy.engine.characteristics import ConnectionCharacteristic
 from sqlalchemy.util.concurrency import await_only
 
 from aws_advanced_python_wrapper.pep249 import \
     OperationalError as _PEP249OperationalError
 from aws_advanced_python_wrapper.sqlalchemy_dialects._exception_handling import \
     _AsyncFailoverSuccessRewrapMixin
+
+
+def _unwrap_wrapper_conn(dbapi_conn: Any) -> Any:
+    """Reach the AsyncAwsWrapperConnection behind SA's adapter.
+
+    The async dialect wraps the wrapper connection in SA's
+    ``AsyncAdapt_aiomysql_connection`` (see the DBAPI adapter's ``connect``),
+    which nests the real object at ``._connection``. Fall back to the object
+    itself for a bare wrapper connection.
+    """
+    return getattr(dbapi_conn, "_connection", dbapi_conn)
+
+
+class _MySQLReadOnlyConnectionCharacteristic(ConnectionCharacteristic):
+    """A ``mysql_readonly`` execution-option characteristic, mirroring SA's
+    ``PGReadOnlyConnectionCharacteristic``.
+
+    SQLAlchemy ships a ``postgresql_readonly`` characteristic but NO MySQL
+    equivalent, so ``execution_options(mysql_readonly=True)`` is silently
+    ignored on stock MySQL dialects. Registering this lets read/write-splitting
+    users route a read-only connection to a reader the same way PG users do
+    (test_sqlalchemy_creator_read_write_splitting_async). Routes through the
+    dialect's set/get_readonly -> the wrapper connection's read-only control,
+    which the RWS plugin intercepts.
+    """
+
+    transactional = True
+
+    def reset_characteristic(self, dialect: Any, dbapi_conn: Any) -> None:
+        dialect.set_readonly(dbapi_conn, False)
+
+    def set_characteristic(self, dialect: Any, dbapi_conn: Any, value: Any) -> None:
+        dialect.set_readonly(dbapi_conn, value)
+
+    def get_characteristic(self, dialect: Any, dbapi_conn: Any) -> Any:
+        return dialect.get_readonly(dbapi_conn)
 
 
 class AwsWrapperAsyncAiomysqlAdaptDBAPI:
@@ -99,12 +137,38 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
     supports_statement_cache = True
     is_async = True
 
+    # Register a ``mysql_readonly`` characteristic (SA ships only
+    # ``postgresql_readonly``) so RWS users can route a read-only connection to
+    # a reader via execution_options, like PG
+    # (test_sqlalchemy_creator_read_write_splitting_async).
+    connection_characteristics = util.immutabledict({
+        **MySQLDialect_aiomysql.connection_characteristics,
+        "mysql_readonly": _MySQLReadOnlyConnectionCharacteristic(),
+    })
+
     # See _AsyncFailoverSuccessRewrapMixin / sqlalchemy_dialects/pg.py.
     # ``dialect.dbapi.OperationalError`` resolves to the wrapper's PEP-249
     # ``OperationalError`` via the shim's ``_dbapi.install`` — rewrap
     # target must be that class for SA's classifier to wrap us to
     # ``sqlalchemy.exc.OperationalError``.
     _failover_success_target_cls = _PEP249OperationalError
+
+    def set_readonly(self, dbapi_conn: Any, value: bool) -> None:
+        # dbapi_conn is SA's AsyncAdapt_aiomysql_connection; the wrapper
+        # connection (whose set_read_only the RWS plugin intercepts) is at
+        # ._connection. set_characteristic runs in SA's greenlet, so bridge the
+        # async set_read_only via await_only.
+        wrapper = _unwrap_wrapper_conn(dbapi_conn)
+        sro = getattr(wrapper, "set_read_only", None)
+        if sro is not None:
+            await_only(sro(bool(value)))
+
+    def get_readonly(self, dbapi_conn: Any) -> bool:
+        # Best-effort: report the wrapper's current read-only intent so SA can
+        # store it for reset-on-checkin. Defaults to False (writer) when not
+        # exposed, which yields the correct reset-to-writer behavior.
+        wrapper = _unwrap_wrapper_conn(dbapi_conn)
+        return bool(getattr(wrapper, "read_only", False))
 
     @classmethod
     def import_dbapi(cls) -> Any:  # type: ignore[override]
