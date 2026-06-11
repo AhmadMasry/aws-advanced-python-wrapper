@@ -145,7 +145,13 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
         proxied = connection.connection
         dbapi = getattr(proxied, "dbapi_connection", proxied)
         inner = getattr(dbapi, "target_connection", dbapi)
-        return inner.charset
+        # ``inner`` may be a raw aiomysql Connection (exposes ``charset``
+        # directly) OR SQLAlchemy's ``AsyncAdapt_aiomysql_connection`` adapter,
+        # which has NO ``charset`` -- it nests the real aiomysql connection at
+        # ``._connection``. Reach whichever applies (SA's create_async_engine
+        # path drives the adapter case: test_sqlalchemy_creator_*_async).
+        real = getattr(inner, "_connection", inner)
+        return getattr(real, "charset", None) or getattr(inner, "charset", None)
 
     def _driver_error_module(self):
         # aiomysql raises pymysql's PEP-249 error classes; lets
