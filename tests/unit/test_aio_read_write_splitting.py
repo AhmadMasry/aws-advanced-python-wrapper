@@ -51,6 +51,10 @@ def _build(topology: Optional[tuple] = None):
     # Simulate initial writer conn.
     writer_conn = MagicMock(name="writer_conn")
     svc._current_connection = writer_conn
+    # _open() opens reader/writer connections with the wired target driver func
+    # (no longer hardcoded to psycopg). The mocked driver_dialect.connect
+    # ignores it, so any callable works here.
+    svc.set_target_driver_func(MagicMock(name="target_driver_func"))
 
     # Default stub for get_host_info_by_strategy: preserve the old
     # "first matching host in candidates" semantics so existing tests
@@ -754,6 +758,7 @@ def _build_with_counters(topology=None):
     )
     writer_conn = MagicMock(name="writer_conn")
     svc._current_connection = writer_conn
+    svc.set_target_driver_func(MagicMock(name="target_driver_func"))
     svc.get_host_info_by_strategy = MagicMock(  # type: ignore[method-assign]
         side_effect=lambda role, strategy, candidates: (
             next((h for h in (candidates or ()) if h.role == role), None)))

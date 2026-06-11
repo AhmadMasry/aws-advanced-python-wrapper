@@ -466,9 +466,16 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
             self,
             driver_dialect: AsyncDriverDialect,
             target: HostInfo) -> Any:
-        # SP-6 currently hardcodes psycopg async connect; SP-8 will
-        # generalize via driver-dialect registry.
-        import psycopg
+        # Use the SAME target driver connect callable the wrapper was opened
+        # with (aiomysql.connect / psycopg.AsyncConnection.connect), wired on
+        # the plugin service at connect time. Hardcoding psycopg here made every
+        # reader/writer switch on a MySQL cluster try the PostgreSQL driver
+        # against a MySQL host -> "Could not open a reader connection".
+        target_func = self._plugin_service.get_target_driver_func()
+        if target_func is None:
+            raise ReadWriteSplittingError(
+                "No target driver connect function is available to open a "
+                "reader/writer connection.")
 
         from aws_advanced_python_wrapper.utils.properties import Properties
         props_copy: Properties = Properties(self._plugin_service.props.copy())  # type: ignore[attr-defined]
@@ -485,9 +492,9 @@ class AsyncReadWriteSplittingPlugin(AsyncPlugin):
         database_dialect = self._plugin_service.database_dialect
         if database_dialect is None:
             return await driver_dialect.connect(
-                target, props_copy, psycopg.AsyncConnection.connect)
+                target, props_copy, target_func)
         return await provider.connect(
-            psycopg.AsyncConnection.connect,
+            target_func,
             driver_dialect,
             database_dialect,
             target,

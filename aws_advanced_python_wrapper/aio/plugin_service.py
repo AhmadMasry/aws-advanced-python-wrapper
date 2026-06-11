@@ -115,6 +115,10 @@ class AsyncPluginService(Protocol):
     def get_availability(self, host_url: str) -> Optional[HostAvailability]:
         ...
 
+    def get_target_driver_func(self) -> Optional[Callable]:
+        """The target driver's async connect callable, wired at connect time."""
+        ...
+
     @property
     def plugin_manager(self) -> Optional[AsyncPluginManager]:
         ...
@@ -743,6 +747,13 @@ class AsyncPluginServiceImpl(AsyncPluginService):
     def set_target_driver_func(self, func: Callable) -> None:
         """Wired by AsyncAwsWrapperConnection.connect at connect time."""
         self._target_driver_func = func
+
+    def get_target_driver_func(self) -> Optional[Callable]:
+        """The target driver's async connect callable (aiomysql.connect /
+        psycopg.AsyncConnection.connect), wired at connect time. Plugins that
+        open their own raw connections (e.g. RWS reader/writer switches) need
+        this so they connect with the RIGHT driver instead of hardcoding one."""
+        return self._target_driver_func
 
     def set_status(self, clazz, key, status):
         self._status_store[(clazz, key)] = status

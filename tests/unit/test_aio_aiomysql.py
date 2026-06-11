@@ -120,7 +120,9 @@ def test_driver_dialect_lifecycle_ops_against_mock_conn():
     async def _body() -> None:
         d = AsyncAiomysqlDriverDialect()
         conn = MagicMock()
-        conn.open = True
+        # aiomysql's Connection exposes ``closed`` (no ``open``); is_closed /
+        # can_execute_query read that.
+        conn.closed = False
         conn.get_autocommit = MagicMock(return_value=True)
         conn.autocommit = AsyncMock()
         conn.ping = AsyncMock()

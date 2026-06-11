@@ -161,7 +161,14 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
         return await asyncio.wait_for(coro, timeout=float(connect_timeout))
 
     async def is_closed(self, conn: Any) -> bool:
-        return not conn.open
+        # aiomysql's Connection exposes a ``closed`` property (True once its
+        # writer stream is gone); it has NO ``open`` attribute (that's
+        # pymysql/mysql.connector). Prefer ``closed``; fall back to ``open``
+        # for any pool proxy that exposes that shape instead.
+        closed = getattr(conn, "closed", None)
+        if closed is not None:
+            return bool(closed)
+        return not getattr(conn, "open", False)
 
     async def abort_connection(self, conn: Any) -> None:
         # aiomysql has no abort primitive. Closing the socket is the
@@ -203,7 +210,8 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
         conn._aws_read_only = bool(read_only)  # type: ignore[attr-defined]
 
     async def can_execute_query(self, conn: Any) -> bool:
-        return bool(conn.open)
+        # aiomysql exposes ``closed`` (no ``open`` -- see is_closed).
+        return not await self.is_closed(conn)
 
     async def transfer_session_state(
             self, from_conn: Any, to_conn: Any) -> None:
