@@ -145,6 +145,19 @@ class AsyncSimpleReadWriteSplittingPlugin(AsyncPlugin):
         if conn is None:
             conn = await connect_func()
         self._plugin_service.initial_connection_host_info = host_info
+        # Seed the role cache with the initial connection so a later
+        # set_read_only REUSES it instead of opening a fresh read/write-endpoint
+        # connection. Without this, connecting via the reader-cluster (cluster-ro)
+        # endpoint then set_read_only(True) opens a NEW cluster-ro connection,
+        # which round-robins to a DIFFERENT reader on a multi-reader cluster and
+        # breaks "stay on the same reader"
+        # (test_connect_to_reader_cluster__switch_read_only_async, multi-5).
+        # The regular RWS plugin gets this via notify_connection_changed; srw has
+        # no such hook, so seed here.
+        if expected == HostRole.READER:
+            self._reader_conn = conn
+        elif expected == HostRole.WRITER:
+            self._writer_conn = conn
         return conn
 
     async def execute(
