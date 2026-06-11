@@ -87,6 +87,7 @@ class AsyncAuthPluginBase(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             connect_func: Callable[..., Awaitable[Any]]) -> Any:
+        self._prepare_secure_transport(driver_dialect, props)
         return await self._connect_with_retry(host_info, props, connect_func)
 
     async def force_connect(
@@ -97,7 +98,14 @@ class AsyncAuthPluginBase(AsyncPlugin):
             props: Properties,
             is_initial_connection: bool,
             force_connect_func: Callable[..., Awaitable[Any]]) -> Any:
+        self._prepare_secure_transport(driver_dialect, props)
         return await self._connect_with_retry(host_info, props, force_connect_func)
+
+    def _prepare_secure_transport(
+            self, driver_dialect: AsyncDriverDialect, props: Properties) -> None:
+        """Hook to ensure secure transport before connecting. No-op by default;
+        overridden by IAM (which sends the token in cleartext and requires TLS)."""
+        pass
 
     async def _connect_with_retry(
             self,
@@ -197,6 +205,27 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
         # Telemetry counter -- matches sync iam_plugin.py:62.
         tf = self._plugin_service.get_telemetry_factory()
         self._fetch_token_counter = tf.create_counter("iam.fetch_token.count")
+
+    def _prepare_secure_transport(
+            self, driver_dialect: AsyncDriverDialect, props: Properties) -> None:
+        # IAM auth sends the token via MySQL's mysql_clear_password plugin, i.e.
+        # in CLEARTEXT, which the driver only does over TLS. psycopg gets TLS
+        # from sslmode=require and mysql.connector negotiates it by default, but
+        # aiomysql does NOT auto-negotiate TLS -- so without this the token is
+        # never sent and the server reports "Access denied ... (using password:
+        # NO)" (test_iam_*_async). Enable TLS for aiomysql IAM connections,
+        # matching PG's sslmode=require semantics (encrypt; cert verification
+        # stays opt-in via a caller-supplied ssl context). Only aiomysql needs
+        # it; respect any TLS config the caller already provided.
+        if getattr(driver_dialect, "_driver_name", None) != "aiomysql":
+            return
+        if props.get("ssl") is not None or props.get("ssl_ca") is not None:
+            return
+        import ssl as _ssl
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        props["ssl"] = ctx
 
     def _default_port(self) -> int:
         dialect = self._plugin_service.database_dialect
