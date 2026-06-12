@@ -1,6 +1,6 @@
 [project]
 name = "aws_advanced_python_wrapper"
-version = "3.0.0"
+version = "3.1.0"
 description = "Amazon Web Services (AWS) Advanced Python Wrapper"
 readme = "README.md"
 license = "Apache-2.0"
