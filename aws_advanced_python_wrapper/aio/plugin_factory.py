@@ -95,6 +95,20 @@ class _ReadWriteSplittingFactory:
         )
 
 
+class _GdbReadWriteSplittingFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        if host_list_provider is None:
+            raise AwsWrapperError(
+                "gdb_rw plugin requires a host_list_provider"
+            )
+        from aws_advanced_python_wrapper.aio.gdb_read_write_splitting_plugin \
+            import AsyncGdbReadWriteSplittingPlugin
+        return AsyncGdbReadWriteSplittingPlugin(
+            plugin_service, host_list_provider, props
+        )
+
+
 class _SimpleReadWriteSplittingFactory:
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
@@ -270,6 +284,7 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "host_monitoring": _HostMonitoringFactory(),
     "host_monitoring_v2": _HostMonitoringFactory(),
     "read_write_splitting": _ReadWriteSplittingFactory(),
+    "gdb_rw": _GdbReadWriteSplittingFactory(),
     "srw": _SimpleReadWriteSplittingFactory(),
     "iam": _IamAuthFactory(),
     "aws_secrets_manager": _AwsSecretsManagerFactory(),
@@ -296,6 +311,7 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _AuroraConnectionTrackerFactory: 100,
     _StaleDnsFactory: 200,
     _ReadWriteSplittingFactory: 300,
+    _GdbReadWriteSplittingFactory: 320,
     _SimpleReadWriteSplittingFactory: 300,
     _FailoverFactory: 400,
     _HostMonitoringFactory: 500,

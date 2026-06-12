@@ -52,6 +52,7 @@ _TOPOLOGY_REQUIRING_PLUGINS = frozenset({
     "failover",
     "failover_v2",
     "read_write_splitting",
+    "gdb_rw",
     "custom_endpoint",
     "aurora_connection_tracker",
 })

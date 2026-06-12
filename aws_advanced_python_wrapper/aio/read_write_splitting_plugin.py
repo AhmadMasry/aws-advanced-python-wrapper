@@ -24,7 +24,8 @@ is cheap.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Set
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
+                    Set)
 
 from aws_advanced_python_wrapper.aio._rws_failover_eviction import \
     _AsyncRwsFailoverEvictionMixin
@@ -257,6 +258,21 @@ class AsyncReadWriteSplittingPlugin(
                 return True
         return False
 
+    def _select_reader_candidates(self, topology: tuple) -> List[HostInfo]:
+        """Reader hosts eligible for selection. Hook for subclasses (the gdb
+        variant restricts to the home region). Base: every reader in the
+        topology. Mirrors sync ``_get_reader_host_candidates``.
+        """
+        return [h for h in topology if h.role == HostRole.READER]
+
+    async def _should_switch_to_writer(self, writer_host: HostInfo) -> bool:
+        """Whether to proceed switching the current connection to
+        ``writer_host``. Hook for subclasses (the gdb variant enforces the
+        home-region restriction / global write forwarding). Base: always
+        switch.
+        """
+        return True
+
     def _is_pool_connection(self, conn: Any) -> bool:
         """Return True if ``conn`` is managed by a pool provider.
 
@@ -349,7 +365,7 @@ class AsyncReadWriteSplittingPlugin(
         self._reader_conn = None
         self._reader_host_info = None
 
-        reader_candidates = [h for h in topology if h.role == HostRole.READER]
+        reader_candidates = self._select_reader_candidates(topology)
         if not reader_candidates:
             # Aurora's ``aurora_replica_status()`` transiently omits a reader
             # row when the replica's LAST_UPDATE_TIMESTAMP lags the query's
@@ -358,7 +374,7 @@ class AsyncReadWriteSplittingPlugin(
             # have just poisoned) before giving up.
             topology = await self._host_list_provider.force_refresh(current)
             topology = tuple(self._plugin_service.filter_hosts(list(topology)))
-            reader_candidates = [h for h in topology if h.role == HostRole.READER]
+            reader_candidates = self._select_reader_candidates(topology)
         if not reader_candidates:
             if self._plugin_service.allowed_and_blocked_hosts is not None:
                 # A custom endpoint constrains the host set and it has no
@@ -456,6 +472,16 @@ class AsyncReadWriteSplittingPlugin(
         # switch to a non-member writer.
         topology = tuple(self._plugin_service.filter_hosts(list(raw_topology)))
 
+        writer = next(
+            (h for h in topology if h.role == HostRole.WRITER),
+            None,
+        )
+        # Subclass hook (gdb): validate/guard the target writer before
+        # switching. Returning False skips the switch (e.g. global write
+        # forwarding keeps the current reader connection); raising forbids it.
+        if writer is not None and not await self._should_switch_to_writer(writer):
+            return
+
         # Try to reuse cached writer if valid + in topology + not closed.
         if (self._writer_conn is not None
                 and self._writer_conn is not current
@@ -473,10 +499,6 @@ class AsyncReadWriteSplittingPlugin(
         self._writer_conn = None
         self._writer_host_info = None
 
-        writer = next(
-            (h for h in topology if h.role == HostRole.WRITER),
-            None,
-        )
         if writer is None:
             raise ReadWriteSplittingError(
                 "No writer host available in the current topology."
