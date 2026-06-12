@@ -158,3 +158,26 @@ class AwsWrapperPGPsycopgDialect(_FailoverSuccessRewrapMixin, PGDialect_psycopg)
         candidate = getattr(dbapi_conn, "driver_connection", dbapi_conn)
         native = getattr(candidate, "target_connection", candidate)
         return TypeInfo.fetch(native, name)
+
+    def do_ping(self, dbapi_connection) -> bool:
+        # Support SQLAlchemy ``pool_pre_ping``. psycopg3 has no ``.ping()``;
+        # SA's _psycopg_common.do_ping runs ``SELECT 1`` via the DBAPI
+        # connection's cursor with an autocommit toggle. Run that liveness
+        # query against the native psycopg connection (reached via the
+        # wrapper's ``target_connection``) so it works regardless of which
+        # psycopg surface the wrapper proxies. A failure -> return False so
+        # SA's pool recycles the connection. Mirrors AWS PR #1245's
+        # pool_pre_ping support, generalized to PostgreSQL.
+        target = getattr(dbapi_connection, "target_connection", dbapi_connection)
+        try:
+            before_autocommit = target.autocommit
+            if not before_autocommit:
+                target.autocommit = True
+            try:
+                target.execute("SELECT 1")
+            finally:
+                if not before_autocommit and not target.closed:
+                    target.autocommit = before_autocommit
+            return True
+        except Exception:
+            return False

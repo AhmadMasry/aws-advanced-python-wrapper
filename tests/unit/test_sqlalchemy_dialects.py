@@ -200,3 +200,67 @@ def test_pg_dialect_type_info_fetch_falls_through_when_no_target_connection(mock
     called_arg = fetch_mock.call_args.args[0]
     assert called_arg is native, (
         "no-wrapper deployments should pass the native conn through unchanged")
+
+
+# --- do_ping / pool_pre_ping support (AWS PR #1245, ported to all dialects) ---
+
+def test_mysql_do_ping_pings_target_connection():
+    """MySQL do_ping must ping the native mysql-connector connection (the
+    wrapper exposes no ``.ping()``), so pool_pre_ping works."""
+    from unittest.mock import MagicMock
+    native = MagicMock(name="native_mysqlconnector")
+    wrapper = MagicMock(name="AwsWrapperConnection")
+    wrapper.target_connection = native
+
+    dialect = AwsWrapperMySQLConnectorDialect()
+    assert dialect.do_ping(wrapper) is True
+    native.ping.assert_called_once_with(reconnect=False)
+
+
+def test_mysql_do_ping_returns_false_on_dead_connection():
+    from unittest.mock import MagicMock
+    native = MagicMock(name="native_mysqlconnector")
+    native.ping.side_effect = Exception("server has gone away")
+    wrapper = MagicMock(name="AwsWrapperConnection")
+    wrapper.target_connection = native
+
+    dialect = AwsWrapperMySQLConnectorDialect()
+    assert dialect.do_ping(wrapper) is False
+
+
+def test_pg_do_ping_runs_select_one_on_target_connection():
+    """PG do_ping runs SELECT 1 on the native psycopg connection (psycopg3
+    has no ``.ping()``)."""
+    from unittest.mock import MagicMock
+    native = MagicMock(name="native_psycopg")
+    native.autocommit = True  # already autocommit -> no toggle
+    wrapper = MagicMock(name="AwsWrapperConnection")
+    wrapper.target_connection = native
+
+    dialect = AwsWrapperPGPsycopgDialect()
+    assert dialect.do_ping(wrapper) is True
+    native.execute.assert_called_once_with("SELECT 1")
+
+
+def test_pg_do_ping_returns_false_on_dead_connection():
+    from unittest.mock import MagicMock
+    native = MagicMock(name="native_psycopg")
+    native.autocommit = True
+    native.execute.side_effect = Exception("connection is closed")
+    wrapper = MagicMock(name="AwsWrapperConnection")
+    wrapper.target_connection = native
+
+    dialect = AwsWrapperPGPsycopgDialect()
+    assert dialect.do_ping(wrapper) is False
+
+
+def test_async_dialects_define_do_ping():
+    """Async dialects must also implement do_ping (AWS ships sync MySQL only;
+    we port pool_pre_ping support to all four dialects)."""
+    from aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async import \
+        AwsWrapperMySQLAiomysqlAsyncDialect
+    from aws_advanced_python_wrapper.sqlalchemy_dialects.pg_async import \
+        AwsWrapperPGPsycopgAsyncDialect
+    # Each defines its own do_ping (not merely inherited from the stock base).
+    assert "do_ping" in AwsWrapperMySQLAiomysqlAsyncDialect.__dict__
+    assert "do_ping" in AwsWrapperPGPsycopgAsyncDialect.__dict__

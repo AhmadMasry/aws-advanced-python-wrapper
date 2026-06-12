@@ -251,3 +251,26 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
         if isinstance(e, FailoverError):
             return isinstance(e, FailoverFailedError)
         return super().is_disconnect(e, connection, cursor)
+
+    def do_ping(self, dbapi_connection) -> bool:  # type: ignore[override]
+        # The aiomysql base types do_ping as ``Literal[True]`` (return-or-raise);
+        # we deliberately return ``bool`` -- SA's ``_do_ping_w_event`` does
+        # ``return self.do_ping(...)``, so a ``False`` return correctly recycles
+        # the pooled connection (mysqlconnector/psycopg bases already type bool).
+        # Support SQLAlchemy ``pool_pre_ping``. aiomysql's ping() is a
+        # coroutine and do_ping runs in SA's greenlet, so bridge via
+        # await_only. dbapi_connection is SA's AsyncAdapt_aiomysql_connection;
+        # ``._connection`` is the AsyncAwsWrapperConnection, whose
+        # ``target_connection`` is the aiomysql connection (or SA's adapter
+        # around it, nesting the real conn at ``._connection``). A driver error
+        # means the connection is dead -> return False so SA's pool recycles
+        # it. Adopts AWS PR #1245 for the async MySQL dialect (AWS ships sync
+        # MySQL only).
+        wrapper = _unwrap_wrapper_conn(dbapi_connection)
+        target = getattr(wrapper, "target_connection", wrapper)
+        real = getattr(target, "_connection", target)
+        try:
+            await_only(real.ping(reconnect=False))
+            return True
+        except Exception:
+            return False

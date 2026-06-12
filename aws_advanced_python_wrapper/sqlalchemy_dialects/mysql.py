@@ -131,3 +131,19 @@ class AwsWrapperMySQLConnectorDialect(
         if isinstance(e, FailoverError):
             return isinstance(e, FailoverFailedError)
         return super().is_disconnect(e, connection, cursor)
+
+    def do_ping(self, dbapi_connection) -> bool:
+        # Support SQLAlchemy ``pool_pre_ping``. SA's
+        # MySQLDialect_mysqlconnector.do_ping calls
+        # ``dbapi_connection.ping(False)``, but AwsWrapperConnection does NOT
+        # expose ``.ping()`` -- so without this override pool_pre_ping raises
+        # AttributeError. Reach the underlying mysql-connector connection via
+        # the wrapper's ``target_connection`` accessor and ping there; a driver
+        # error means the connection is dead -> return False so SA's pool
+        # recycles it. Adopts AWS PR #1245, generalized to our dialect family.
+        target = getattr(dbapi_connection, "target_connection", dbapi_connection)
+        try:
+            target.ping(reconnect=False)
+            return True
+        except Exception:
+            return False

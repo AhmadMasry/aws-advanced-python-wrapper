@@ -247,3 +247,21 @@ class AwsWrapperPGPsycopgAsyncDialect(
         if wrapper_plugins is not None:
             kwargs["plugins"] = wrapper_plugins
         return args, kwargs
+
+    def do_ping(self, dbapi_connection) -> bool:
+        # Support SQLAlchemy ``pool_pre_ping`` for async PG. psycopg3's
+        # AsyncConnection has no ping(); run a lightweight ``SELECT 1``.
+        # dbapi_connection is SA's AsyncAdapt_psycopg_connection; reach the
+        # native AsyncConnection via ``driver_connection`` ->
+        # ``wrapper.target_connection`` and await it through the adapter's
+        # ``await_`` greenlet bridge. A failure -> return False so SA's pool
+        # recycles the connection. Adopts AWS PR #1245 for the async PG
+        # dialect (AWS ships sync MySQL only).
+        adapted = dbapi_connection
+        wrapper = getattr(adapted, "driver_connection", adapted)
+        native = getattr(wrapper, "target_connection", wrapper)
+        try:
+            adapted.await_(native.execute("SELECT 1"))
+            return True
+        except Exception:
+            return False
