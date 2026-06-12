@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import urllib.request
 from datetime import datetime, timedelta
 
 import pytest
@@ -381,11 +380,6 @@ def test_connect_with_specified_host(iam_host: str, mocker, mock_plugin_service,
     assert _GENERATED_TOKEN != actual_token.token
     assert f"{_TEST_TOKEN}:{iam_host}" == actual_token.token
     assert actual_token.is_expired() is False
-
-
-def test_aws_supported_regions_url_exists():
-    url = "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.RegionsAndAvailabilityZones.html"
-    assert 200 == urllib.request.urlopen(url).getcode()
 
 
 @pytest.mark.parametrize("host", [

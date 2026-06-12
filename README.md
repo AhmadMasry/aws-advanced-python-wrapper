@@ -88,7 +88,6 @@ The following table lists the connection properties used with the AWS Advanced P
 | `topology_refresh_ms`                        |      [Driver Parameters](docs/using-the-python-wrapper/UsingThePythonWrapper.md#aws-advanced-python-wrapper-parameters)      |
 | `cluster_id`                                 |      [Driver Parameters](docs/using-the-python-wrapper/UsingThePythonWrapper.md#aws-advanced-python-wrapper-parameters)      |
 | `cluster_instance_host_pattern`              |      [Driver Parameters](docs/using-the-python-wrapper/UsingThePythonWrapper.md#aws-advanced-python-wrapper-parameters)      |
-| `global_cluster_instance_host_patterns`      | [Failover v2 Plugin](docs/using-the-python-wrapper/UsingThePythonWrapper.md#aws-advanced-python-wrapper-parameters)                                 |
 | `wrapper_dialect`                            |              [Dialects](docs/using-the-python-wrapper/DatabaseDialects.md), and whether you should include it.               |
 | `wrapper_driver_dialect`                     |           [Driver Dialect](./docs/using-the-python-wrapper/DriverDialects.md), and whether you should include it.            |
 | `plugins`                                    |   [Connection Plugin Manager](docs/using-the-python-wrapper/UsingThePythonWrapper.md#connection-plugin-manager-parameters)   | 
@@ -119,9 +118,13 @@ The following table lists the connection properties used with the AWS Advanced P
 | `secrets_manager_secret_id`                  |           [Secrets Manager Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheAwsSecretsManagerPlugin.md)           |
 | `secrets_manager_region`                     |           [Secrets Manager Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheAwsSecretsManagerPlugin.md)           |
 | `secrets_manager_endpoint`                   |           [Secrets Manager Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheAwsSecretsManagerPlugin.md)           |
-| `secrets_manager_secret_username`            |           [Secrets Manager Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheAwsSecretsManagerPlugin.md)           |
-| `secrets_manager_secret_password`            |           [Secrets Manager Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheAwsSecretsManagerPlugin.md)           |
+| `secrets_manager_secret_username_key`        |           [Secrets Manager Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheAwsSecretsManagerPlugin.md)           |
+| `secrets_manager_secret_password_key`        |           [Secrets Manager Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheAwsSecretsManagerPlugin.md)           |
 | `reader_host_selector_strategy`              | [Connection Strategy](docs/using-the-python-wrapper/using-plugins/UsingTheReadWriteSplittingPlugin.md#connection-strategies) |
+| `gdb_rw_home_region`                         |    [GDB Read/Write Splitting Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheGdbReadWriteSplittingPlugin.md)    |
+| `gdb_rw_restrict_writer_to_home_region`      |    [GDB Read/Write Splitting Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheGdbReadWriteSplittingPlugin.md)    |
+| `gdb_rw_restrict_reader_to_home_region`      |    [GDB Read/Write Splitting Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheGdbReadWriteSplittingPlugin.md)    |
+| `gdb_enable_global_write_forwarding`         |    [GDB Read/Write Splitting Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheGdbReadWriteSplittingPlugin.md)    |
 | `db_user`                                    |   [Federated Authentication Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheFederatedAuthenticationPlugin.md)    |
 | `idp_username`                               |   [Federated Authentication Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheFederatedAuthenticationPlugin.md)    |
 | `idp_password`                               |   [Federated Authentication Plugin](docs/using-the-python-wrapper/using-plugins/UsingTheFederatedAuthenticationPlugin.md)    |
@@ -156,6 +159,10 @@ Support for Blue/Green deployments using the AWS Advanced Python Wrapper require
 - Supported Aurora MySQL Versions: Engine Release `3.07` and above.
 
 Please note that Aurora Global Database and RDS Multi-AZ clusters with Blue/Green deployments is currently not supported. For detailed information on supported database versions, refer to the [Blue/Green Deployment Plugin Documentation](docs/using-the-python-wrapper/using-plugins/UsingTheBlueGreenPlugin.md).
+
+#### Enhanced Failure Monitoring with MySQL
+
+Enhanced Failure Monitoring (both the `host_monitoring` and `host_monitoring_v2` plugins) is not supported with the MySQL Connector/Python driver. Both plugins rely on being able to abort an active connection from a separate monitoring thread when a host is determined to be unhealthy, and the MySQL Connector/Python driver does not support aborting connections from a separate thread. For more information, see the [Host Monitoring Plugin Documentation](docs/using-the-python-wrapper/using-plugins/UsingTheHostMonitoringPlugin.md).
 
 #### MySQL Connector/Python C Extension
 
@@ -229,8 +236,8 @@ This `aws-advanced-python-wrapper` is being tested against the following Communi
 
 | Database          | Versions                                                                                                                                                                                                                                                                                                                         |
 |-------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| MySQL             | 8.4.0                                                                                                                                                                                                                                                                                                                            |
-| PostgreSQL        | 16.2                                                                                                                                                                                                                                                                                                                             |
+| MySQL             | 8.4.9                                                                                                                                                                                                                                                                                                                            |
+| PostgreSQL        | 18.4                                                                                                                                                                                                                                                                                                                             |
 | Aurora MySQL      | - LTS version, see [here](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Updates.Versions.html#AuroraMySQL.Updates.LTS) for more details. <br><br> - Latest release, as shown on [this page](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraMySQLReleaseNotes/AuroraMySQL.Updates.30Updates.html). |
 | Aurora PostgreSQL | - LTS version, see [here](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Updates.LTS.html) for more details. <br><br> - Latest release, as shown on [this page](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraPostgreSQLReleaseNotes/AuroraPostgreSQL.Updates.html).)                        |
 

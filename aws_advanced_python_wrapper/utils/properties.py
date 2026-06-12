@@ -40,8 +40,18 @@ class WrapperProperty:
     def __str__(self):
         return f"WrapperProperty(name={self.name}, default_value={self.default_value})"
 
-    def get(self, props: Properties) -> Optional[str]:
-        if self.default_value:
+    def get(self, props: Properties, return_default: bool = True) -> Optional[str]:
+        """Retrieve this property's value from the given properties.
+
+        :param props: the :class:`Properties` collection to read the value from.
+        :param return_default: if ``True``, fall back to this property's
+            ``default_value`` when the property is not present in ``props``.
+            If ``False``, the default value is ignored.
+        :return: the property's value, the default value when missing and
+            ``return_default`` is ``True``, or ``None`` if the property is
+            absent and no default applies.
+        """
+        if self.default_value and return_default:
             return props.get(self.name, self.default_value)
         return props.get(self.name)
 
@@ -67,11 +77,6 @@ class WrapperProperty:
             return value.lower() == "true" if isinstance(value, str) else bool(value)  # type: ignore[return-value]
         return type_class(value)  # type: ignore[call-arg]
 
-    def get_or_default(self, props: Properties) -> str:
-        if not self.default_value:
-            raise ValueError(f"No default value found for property {self}")
-        return props.get(self.name, self.default_value)
-
     def get_int(self, props: Properties) -> int:
         return self.get_type(props, int)
 
@@ -86,7 +91,8 @@ class WrapperProperty:
 
 
 class WrapperProperties:
-    DEFAULT_PLUGINS = "aurora_connection_tracker,failover_v2,host_monitoring_v2"
+    DEFAULT_PLUGINS = "initial_connection,aurora_connection_tracker,failover_v2,host_monitoring_v2"
+    MYSQL_CONNECTOR_DEFAULT_PLUGINS = "initial_connection,aurora_connection_tracker,failover_v2"
     _DEFAULT_TOKEN_EXPIRATION_SEC = 15 * 60
 
     PROFILE_NAME = WrapperProperty(
@@ -645,6 +651,32 @@ class WrapperProperties:
         "Per-attempt backoff cap in seconds for the same retry path. Initial "
         "backoff is 1.0s with a 1.5x multiplier; this caps the geometric growth.",
         30.0,
+    )
+
+    # Global Database Read/Write Splitting
+    GDB_RW_HOME_REGION = WrapperProperty(
+        "gdb_rw_home_region",
+        "Specifies the home region for read/write splitting in a Global Database setup.",
+        None,
+    )
+
+    GDB_RW_RESTRICT_WRITER_TO_HOME_REGION = WrapperProperty(
+        "gdb_rw_restrict_writer_to_home_region",
+        "Prevents connections to a writer instance outside of the defined home region.",
+        True,
+    )
+
+    GDB_RW_RESTRICT_READER_TO_HOME_REGION = WrapperProperty(
+        "gdb_rw_restrict_reader_to_home_region",
+        "Prevents connections to a reader instance outside of the defined home region.",
+        True,
+    )
+
+    GDB_ENABLE_GLOBAL_WRITE_FORWARDING = WrapperProperty(
+        "gdb_enable_global_write_forwarding",
+        "Set to True to enable Global Write Forwarding when connected to a "
+        "reader connection in a secondary global region.",
+        False,
     )
 
 

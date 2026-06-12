@@ -58,6 +58,7 @@ from ..utils.conditions import (disable_on_features, enable_on_deployments,
                                 enable_on_num_instances)
 from ..utils.database_engine import DatabaseEngine
 from ..utils.database_engine_deployment import DatabaseEngineDeployment
+from ..utils.retry_helper import retry_until
 from ..utils.test_environment import TestEnvironment
 from ..utils.test_environment_features import TestEnvironmentFeatures
 
@@ -66,6 +67,8 @@ class Base(DeclarativeBase):
     pass
 
 class TestModel(Base):
+    __test__ = False
+
     """Basic test model for SQLAlchemy ORM functionality"""
     __tablename__ = 'sqlalchemy_test_model'
 
@@ -141,6 +144,8 @@ def _build_url(user, password, host, port, dbname, wrapper_plugins=None, **extra
     # unsupported on MySQL) -- breaking test_sqlalchemy_with_no_plugins.
     if wrapper_plugins is not None:
         query_params['wrapper_plugins'] = wrapper_plugins
+    else:
+        query_params['wrapper_plugins'] = ''
     query_params['connect_timeout'] = str(extra_options.get('connect_timeout', 10))
     for k, v in extra_options.items():
         if k != 'connect_timeout':
@@ -289,7 +294,7 @@ class TestSqlAlchemyPlugins:
         Base.metadata.create_all(engine, tables=[
             TestModel.__table__, DataTypeModel.__table__,
             Author.__table__, Book.__table__
-        ])
+        ], checkfirst=False)
 
         models = {
             'TestModel': TestModel,
@@ -529,7 +534,8 @@ class TestSqlAlchemyPlugins:
                 current_writer_id = row._tuple()[0]
             else:
                 raise Exception("Failed to get current_writer_id from row because row was None.")
-            assert rds_utils.is_db_instance_writer(current_writer_id) is True
+            # RDS API lags behind the writer election, so we retry the check.
+            assert retry_until(lambda: rds_utils.is_db_instance_writer(current_writer_id))
             assert current_writer_id != initial_writer_id
 
             session.query(TestModel).delete()

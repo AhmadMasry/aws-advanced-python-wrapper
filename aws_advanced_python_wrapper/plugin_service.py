@@ -72,6 +72,8 @@ from aws_advanced_python_wrapper.exception_handling import (ExceptionHandler,
 from aws_advanced_python_wrapper.execute_time_plugin import \
     ExecuteTimePluginFactory
 from aws_advanced_python_wrapper.failover_plugin import FailoverPluginFactory
+from aws_advanced_python_wrapper.gdb_read_write_splitting_plugin import \
+    GdbReadWriteSplittingPluginFactory
 from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.host_list_provider import (
     ConnectionStringHostListProvider, HostListProvider,
@@ -830,6 +832,7 @@ class PluginManager(CanReleaseResources):
         "failover_v2": FailoverV2PluginFactory,
         "read_write_splitting": ReadWriteSplittingPluginFactory,
         "srw": SimpleReadWriteSplittingPluginFactory,
+        "gdb_rw": GdbReadWriteSplittingPluginFactory,
         "fastest_response_strategy": FastestResponseStrategyPluginFactory,
         "stale_dns": StaleDnsPluginFactory,
         "custom_endpoint": CustomEndpointPluginFactory,
@@ -855,6 +858,7 @@ class PluginManager(CanReleaseResources):
         StaleDnsPluginFactory: 200,
         ReadWriteSplittingPluginFactory: 300,
         SimpleReadWriteSplittingPluginFactory: 310,
+        GdbReadWriteSplittingPluginFactory: 320,
         FailoverPluginFactory: 400,
         FailoverV2PluginFactory: 410,
         HostMonitoringPluginFactory: 500,
@@ -914,9 +918,12 @@ class PluginManager(CanReleaseResources):
                     Messages.get_formatted("PluginManager.ConfigurationProfileNotFound", profile_name))
             plugin_factories = DriverConfigurationProfiles.get_plugin_factories(profile_name)
         else:
-            plugin_codes = WrapperProperties.PLUGINS.get(self._props)
+            plugin_codes = WrapperProperties.PLUGINS.get(self._props, False)
             if plugin_codes is None:
-                plugin_codes = WrapperProperties.DEFAULT_PLUGINS
+                driver_dialect = self._container.plugin_service.driver_dialect
+                plugin_codes = WrapperProperties.MYSQL_CONNECTOR_DEFAULT_PLUGINS \
+                    if driver_dialect.dialect_code == "mysql-connector-python" \
+                    else WrapperProperties.DEFAULT_PLUGINS
 
             if plugin_codes != "":
                 plugin_factories = self.create_plugin_factories_from_list(plugin_codes.split(","))

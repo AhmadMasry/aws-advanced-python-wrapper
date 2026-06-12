@@ -41,6 +41,7 @@ from tests.integration.container.utils.database_engine_deployment import \
     DatabaseEngineDeployment
 from tests.integration.container.utils.driver_helper import DriverHelper
 from tests.integration.container.utils.rds_test_utility import RdsTestUtility
+from tests.integration.container.utils.retry_helper import retry_until
 from tests.integration.container.utils.test_environment import TestEnvironment
 from tests.integration.container.utils.test_environment_features import \
     TestEnvironmentFeatures
@@ -470,6 +471,10 @@ class TestCustomEndpoint:
         assert new_instance_id == original_writer_id
 
         instances = TestEnvironment.get_current().get_instances()
+        # The RDS API lags behind the writer election triggered during setup, so it may still report
+        # a stale writer. Retry until the API agrees the instance we are connected to is the writer,
+        # otherwise the reader selection below could pick our own writer and create duplicate ids.
+        assert retry_until(lambda: rds_utils.get_cluster_writer_instance_id() == original_writer_id)
         writer_id = str(rds_utils.get_cluster_writer_instance_id())
 
         reader_id_to_add = ""
