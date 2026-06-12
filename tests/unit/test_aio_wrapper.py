@@ -490,14 +490,51 @@ def test_connection_async_context_manager_closes_on_exit():
     raw_conn = _make_mock_async_conn()
 
     async def _body() -> None:
+        # plugins="" -> bare connection (no default plugins), isolating the
+        # context-manager close path from default-plugin activity.
         async with await AsyncAwsWrapperConnection.connect(
                 target=_build_mock_psycopg_connect(raw_conn),
                 conninfo="host=h user=u password=p dbname=d port=5432",
+                plugins="",
         ) as conn:
             assert isinstance(conn, AsyncAwsWrapperConnection)
 
     asyncio.run(_body())
     raw_conn.close.assert_awaited_once()
+
+
+def test_connect_applies_default_plugins_when_unset():
+    # Parity with the sync wrapper: when neither an explicit plugin list nor a
+    # ``plugins`` property is given, the default plugin list is applied.
+    raw_conn = _make_mock_async_conn()
+
+    async def _body() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+        )
+
+    conn = asyncio.run(_body())
+    # DEFAULT_PLUGINS: initial_connection, aurora_connection_tracker,
+    # failover_v2, host_monitoring_v2.
+    assert conn._plugin_manager.num_plugins >= 4
+
+
+def test_connect_explicit_blank_plugins_loads_none():
+    # ``plugins=""`` is distinct from unset: it means "no plugins".
+    raw_conn = _make_mock_async_conn()
+
+    async def _body() -> AsyncAwsWrapperConnection:
+        return await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+            plugins="",
+        )
+
+    conn = asyncio.run(_body())
+    # Only the always-present built-in AsyncDefaultPlugin; no user/default
+    # plugins (vs >=5 when defaults are applied for the unset case above).
+    assert conn._plugin_manager.num_plugins == 1
 
 
 def test_connection_getattr_forwards_to_raw_conn():

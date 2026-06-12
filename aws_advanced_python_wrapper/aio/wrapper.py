@@ -36,7 +36,8 @@ from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
-                                                          PropertiesUtils)
+                                                          PropertiesUtils,
+                                                          WrapperProperties)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -829,6 +830,20 @@ class AsyncAwsWrapperConnection:
 
         props: Properties = PropertiesUtils.parse_properties(
             conn_info=conninfo, **kwargs)
+
+        # Parity with the sync wrapper (PluginManager.create_plugins): when
+        # NEITHER an explicit plugin list (``plugins=[...]``) NOR a ``plugins``
+        # connection property is supplied, apply the default plugin list so
+        # failover/EFM/etc. load by default. Inject into props (not into
+        # build_async_plugins) so _build_host_list_provider stays in sync -- it
+        # reads the same property to choose a topology vs static provider. An
+        # explicit list leaves the ``plugins`` param non-None (skipped here); an
+        # explicit ``plugins=""`` leaves the key present (skipped -> no plugins).
+        # Async MySQL keeps host_monitoring_v2 (aiomysql EFM works via asyncio
+        # cancellation), so both async engines use the full DEFAULT_PLUGINS.
+        if plugins is None and WrapperProperties.PLUGINS.name not in props:
+            props[WrapperProperties.PLUGINS.name] = \
+                WrapperProperties.DEFAULT_PLUGINS
 
         # Pick the driver dialect by the target connect callable's module:
         # aiomysql.connect -> AsyncAiomysqlDriverDialect (MySQL); otherwise the
