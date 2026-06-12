@@ -34,6 +34,8 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Set
 
+from aws_advanced_python_wrapper.aio._rws_failover_eviction import \
+    _AsyncRwsFailoverEvictionMixin
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import (AwsWrapperError,
                                                 ReadWriteSplittingError)
@@ -55,12 +57,23 @@ if TYPE_CHECKING:
 logger = Logger(__name__)
 
 
-class AsyncSimpleReadWriteSplittingPlugin(AsyncPlugin):
+class AsyncSimpleReadWriteSplittingPlugin(
+        _AsyncRwsFailoverEvictionMixin, AsyncPlugin):
     """Async counterpart of :class:`SimpleReadWriteSplittingPlugin`."""
 
     _SUBSCRIBED: Set[str] = {
         DbApiMethod.CONNECT.method_name,
         DbApiMethod.CONNECTION_SET_READ_ONLY.method_name,
+        # Execute pipeline -- subscribed so a FailoverError raised while a
+        # command runs evicts stale pooled reader/writer connections
+        # (sync #1117 parity via _AsyncRwsFailoverEvictionMixin).
+        DbApiMethod.CURSOR_EXECUTE.method_name,
+        DbApiMethod.CURSOR_EXECUTEMANY.method_name,
+        DbApiMethod.CURSOR_FETCHONE.method_name,
+        DbApiMethod.CURSOR_FETCHMANY.method_name,
+        DbApiMethod.CURSOR_FETCHALL.method_name,
+        DbApiMethod.CONNECTION_COMMIT.method_name,
+        DbApiMethod.CONNECTION_ROLLBACK.method_name,
     }
 
     _DEFAULT_RETRY_TIMEOUT_SEC = 60.0
@@ -167,9 +180,20 @@ class AsyncSimpleReadWriteSplittingPlugin(AsyncPlugin):
             execute_func: Callable[..., Awaitable[Any]],
             *args: Any,
             **kwargs: Any) -> Any:
-        if method_name != DbApiMethod.CONNECTION_SET_READ_ONLY.method_name:
-            return await execute_func()
+        if method_name == DbApiMethod.CONNECTION_SET_READ_ONLY.method_name:
+            await self._maybe_switch_for_read_only(args)
+        # Funnel every subscribed call through the failover-eviction wrapper so
+        # a FailoverError raised while the command runs closes stale pooled
+        # reader/writer connections (sync #1117 parity).
+        return await self._execute_with_failover_eviction(
+            method_name, execute_func)
 
+    async def _maybe_switch_for_read_only(self, args: tuple) -> None:
+        """Swap to the read/write endpoint per the requested read-only state
+        (no-op mid-transaction or when already correct). Runs before the
+        wrapped ``set_read_only`` call in :meth:`execute`; raises
+        ReadWriteSplittingError for a mid-transaction writer swap.
+        """
         read_only = bool(args[0]) if args else False
         driver_dialect = self._plugin_service.driver_dialect
         current = self._plugin_service.current_connection
@@ -211,7 +235,6 @@ class AsyncSimpleReadWriteSplittingPlugin(AsyncPlugin):
                     "read-write.")
             await self._switch_to(
                 self._write_host_info, HostRole.WRITER, driver_dialect)
-        return await execute_func()
 
     async def _switch_to(
             self,

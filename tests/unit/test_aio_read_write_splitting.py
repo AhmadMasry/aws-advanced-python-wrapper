@@ -260,11 +260,73 @@ def test_reopens_reader_when_cached_reader_closed():
     asyncio.run(_body())
 
 
-def test_subscribed_methods_only_covers_set_read_only():
+def test_subscribed_methods_cover_set_read_only_and_execute_pipeline():
+    # set_read_only drives the reader/writer swap; the execute-pipeline methods
+    # are subscribed so a FailoverError raised mid-command evicts stale pooled
+    # connections (sync #1117 parity).
     plugin, *_ = _build()
-    assert plugin.subscribed_methods == {
-        DbApiMethod.CONNECTION_SET_READ_ONLY.method_name
-    }
+    subscribed = plugin.subscribed_methods
+    assert DbApiMethod.CONNECTION_SET_READ_ONLY.method_name in subscribed
+    for m in (
+            DbApiMethod.CURSOR_EXECUTE,
+            DbApiMethod.CURSOR_FETCHONE,
+            DbApiMethod.CURSOR_FETCHMANY,
+            DbApiMethod.CURSOR_FETCHALL,
+            DbApiMethod.CONNECTION_COMMIT,
+            DbApiMethod.CONNECTION_ROLLBACK):
+        assert m.method_name in subscribed
+
+
+def test_failover_failed_error_evicts_all_cached_connections():
+    # FailoverFailedError -> no usable connection: evict BOTH cached conns,
+    # including the in-use one, so a dead pooled conn is never reused (#1117).
+    async def _body() -> None:
+        from aws_advanced_python_wrapper.errors import FailoverFailedError
+        plugin, svc, hlp, dd, writer_conn = _build()
+        reader_conn = MagicMock(name="reader_conn")
+        plugin._reader_conn = reader_conn
+        plugin._reader_host_info = HostInfo(
+            host="reader.example", port=5432, role=HostRole.READER)
+
+        async def _boom() -> None:
+            raise FailoverFailedError("no writer")
+
+        with pytest.raises(FailoverFailedError):
+            await plugin.execute(
+                object(), DbApiMethod.CURSOR_EXECUTE.method_name, _boom)
+
+        assert reader_conn.close.called
+        assert writer_conn.close.called  # in-use conn evicted too
+        assert plugin._reader_conn is None
+        assert plugin._writer_conn is None
+
+    asyncio.run(_body())
+
+
+def test_failover_success_error_evicts_idle_keeps_current():
+    # A non-failed FailoverError (success / txn-resolution-unknown) means the
+    # wrapper reconnected: evict only the IDLE cached conns; keep the in-use one.
+    async def _body() -> None:
+        from aws_advanced_python_wrapper.errors import FailoverSuccessError
+        plugin, svc, hlp, dd, writer_conn = _build()
+        reader_conn = MagicMock(name="reader_conn")
+        plugin._reader_conn = reader_conn
+        plugin._reader_host_info = HostInfo(
+            host="reader.example", port=5432, role=HostRole.READER)
+
+        async def _boom() -> None:
+            raise FailoverSuccessError("reconnected to new writer")
+
+        with pytest.raises(FailoverSuccessError):
+            await plugin.execute(
+                object(), DbApiMethod.CURSOR_EXECUTE.method_name, _boom)
+
+        assert reader_conn.close.called          # idle reader evicted
+        assert plugin._reader_conn is None
+        assert not writer_conn.close.called      # in-use writer kept
+        assert plugin._writer_conn is writer_conn
+
+    asyncio.run(_body())
 
 
 def test_initial_connect_seeds_writer_cache():
