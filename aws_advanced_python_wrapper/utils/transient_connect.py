@@ -50,12 +50,21 @@ PG_TRANSIENT_CONNECT_SQLSTATES: FrozenSet[str] = frozenset({
 # during Aurora rotation.
 PG_TRANSIENT_CONNECT_SQLSTATE_PREFIXES: Tuple[str, ...] = ("08",)
 # libpq wire-level errors carry no SQLSTATE from the server. Mirrors
-# :data:`pg_exception_handler.PgExceptionHandler._NETWORK_ERROR_MESSAGES`.
+# :data:`pg_exception_handler.PgExceptionHandler._NETWORK_ERROR_MESSAGES`,
+# plus the client-side connect-timeout message. psycopg raises
+# ``ConnectionTimeout("connection timeout expired")`` when ``connect_timeout``
+# elapses before the server answers -- which is exactly what happens while
+# Aurora is promoting a new writer (the endpoint accepts the TCP connection
+# but the backend hasn't finished booting, so the libpq handshake stalls).
+# That is transient: the next attempt, once promotion completes, succeeds.
+# It carries no SQLSTATE (the server never replied), so only the message
+# prefix can classify it.
 PG_TRANSIENT_CONNECT_MESSAGE_PREFIXES: Tuple[str, ...] = (
     "connection failed",
     "consuming input failed",
     "connection socket closed",
     "the connection is closed",
+    "connection timeout expired",
 )
 
 # ───── MySQL Connector (sync) ──────────────────────────────────────────
