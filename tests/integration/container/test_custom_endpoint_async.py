@@ -31,8 +31,9 @@ Translation notes vs the sync file:
 from __future__ import annotations
 
 import asyncio
+import socket
 from time import perf_counter_ns, sleep
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Set
 from uuid import uuid4
 
 import pytest
@@ -195,6 +196,28 @@ class TestCustomEndpointAsync:
         if not available:
             pytest.fail(f"The test setup step timed out while waiting for the test custom endpoint to become available: "
                         f"'{TestCustomEndpointAsync.endpoint_id}'.")
+
+        # The RDS API flips the endpoint to "available" before its DNS record
+        # has propagated to the resolver this host uses. Connecting in that
+        # window fails the test setup with "[Errno -2] Name or service not
+        # known" -- observed deterministically on the multi-instance Aurora
+        # axes (these tests only run with >=3 instances). Wait for the endpoint
+        # hostname to actually resolve before any test connects through it.
+        self._wait_until_endpoint_dns_resolves(TestCustomEndpointAsync.endpoint_info["Endpoint"])
+
+    def _wait_until_endpoint_dns_resolves(self, hostname: str):
+        end_ns = perf_counter_ns() + 5 * 60 * 1_000_000_000  # 5 minutes
+        last_error: Optional[BaseException] = None
+        while perf_counter_ns() < end_ns:
+            try:
+                socket.getaddrinfo(hostname, None)
+                return
+            except OSError as ex:  # name resolution not propagated yet
+                last_error = ex
+                sleep(3)
+        pytest.fail(
+            "The test setup step timed out while waiting for the custom "
+            f"endpoint DNS to resolve: '{hostname}' (last error: {last_error}).")
 
     def _create_endpoint(self, rds_client, instances):
         instance_ids = [instance.get_instance_id() for instance in instances]
