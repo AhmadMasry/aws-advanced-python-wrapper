@@ -964,6 +964,35 @@ class AsyncAwsWrapperConnection:
         except Exception:  # noqa: BLE001 - topology is (re)fetched on demand
             pass
 
+        # Connect-time topology/role queries -- the eager refresh above and the
+        # Aurora-aware default plugins' connect hooks (initial_connection,
+        # aurora_connection_tracker, failover) -- run against target_conn. On a
+        # NON-Aurora target those Aurora queries fail and leave psycopg's
+        # transaction in an aborted state; even on Aurora a successful topology
+        # SELECT can leave an open read transaction. Either way the application
+        # must receive a clean connection, so roll back any wrapper-internal
+        # transaction before handing target_conn to the caller. Without this, a
+        # default-plugin connect to a plain (non-Aurora) Postgres leaves the
+        # caller's first query dead with ``InFailedSqlTransaction: current
+        # transaction is aborted`` (regression once defaults auto-load on
+        # non-Aurora targets). Only act when the connection is NOT in autocommit
+        # AND is in a transaction -- the only state where a lingering (open or
+        # aborted) wrapper-internal transaction can persist; autocommit / idle
+        # connections have nothing to clean. Best-effort + driver-agnostic
+        # (psycopg's rollback is a coroutine; aiomysql's is sync).
+        try:
+            in_txn = (
+                not await driver_dialect.get_autocommit(target_conn)
+                and await driver_dialect.is_in_transaction(target_conn))
+            if in_txn:
+                rollback = getattr(target_conn, "rollback", None)
+                if rollback is not None:
+                    result = rollback()
+                    if asyncio.iscoroutine(result):
+                        await result
+        except Exception:  # noqa: BLE001 - best-effort txn cleanup
+            pass
+
         await plugin_service.set_current_connection(target_conn, host_info)
         wrapper = AsyncAwsWrapperConnection(plugin_service, plugin_manager, target_conn)
         # Register so that plugin-driven connection switches (failover / RWS

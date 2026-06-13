@@ -537,6 +537,45 @@ def test_connect_explicit_blank_plugins_loads_none():
     assert conn._plugin_manager.num_plugins == 1
 
 
+def test_connect_rolls_back_lingering_nonautocommit_transaction():
+    # Connect-time topology/plugin queries can leave a non-autocommit
+    # connection in a transaction -- on a NON-Aurora target a failed Aurora
+    # query leaves psycopg's txn ABORTED. connect() must roll it back before
+    # handing the connection to the caller, otherwise the first real query
+    # dies with InFailedSqlTransaction (regression once default plugins
+    # auto-load on plain Postgres).
+    import psycopg
+    raw_conn = _make_mock_async_conn()
+    raw_conn.autocommit = False  # not autocommit -> a txn can linger
+    raw_conn.info.transaction_status = psycopg.pq.TransactionStatus.INERROR
+
+    async def _body() -> None:
+        await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+            plugins="",
+        )
+
+    asyncio.run(_body())
+    raw_conn.rollback.assert_awaited()
+
+
+def test_connect_does_not_roll_back_autocommit_connection():
+    # An autocommit connection has no lingering transaction, so connect() must
+    # NOT issue a spurious rollback (guards the gate above).
+    raw_conn = _make_mock_async_conn()  # autocommit=True by default
+
+    async def _body() -> None:
+        await AsyncAwsWrapperConnection.connect(
+            target=_build_mock_psycopg_connect(raw_conn),
+            conninfo="host=h user=u password=p dbname=d port=5432",
+            plugins="",
+        )
+
+    asyncio.run(_body())
+    raw_conn.rollback.assert_not_awaited()
+
+
 def test_connection_getattr_forwards_to_raw_conn():
     raw_conn = _make_mock_async_conn()
     raw_conn.info = "pgconn-info-sentinel"
