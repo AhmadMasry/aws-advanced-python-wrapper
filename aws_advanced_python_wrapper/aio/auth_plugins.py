@@ -38,6 +38,7 @@ from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.iam_utils import IamAuthUtils
+from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
         AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
+
+logger = Logger(__name__)
 
 
 class AsyncAuthPluginBase(AsyncPlugin):
@@ -213,18 +216,30 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
         # from sslmode=require and mysql.connector negotiates it by default, but
         # aiomysql does NOT auto-negotiate TLS -- so without this the token is
         # never sent and the server reports "Access denied ... (using password:
-        # NO)" (test_iam_*_async). Enable TLS for aiomysql IAM connections,
-        # matching PG's sslmode=require semantics (encrypt; cert verification
-        # stays opt-in via a caller-supplied ssl context). Only aiomysql needs
-        # it; respect any TLS config the caller already provided.
-        if getattr(driver_dialect, "_driver_name", None) != "aiomysql":
+        # NO)" (test_iam_*_async). Only aiomysql needs the nudge.
+        if driver_dialect.driver_name != "aiomysql":
             return
+        # Respect any TLS config the caller already provided -- this is the
+        # supported path to a *verifying* connection: pass the RDS CA bundle
+        # via ``ssl_ca`` (or a fully-configured ``ssl`` context).
         if props.get("ssl") is not None or props.get("ssl_ca") is not None:
             return
+
         import ssl as _ssl
         ctx = _ssl.create_default_context()
+        # We cannot verify the server certificate here: the Amazon RDS CA is
+        # NOT in the system trust store (unlike public-web certs), and no
+        # ``ssl_ca`` was supplied -- so ``create_default_context()`` would fail
+        # the handshake against a real RDS endpoint. Encrypt anyway (the IAM
+        # token must never cross the wire in cleartext), but the channel is
+        # then encrypted-but-not-authenticated (MITM-exposable for a credential).
+        # Warn unless the caller explicitly opted out of verification via
+        # ``ssl_secure=false`` -- never downgrade silently. The remediation
+        # (supply ``ssl_ca``) is in the warning message.
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
+        if WrapperProperties.SSL_SECURE.get_bool(props):
+            logger.warning("IamAuthPlugin.UnverifiedTlsForIamToken")
         props["ssl"] = ctx
 
     def _default_port(self) -> int:
