@@ -75,6 +75,38 @@ class AsyncPsycopgDriverDialect(AsyncDriverDialect):
                            psycopg.AsyncConnection.connect)
         return target is expected
 
+    def prepare_connect_info(self, host_info: "HostInfo", props: "Properties") -> "Properties":
+        # The base strips wrapper-internal props (including connect_timeout and
+        # the tcp-keepalive settings) via remove_wrapper_props. Re-add the
+        # driver-level params psycopg understands, mirroring the SYNC
+        # PgDriverDialect.prepare_connect_info. Without connect_timeout an async
+        # connect to a down/unreachable host -- e.g. the just-demoted old writer
+        # during failover -- hangs at the OS TCP timeout (~2 min) instead of the
+        # configured bound, which burns the failover deadline on multi-instance
+        # clusters (test_writer_failover_in_idle_connections_async on multi-5).
+        from aws_advanced_python_wrapper.utils.properties import \
+            WrapperProperties
+        prepared = super().prepare_connect_info(host_info, props)
+
+        connect_timeout = WrapperProperties.CONNECT_TIMEOUT_SEC.get(props)
+        if connect_timeout is not None:
+            prepared["connect_timeout"] = connect_timeout
+
+        keepalive = WrapperProperties.TCP_KEEPALIVE.get(props)
+        if keepalive is not None:
+            prepared["keepalives"] = keepalive
+        keepalive_time = WrapperProperties.TCP_KEEPALIVE_TIME_SEC.get(props)
+        if keepalive_time is not None:
+            prepared["keepalives_idle"] = keepalive_time
+        keepalive_interval = WrapperProperties.TCP_KEEPALIVE_INTERVAL_SEC.get(props)
+        if keepalive_interval is not None:
+            prepared["keepalives_interval"] = keepalive_interval
+        keepalive_probes = WrapperProperties.TCP_KEEPALIVE_PROBES.get(props)
+        if keepalive_probes is not None:
+            prepared["keepalives_count"] = keepalive_probes
+
+        return prepared
+
     async def connect(
             self,
             host_info: HostInfo,
