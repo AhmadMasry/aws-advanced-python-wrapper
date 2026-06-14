@@ -37,7 +37,10 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, List,
                     Optional, Protocol, Tuple, runtime_checkable)
 
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
+from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
+
+logger = Logger(__name__)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -343,9 +346,16 @@ class AsyncAuroraHostListProvider:
             async with connection.cursor() as cur:
                 await cur.execute(self._topology_query)
                 return list(await cur.fetchall())
-        except Exception:
+        except Exception as ex:
             # A failed topology probe should not raise into the caller;
             # the caller will see an empty topology and fall back to cache.
+            # Log so a genuinely broken query (wrong SQL after a dialect
+            # upgrade, missing permissions) is distinguishable from a
+            # genuinely empty result -- otherwise failover silently degrades
+            # to the seed host with no signal.
+            logger.debug(
+                f"[AsyncAuroraHostListProvider] topology query failed; "
+                f"returning empty topology (caller falls back to cache): {ex}")
             return []
 
     def _rows_to_topology(self, rows: List[tuple]) -> Topology:
@@ -518,9 +528,14 @@ class AsyncMultiAzHostListProvider(AsyncAuroraHostListProvider):
 
             self._writer_id = writer_id
             return rows
-        except Exception:
+        except Exception as ex:
             # Mirror AsyncAuroraHostListProvider: a failed probe yields
-            # an empty topology rather than raising into the caller.
+            # an empty topology rather than raising into the caller. Log so a
+            # broken query (post dialect-upgrade SQL, permissions) is not
+            # silently indistinguishable from an empty cluster.
+            logger.debug(
+                f"[AsyncMultiAzHostListProvider] topology query failed; "
+                f"returning empty topology (caller falls back to cache): {ex}")
             return []
 
     def _rows_to_topology(self, rows: List[tuple]) -> Topology:

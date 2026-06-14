@@ -48,6 +48,7 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional,
                     Set, Tuple)
 
 from aws_advanced_python_wrapper.hostinfo import HostRole
+from aws_advanced_python_wrapper.utils.log import Logger
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.host_list_provider import (
@@ -56,6 +57,8 @@ if TYPE_CHECKING:
         AsyncPluginService
     from aws_advanced_python_wrapper.hostinfo import HostInfo
     from aws_advanced_python_wrapper.utils.properties import Properties
+
+logger = Logger(__name__)
 
 
 class AsyncClusterTopologyMonitor:
@@ -179,7 +182,10 @@ class AsyncClusterTopologyMonitor:
         if self._owned_conn is None:
             try:
                 self._owned_conn = await self._connection_factory()
-            except Exception:  # noqa: BLE001 - retry on a later tick
+            except Exception as ex:  # noqa: BLE001 - retry on a later tick
+                logger.debug(
+                    f"[AsyncClusterTopologyMonitor] failed to open a dedicated "
+                    f"monitoring connection; will retry next tick: {ex}")
                 self._owned_conn = None
         return self._owned_conn
 
@@ -200,11 +206,17 @@ class AsyncClusterTopologyMonitor:
                         topology = await self._fetch_via_provider(conn)
                         self._last_topology = topology
                         self._check_for_writer_change(topology)
-                    except Exception:
+                    except Exception as ex:
                         # Monitor failures shouldn't crash the task; the cached
                         # topology remains usable. A failure may mean the owned
                         # connection died (e.g. its instance was failed over) --
-                        # drop it so the next tick reopens to a live host.
+                        # drop it so the next tick reopens to a live host. Log
+                        # so a PERSISTENTLY failing monitor (auth/query mismatch)
+                        # isn't invisible while topology silently goes stale.
+                        logger.debug(
+                            f"[AsyncClusterTopologyMonitor] topology refresh "
+                            f"tick failed; dropping monitoring connection and "
+                            f"retrying next tick: {ex}")
                         await self._drop_owned_connection()
                 elif self._should_panic():
                     self._spawn_panic_probes()

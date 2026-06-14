@@ -34,10 +34,13 @@ from aws_advanced_python_wrapper.database_dialect import DatabaseDialectManager
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           PropertiesUtils,
                                                           WrapperProperties)
+
+logger = Logger(__name__)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.aio.driver_dialect.base import \
@@ -472,14 +475,20 @@ class AsyncAwsWrapperConnection:
         if ss is not None:
             try:
                 await ss.setup_pristine_autocommit(value)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as ex:  # noqa: BLE001
+                logger.debug(
+                    f"[AsyncAwsWrapperConnection] failed to record pristine "
+                    f"autocommit in session state; it may not be restored on a "
+                    f"connection switch: {ex}")
         await self._plugin_service.driver_dialect.set_autocommit(self._target_conn, value)
         if ss is not None:
             try:
                 ss.set_autocommit(value)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as ex:  # noqa: BLE001
+                logger.debug(
+                    f"[AsyncAwsWrapperConnection] failed to record autocommit "
+                    f"in session state; it may not survive a connection "
+                    f"switch (failover / RWS): {ex}")
 
     @property
     def isolation_level(self) -> Any:
@@ -961,8 +970,10 @@ class AsyncAwsWrapperConnection:
         # connections_async). Best-effort: static/no-topology providers no-op.
         try:
             await plugin_service.force_refresh_host_list(target_conn)
-        except Exception:  # noqa: BLE001 - topology is (re)fetched on demand
-            pass
+        except Exception as ex:  # noqa: BLE001 - topology is (re)fetched on demand
+            logger.debug(
+                f"[AsyncAwsWrapperConnection] connect-time topology refresh "
+                f"failed; topology will be (re)fetched on demand: {ex}")
 
         # Connect-time topology/role queries -- the eager refresh above and the
         # Aurora-aware default plugins' connect hooks (initial_connection,
