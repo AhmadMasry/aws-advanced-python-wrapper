@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import gc
+from time import monotonic, sleep
 
 import pytest
 from sqlalchemy import PoolProxiedConnection
@@ -291,20 +292,50 @@ class TestReadWriteSplitting:
         self, test_driver: TestDriver, props, conn_utils, rds_utils
     ):
         target_driver_connect = DriverHelper.get_connect_func(test_driver)
-        with AwsWrapperConnection.connect(
-            target_driver_connect,
-            **conn_utils.get_connect_params(conn_utils.reader_cluster_host),
-            **props,
-        ) as conn:
-            reader_id = rds_utils.query_instance_id(conn)
+        # The reader cluster (cluster-ro) endpoint can route the initial
+        # connection to the WRITER on thin clusters (e.g. 2-instance) when the
+        # lone read-replica isn't in the reader endpoint's rotation -- Aurora's
+        # documented "reader endpoint falls back to the writer" behavior. This
+        # test's premise is a READER initial connection, so poll until cluster-ro
+        # actually serves one. If it never does within the budget the environment
+        # can't provide the precondition, so skip -- this is NOT a wrapper defect
+        # (the wrapper connects where cluster-ro points and reports the role
+        # faithfully via get_host_role; @@innodb_read_only=0 means the server
+        # itself declared it the writer).
+        writer_id = rds_utils.get_cluster_writer_instance_id()
+        conn = None
+        reader_id = None
+        # 5 min budget: cluster-ro converges to the reader within ~minutes of
+        # provisioning (measured ~3-5 min, both engines); only the first test
+        # run before convergence pays the wait, the rest pass immediately.
+        deadline = monotonic() + 300
+        while monotonic() < deadline:
+            conn = AwsWrapperConnection.connect(
+                target_driver_connect,
+                **conn_utils.get_connect_params(conn_utils.reader_cluster_host),
+                **props,
+            )
+            candidate = rds_utils.query_instance_id(conn)
+            if candidate != writer_id:
+                reader_id = candidate
+                break
+            conn.close()
+            conn = None
+            sleep(5)
+        if reader_id is None:
+            pytest.skip(
+                "reader cluster endpoint never routed to a reader within ~5 min "
+                "(environmental: lone replica not in the RO rotation)")
 
+        assert conn is not None  # set whenever reader_id is (type-narrowing)
+        with conn:
             conn.read_only = True
             current_id = rds_utils.query_instance_id(conn)
             assert reader_id == current_id
 
             conn.read_only = False
-            writer_id = rds_utils.query_instance_id(conn)
-            assert reader_id != writer_id
+            new_writer_id = rds_utils.query_instance_id(conn)
+            assert reader_id != new_writer_id
 
     def test_set_read_only_false__read_only_transaction(
         self, test_driver: TestDriver, props, conn_utils, rds_utils

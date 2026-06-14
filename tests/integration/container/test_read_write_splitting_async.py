@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+from time import monotonic
 from typing import TYPE_CHECKING
 
 import pytest
@@ -333,21 +334,49 @@ class TestReadWriteSplittingAsync:
         self, test_driver: TestDriver, props, conn_utils, rds_utils
     ):
         async def inner():
-            conn = await connect_async(
-                test_driver=test_driver,
-                connect_params=conn_utils.get_connect_params(conn_utils.reader_cluster_host),
-                **dict(props),
-            )
-            try:
-                reader_id = await query_instance_id_async(conn, rds_utils)
+            # See the sync variant: the reader cluster (cluster-ro) endpoint can
+            # route the initial connection to the WRITER on thin clusters when
+            # the lone read-replica isn't in the reader endpoint's rotation
+            # (Aurora's documented reader-endpoint-falls-back-to-writer). This
+            # test's premise is a READER initial connection, so poll until
+            # cluster-ro serves one; skip as environmental if it never does
+            # within the budget (not a wrapper defect).
+            writer_id = rds_utils.get_cluster_writer_instance_id()
+            conn = None
+            reader_id = None
+            # 5 min budget (see sync variant): cluster-ro converges to the
+            # reader within ~minutes of provisioning; only the first test run
+            # before convergence pays the wait.
+            deadline = monotonic() + 300
+            while monotonic() < deadline:
+                conn = await connect_async(
+                    test_driver=test_driver,
+                    connect_params=conn_utils.get_connect_params(conn_utils.reader_cluster_host),
+                    **dict(props),
+                )
+                candidate = await query_instance_id_async(conn, rds_utils)
+                if candidate != writer_id:
+                    reader_id = candidate
+                    break
+                await conn.close()
+                conn = None
+                await asyncio.sleep(5)
+            if reader_id is None:
+                if conn is not None:
+                    await conn.close()
+                await cleanup_async()
+                pytest.skip(
+                    "reader cluster endpoint never routed to a reader within ~5 min "
+                    "(environmental: lone replica not in the RO rotation)")
 
+            try:
                 await conn.set_read_only(True)
                 current_id = await query_instance_id_async(conn, rds_utils)
                 assert reader_id == current_id
 
                 await conn.set_read_only(False)
-                writer_id = await query_instance_id_async(conn, rds_utils)
-                assert reader_id != writer_id
+                new_writer_id = await query_instance_id_async(conn, rds_utils)
+                assert reader_id != new_writer_id
             finally:
                 await conn.close()
                 await cleanup_async()
