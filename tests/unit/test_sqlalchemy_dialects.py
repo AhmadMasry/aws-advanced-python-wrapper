@@ -261,6 +261,7 @@ def test_async_dialects_define_do_ping():
         AwsWrapperMySQLAiomysqlAsyncDialect
     from aws_advanced_python_wrapper.sqlalchemy_dialects.pg_async import \
         AwsWrapperPGPsycopgAsyncDialect
+
     # Each defines its own do_ping (not merely inherited from the stock base).
     assert "do_ping" in AwsWrapperMySQLAiomysqlAsyncDialect.__dict__
     assert "do_ping" in AwsWrapperPGPsycopgAsyncDialect.__dict__

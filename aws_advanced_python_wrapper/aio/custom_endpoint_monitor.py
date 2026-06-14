@@ -34,11 +34,11 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
                     Set, Tuple)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
+from aws_advanced_python_wrapper.allowed_and_blocked_hosts import \
+    AllowedAndBlockedHosts
 # Reuse the sync data classes -- they're pure holders, no I/O.
 from aws_advanced_python_wrapper.custom_endpoint_plugin import (
     CustomEndpointInfo, CustomEndpointRoleType)
-from aws_advanced_python_wrapper.allowed_and_blocked_hosts import \
-    AllowedAndBlockedHosts
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties

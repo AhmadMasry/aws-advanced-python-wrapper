@@ -198,14 +198,14 @@ def test_run_async_bypasses_plugin_chain_on_both_wrappers() -> None:
     # plugin pipeline.
     async_wrapper = _async_wrapper(MagicMock())
     asyncio.run(greenlet_spawn(lambda: async_wrapper.run_async(_fn)))
-    async_wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[union-attr]
+    async_wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[attr-defined]
 
     # Sync wrapper: run_async is intentionally unsupported (c0ca385); it
     # raises before any plugin work, so the chain is likewise untouched.
     sync_wrapper = _sync_wrapper(MagicMock())
     with pytest.raises(NotImplementedError):
         asyncio.run(greenlet_spawn(lambda: sync_wrapper.run_async(_fn)))
-    sync_wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[union-attr]
+    sync_wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[attr-defined]
 
 
 # ---- SA AdaptedConnection duck-type contract verification ------------

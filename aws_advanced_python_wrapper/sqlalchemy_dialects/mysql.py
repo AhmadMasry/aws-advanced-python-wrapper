@@ -118,6 +118,7 @@ class AwsWrapperMySQLConnectorDialect(
         # do_execute reaches the mixin.
         from aws_advanced_python_wrapper.errors import (FailoverError,
                                                         FailoverFailedError)
+
         # Catch the whole FailoverError family (FailoverSuccessError,
         # FailoverFailedError, AND TransactionResolutionUnknownError) before the
         # upstream is_disconnect probes ``e.errno`` -- none of them carry the

@@ -30,8 +30,8 @@ if TYPE_CHECKING:
         AsyncDriverDialect
     from aws_advanced_python_wrapper.database_dialect import DatabaseDialect
     from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
-    from aws_advanced_python_wrapper.utils.notifications import (ConnectionEvent,
-                                                                 HostEvent)
+    from aws_advanced_python_wrapper.utils.notifications import (
+        ConnectionEvent, HostEvent)
     from aws_advanced_python_wrapper.utils.properties import Properties
 
 

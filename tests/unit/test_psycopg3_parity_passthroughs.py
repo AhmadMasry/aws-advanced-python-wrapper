@@ -367,7 +367,9 @@ def test_async_wrapper_set_read_only_routes_through_plugin_pipeline() -> None:
     asyncio.run(wrapper.set_read_only(True))
     wrapper._plugin_manager.execute.assert_awaited_once()
     # Routed under CONNECTION_SET_READ_ONLY with the value as the trailing arg.
-    await_args = wrapper._plugin_manager.execute.await_args.args
+    await_call = wrapper._plugin_manager.execute.await_args
+    assert await_call is not None
+    await_args = await_call.args
     assert await_args[1] == DbApiMethod.CONNECTION_SET_READ_ONLY
     assert await_args[3] is True
 

@@ -24,8 +24,7 @@ is cheap.
 from __future__ import annotations
 
 import asyncio
-from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
-                    Set)
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
 
 from aws_advanced_python_wrapper.aio._rws_failover_eviction import \
     _AsyncRwsFailoverEvictionMixin

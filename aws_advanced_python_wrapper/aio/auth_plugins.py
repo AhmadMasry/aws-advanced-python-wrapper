@@ -37,8 +37,8 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional,
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
-from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.iam_utils import IamAuthUtils
+from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import WrapperProperties
 from aws_advanced_python_wrapper.utils.rds_url_type import RdsUrlType
 from aws_advanced_python_wrapper.utils.rds_utils import RdsUtils
@@ -422,8 +422,7 @@ class AsyncAwsSecretsManagerPlugin(AsyncAuthPluginBase):
         # secret id raises ClientError (ResourceNotFoundException); a bad region
         # raises EndpointConnectionError. Callers (and the negative-path tests)
         # expect AwsWrapperError, not the raw botocore exception.
-        from botocore.exceptions import (ClientError,
-                                         EndpointConnectionError)
+        from botocore.exceptions import ClientError, EndpointConnectionError
         try:
             secret = await asyncio.to_thread(
                 self._fetch_secret_blocking, secret_id, region, endpoint

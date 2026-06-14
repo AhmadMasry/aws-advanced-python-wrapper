@@ -75,7 +75,7 @@ class AsyncPsycopgDriverDialect(AsyncDriverDialect):
                            psycopg.AsyncConnection.connect)
         return target is expected
 
-    def prepare_connect_info(self, host_info: "HostInfo", props: "Properties") -> "Properties":
+    def prepare_connect_info(self, host_info: HostInfo, props: Properties) -> Properties:
         # The base strips wrapper-internal props (including connect_timeout and
         # the tcp-keepalive settings) via remove_wrapper_props. Re-add the
         # driver-level params psycopg understands, mirroring the SYNC

@@ -242,6 +242,7 @@ class AwsWrapperMySQLAiomysqlAsyncDialect(
         # this handles the cursor-creation path that runs earlier.
         from aws_advanced_python_wrapper.errors import (FailoverError,
                                                         FailoverFailedError)
+
         # Catch the whole FailoverError family -- including
         # TransactionResolutionUnknownError -- before upstream probes
         # ``e.errno`` / ``e.args[0]`` (the wrapper errors carry neither). Only

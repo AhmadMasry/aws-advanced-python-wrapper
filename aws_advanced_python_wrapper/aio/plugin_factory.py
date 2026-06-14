@@ -102,8 +102,8 @@ class _GdbReadWriteSplittingFactory:
             raise AwsWrapperError(
                 "gdb_rw plugin requires a host_list_provider"
             )
-        from aws_advanced_python_wrapper.aio.gdb_read_write_splitting_plugin \
-            import AsyncGdbReadWriteSplittingPlugin
+        from aws_advanced_python_wrapper.aio.gdb_read_write_splitting_plugin import \
+            AsyncGdbReadWriteSplittingPlugin
         return AsyncGdbReadWriteSplittingPlugin(
             plugin_service, host_list_provider, props
         )
