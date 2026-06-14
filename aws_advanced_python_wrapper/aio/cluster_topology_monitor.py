@@ -232,6 +232,19 @@ class AsyncClusterTopologyMonitor:
             # Close the monitor's dedicated connection (if any) so we don't
             # leak it past task shutdown.
             await self._drop_owned_connection()
+            # A panic-mode probe may have stashed a verified-writer connection
+            # for the failover caller to claim_verified_writer(). If the monitor
+            # is stopped (release_resources_async / shutdown hook) before the
+            # caller claims it, that connection would leak -- a winning probe
+            # task is already done(), so the cancellation above doesn't touch it.
+            # Close it explicitly to honor the no-leak / release_resources_async
+            # invariant (for aiomysql it otherwise strands a socket + session).
+            if self._verified_writer_conn is not None:
+                await self._close_best_effort(self._verified_writer_conn)
+                self._verified_writer_conn = None
+                self._verified_writer_host_info = None
+                self._is_verified_writer_connection = False
+                self._writer_found_event.clear()
 
     def _should_panic(self) -> bool:
         """Enter panic mode iff ``probe_host`` is wired, we have a known

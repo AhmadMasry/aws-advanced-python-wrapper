@@ -751,12 +751,15 @@ def test_topology_monitor_probe_winner_sets_verified_writer():
     async def _run():
         monitor.start()
         await asyncio.sleep(0.1)
+        # Observe while the monitor is alive -- this is when failover claims
+        # the verified writer. (On stop() an unclaimed conn is closed; see
+        # test_monitor_closes_stashed_verified_writer_on_stop.)
+        assert monitor._is_verified_writer_connection is True
+        assert monitor._verified_writer_conn is winner_conn
+        assert monitor._verified_writer_host_info is h2
         await monitor.stop()
 
     asyncio.run(_run())
-    assert monitor._is_verified_writer_connection is True
-    assert monitor._verified_writer_conn is winner_conn
-    assert monitor._verified_writer_host_info is h2
 
 
 def test_topology_monitor_claim_verified_writer_is_one_shot():
@@ -877,12 +880,14 @@ def test_topology_monitor_loser_probe_closes_its_conn():
     async def _run():
         monitor.start()
         await asyncio.sleep(0.15)
+        # While alive: loser closed during the race, winner retained (claimable).
+        loser_conn.close.assert_called()
+        winner_conn.close.assert_not_called()
         await monitor.stop()
 
     asyncio.run(_run())
-    # Loser closed; winner retained
-    loser_conn.close.assert_called()
-    winner_conn.close.assert_not_called()
+    # On stop the unclaimed winner is closed too -- not leaked (audit C2).
+    winner_conn.close.assert_called()
 
 
 def test_probe_two_writers_only_first_wins_second_closes_conn():
@@ -917,13 +922,16 @@ def test_probe_two_writers_only_first_wins_second_closes_conn():
     async def _run():
         monitor.start()
         await asyncio.sleep(0.1)
+        # While alive: h1 won and its conn is retained; h2's "also a writer"
+        # conn was closed.
+        assert monitor._verified_writer_conn is winner_conn
+        loser_conn.close.assert_called()
+        winner_conn.close.assert_not_called()
         await monitor.stop()
 
     asyncio.run(_run())
-    # h1 won; its conn retained. h2's "also a writer" conn was closed.
-    assert monitor._verified_writer_conn is winner_conn
-    loser_conn.close.assert_called()
-    winner_conn.close.assert_not_called()
+    # On stop the unclaimed winner is closed too -- not leaked (audit C2).
+    winner_conn.close.assert_called()
 
 
 def test_canceled_probe_conn_closed_on_shutdown():
@@ -1015,3 +1023,41 @@ def test_build_probe_host_propagates_connect_errors():
     probe = build_probe_host(svc, Properties({"host": "h"}))
     with pytest.raises(OSError):
         asyncio.run(probe(HostInfo(host="h", port=5432)))
+
+
+def test_monitor_closes_stashed_verified_writer_on_stop():
+    """Audit C2 regression guard: a panic-mode verified-writer connection left
+    unclaimed (the failover caller never called claim_verified_writer) must be
+    closed when the monitor stops, not leaked. A winning probe task is already
+    done(), so the finally's probe-task cancellation doesn't cover it."""
+    from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+    topology = (HostInfo(host="w1", port=5432, role=HostRole.WRITER),)
+    provider = MagicMock()
+    provider.force_refresh = AsyncMock(return_value=topology)
+
+    stashed = MagicMock(name="verified-writer-conn")
+    stashed.close = AsyncMock()
+
+    monitor = AsyncClusterTopologyMonitor(
+        provider=provider,
+        connection_getter=lambda: MagicMock(name="monitor-conn"),
+        refresh_interval_sec=0.2,
+        high_refresh_rate_sec=0.05,
+    )
+
+    async def _run_briefly():
+        monitor.start()
+        await asyncio.sleep(0.02)
+        # Simulate a panic probe that found a writer and stashed it for a
+        # failover caller that never claimed it.
+        monitor._verified_writer_conn = stashed
+        monitor._verified_writer_host_info = HostInfo(
+            host="w1", port=5432, role=HostRole.WRITER)
+        monitor._is_verified_writer_connection = True
+        await monitor.stop()
+
+    asyncio.run(_run_briefly())
+    stashed.close.assert_awaited_once()
+    assert monitor._verified_writer_conn is None
+    assert monitor._is_verified_writer_connection is False
