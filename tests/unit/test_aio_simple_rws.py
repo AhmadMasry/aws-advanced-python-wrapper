@@ -251,6 +251,63 @@ def test_verify_retries_then_falls_back_when_role_mismatches_and_current_usable(
     asyncio.run(_body())
 
 
+def test_connect_does_not_seed_cache_when_role_unverified():
+    """Audit C1 regression guard. If _verify_role can't confirm the expected
+    role, connect() falls back to a plain connection but must NOT seed the
+    reader/writer cache from it: its actual role is unknown, and a wrong-role
+    seed would make a later set_read_only REUSE a mislabelled connection
+    (e.g. a writer cached as the reader) and never switch."""
+    async def _body() -> None:
+        # Expect READER (via the type prop) but every probe says WRITER ->
+        # _verify_role exhausts retries and returns None.
+        svc, dd = _build_plugin_service(role_returns=HostRole.WRITER)
+        props = _base_props(**{
+            WrapperProperties.SRW_VERIFY_INITIAL_CONNECTION_TYPE.name: "reader",
+        })
+        plugin = AsyncSimpleReadWriteSplittingPlugin(svc, props)
+        fallback = MagicMock(name="fallback-conn")
+
+        async def _connect_func() -> Any:
+            return fallback
+
+        result = await plugin.connect(
+            MagicMock(), dd,
+            HostInfo(host="reader.cluster-ro-x.rds.amazonaws.com", port=5432),
+            props, True, _connect_func)
+
+        assert result is fallback
+        assert plugin._reader_conn is None
+        assert plugin._writer_conn is None
+
+    asyncio.run(_body())
+
+
+def test_connect_seeds_cache_only_with_verified_connection():
+    """Positive companion: when the probe confirms the expected role, the
+    verified connection IS seeded so set_read_only can reuse it."""
+    async def _body() -> None:
+        svc, dd = _build_plugin_service(role_returns=HostRole.READER)
+        props = _base_props(**{
+            WrapperProperties.SRW_VERIFY_INITIAL_CONNECTION_TYPE.name: "reader",
+        })
+        plugin = AsyncSimpleReadWriteSplittingPlugin(svc, props)
+        initial_conn = MagicMock(name="initial-conn")
+
+        async def _connect_func() -> Any:
+            return initial_conn
+
+        result = await plugin.connect(
+            MagicMock(), dd,
+            HostInfo(host="reader.cluster-ro-x.rds.amazonaws.com", port=5432),
+            props, True, _connect_func)
+
+        assert result is initial_conn
+        assert plugin._reader_conn is initial_conn
+        assert plugin._writer_conn is None
+
+    asyncio.run(_body())
+
+
 def test_reader_switch_failure_raises_when_current_connection_unusable():
     """If no verified reader can be opened AND the current connection is
     closed, set_read_only(True) propagates -- there is no safe fallback."""

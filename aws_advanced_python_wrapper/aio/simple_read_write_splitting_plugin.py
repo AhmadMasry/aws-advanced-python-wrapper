@@ -153,12 +153,20 @@ class AsyncSimpleReadWriteSplittingPlugin(
         if expected is None:
             return await connect_func()
 
-        conn = await self._verify_role(
+        verified = await self._verify_role(
             driver_dialect, host_info, expected, connect_func=connect_func)
-        if conn is None:
-            conn = await connect_func()
         self._plugin_service.initial_connection_host_info = host_info
-        # Seed the role cache with the initial connection so a later
+
+        if verified is None:
+            # _verify_role exhausted its retries without confirming `expected`
+            # (e.g. the cluster-ro endpoint kept routing to the writer, or the
+            # probe errored). Fall back to a plain connection, but do NOT seed
+            # the role cache from it: its ACTUAL role is unknown, and caching it
+            # as `expected` would make a later set_read_only REUSE a mislabelled
+            # connection (e.g. a writer cached as the reader) and never switch.
+            return await connect_func()
+
+        # Seed the role cache only with the VERIFIED connection so a later
         # set_read_only REUSES it instead of opening a fresh read/write-endpoint
         # connection. Without this, connecting via the reader-cluster (cluster-ro)
         # endpoint then set_read_only(True) opens a NEW cluster-ro connection,
@@ -166,12 +174,12 @@ class AsyncSimpleReadWriteSplittingPlugin(
         # breaks "stay on the same reader"
         # (test_connect_to_reader_cluster__switch_read_only_async, multi-5).
         # The regular RWS plugin gets this via notify_connection_changed; srw has
-        # no such hook, so seed here.
+        # no such hook, so seed here -- but only because the role is confirmed.
         if expected == HostRole.READER:
-            self._reader_conn = conn
+            self._reader_conn = verified
         elif expected == HostRole.WRITER:
-            self._writer_conn = conn
-        return conn
+            self._writer_conn = verified
+        return verified
 
     async def execute(
             self,
