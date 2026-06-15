@@ -19,15 +19,13 @@
 Salvaged from main's PR #1224 and now bound to the wrapper's own dialect via
 the ``mysql+aws_wrapper_mysqlconnector://`` URL (see SqlAlchemySupport.md).
 
-PENDING VERIFICATION (do after the EC2/Aurora run confirms the merge is
-clean): these tests connect with mysql-connector's default C extension --
-they do NOT set ``use_pure=True``. The README recommends ``use_pure=True``
-for Aurora MySQL because the C extension's ``is_connected`` can block
-indefinitely on network failure, which is exactly what the failover tests
-here provoke. If these flake/hang on failover, add ``use_pure=True`` to the
-engine URLs. Tracked because the wrapper's MySQL SA dialect is already
-verified under ``use_pure=True`` elsewhere (test_sqlalchemy.py), but these
-ORM-level failover paths are not yet exercised on real Aurora.
+Validated on real Aurora MySQL (EC2 run, 2026-06-15): these pass on
+mysql-connector's default C extension -- including the failover variants
+(failover_during_query, iam_plugin, secrets_manager) -- so ``use_pure=True``
+is NOT required here. The README's concern that the C extension's
+``is_connected`` can block on network failure did not bite for these
+ORM-level failover paths. (The MySQL SA dialect is separately exercised under
+``use_pure=True`` in test_sqlalchemy.py.)
 """
 
 from __future__ import annotations
