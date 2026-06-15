@@ -115,7 +115,12 @@ class AsyncPsycopgDriverDialect(AsyncDriverDialect):
         prepared = self.prepare_connect_info(host_info, props)
         # psycopg.AsyncConnection.connect accepts conninfo + kwargs or all
         # kwargs. Our prepared dict is kwargs-style (host, port, user, ...).
-        return await connect_func(**prepared)
+        # Route through execute_connect (like the aiomysql dialect) so the
+        # dialect's own connect path and AsyncDriverConnectionProvider share
+        # one per-driver connect hook -- psycopg's execute_connect is the
+        # base pass-through today, but this keeps the two paths consistent if
+        # a psycopg-specific override (e.g. an outer timeout) is ever added.
+        return await self.execute_connect(connect_func, prepared, props)
 
     async def is_closed(self, conn: Any) -> bool:
         # psycopg.AsyncConnection exposes `closed` as a sync property.

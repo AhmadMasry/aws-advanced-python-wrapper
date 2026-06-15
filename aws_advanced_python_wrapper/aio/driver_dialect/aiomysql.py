@@ -38,11 +38,14 @@ from aws_advanced_python_wrapper.aio.driver_dialect.base import \
     AsyncDriverDialect
 from aws_advanced_python_wrapper.driver_dialect_codes import DriverDialectCodes
 from aws_advanced_python_wrapper.pep249_methods import DbApiMethod
+from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.properties import (Properties,
                                                           WrapperProperties)
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.hostinfo import HostInfo
+
+logger = Logger(__name__)
 
 
 class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
@@ -195,7 +198,19 @@ class AsyncAiomysqlDriverDialect(AsyncDriverDialect):
         if callable(get_txn):
             return bool(get_txn())
         ga = getattr(conn, "get_autocommit", None)
-        return (not ga()) if callable(ga) else False
+        if callable(ga):
+            # Fallback heuristic (autocommit off => assume in-transaction).
+            # Less accurate than SERVER_STATUS_IN_TRANS; reachable only for an
+            # unexpected connection shape lacking get_transaction_status.
+            return not ga()
+        # Neither method present: an unexpected connection shape on the
+        # connect-time rollback / RWS-switch hot path. Log rather than silently
+        # returning False (which could skip a needed rollback).
+        logger.debug(
+            "[AsyncAiomysqlDriverDialect] is_in_transaction: connection "
+            f"exposes neither get_transaction_status nor get_autocommit "
+            f"({type(conn).__name__}); assuming not in transaction")
+        return False
 
     async def get_autocommit(self, conn: Any) -> bool:
         return bool(conn.get_autocommit())

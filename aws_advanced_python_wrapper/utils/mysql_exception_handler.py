@@ -90,7 +90,12 @@ class MySQLExceptionHandler(ExceptionHandler):
         if hasattr(error, 'msg') and error.msg is not None and self._UNAVAILABLE_CONNECTION in error.msg:
             return True
 
-        if hasattr(error, 'args') and len(error.args) == 1:
+        if (hasattr(error, 'args') and len(error.args) == 1
+                and isinstance(error.args[0], str)):
+            # Guard isinstance: a pymysql error can carry a single INT arg
+            # (e.g. OperationalError(2013) with no message); ``str in int``
+            # would raise TypeError into the failover classifier. The int
+            # network-error case is already handled by the errno branch above.
             return self._UNAVAILABLE_CONNECTION in error.args[0]
 
         return False

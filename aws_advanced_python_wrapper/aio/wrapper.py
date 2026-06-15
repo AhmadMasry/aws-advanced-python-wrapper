@@ -598,7 +598,7 @@ class AsyncAwsWrapperConnection:
 
         The async driver dialect's ``is_closed`` is a coroutine, but every
         supported async driver exposes closed-state synchronously
-        (psycopg ``AsyncConnection.closed``; aiomysql ``Connection.open``),
+        (psycopg ``AsyncConnection.closed``; aiomysql ``Connection.closed``),
         so we answer here without awaiting. Without this property
         ``__getattr__`` forwards ``is_closed`` to the raw driver connection,
         which has no such attribute -> AttributeError.
@@ -606,7 +606,9 @@ class AsyncAwsWrapperConnection:
         target = self._target_conn
         if hasattr(target, "closed"):
             return bool(target.closed)
-        # aiomysql Connection exposes ``open`` (inverse of closed), not ``closed``.
+        # Both psycopg's AsyncConnection and aiomysql 0.3.2's Connection expose
+        # ``closed``; the ``open`` fallback covers a pool proxy of the
+        # pymysql/mysql.connector shape (``open``, the inverse of ``closed``).
         if hasattr(target, "open"):
             return not bool(target.open)
         return False
