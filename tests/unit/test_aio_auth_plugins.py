@@ -162,11 +162,13 @@ def _dialect(driver_name):
     return d
 
 
-def test_iam_aiomysql_no_tls_config_encrypts_and_warns():
+def test_iam_aiomysql_no_tls_config_encrypts_without_verify_silently():
     """aiomysql doesn't auto-negotiate TLS, so the cleartext IAM token would be
-    dropped. We enable encryption, but since the RDS CA isn't in the system
-    trust store and no ssl_ca was given we cannot verify -- so we must WARN
-    (not silently downgrade)."""
+    dropped. We enable encryption but do NOT verify the cert (the RDS CA isn't
+    in the system trust store and no ssl_ca was given). This matches the SYNC
+    driver's posture exactly -- mysql.connector negotiates TLS by default with
+    ssl_verify_cert=False -- so, like the sync IamAuthPlugin, we stay SILENT
+    (no warning). Verification is opt-in via ssl_ca."""
     import ssl
     props = Properties({"host": "h", "port": "3306", "user": "app"})
     plugin = AsyncIamAuthPlugin(_svc(props), props)
@@ -176,8 +178,7 @@ def test_iam_aiomysql_no_tls_config_encrypts_and_warns():
     assert isinstance(ctx, ssl.SSLContext)
     assert ctx.verify_mode == ssl.CERT_NONE
     assert ctx.check_hostname is False
-    mock_logger.warning.assert_called_once_with(
-        "IamAuthPlugin.UnverifiedTlsForIamToken")
+    mock_logger.warning.assert_not_called()
 
 
 def test_iam_aiomysql_respects_caller_ssl_ca():
@@ -198,21 +199,6 @@ def test_iam_non_aiomysql_is_noop():
     plugin = AsyncIamAuthPlugin(_svc(props), props)
     plugin._prepare_secure_transport(_dialect("psycopg-async"), props)
     assert props.get("ssl") is None
-
-
-def test_iam_aiomysql_ssl_secure_false_silences_warning():
-    """ssl_secure=false is an explicit, acknowledged opt-out -> still encrypt
-    (token must not be cleartext) but do not warn."""
-    import ssl
-    props = Properties({
-        "host": "h", "port": "3306", "user": "app", "ssl_secure": "false"})
-    plugin = AsyncIamAuthPlugin(_svc(props), props)
-    with patch("aws_advanced_python_wrapper.aio.auth_plugins.logger") as mock_logger:
-        plugin._prepare_secure_transport(_dialect("aiomysql"), props)
-    ctx = props.get("ssl")
-    assert isinstance(ctx, ssl.SSLContext)
-    assert ctx.verify_mode == ssl.CERT_NONE
-    mock_logger.warning.assert_not_called()
 
 
 # ---- Secrets Manager plugin --------------------------------------------

@@ -227,19 +227,20 @@ class AsyncIamAuthPlugin(AsyncAuthPluginBase):
 
         import ssl as _ssl
         ctx = _ssl.create_default_context()
-        # We cannot verify the server certificate here: the Amazon RDS CA is
-        # NOT in the system trust store (unlike public-web certs), and no
-        # ``ssl_ca`` was supplied -- so ``create_default_context()`` would fail
-        # the handshake against a real RDS endpoint. Encrypt anyway (the IAM
-        # token must never cross the wire in cleartext), but the channel is
-        # then encrypted-but-not-authenticated (MITM-exposable for a credential).
-        # Warn unless the caller explicitly opted out of verification via
-        # ``ssl_secure=false`` -- never downgrade silently. The remediation
-        # (supply ``ssl_ca``) is in the warning message.
+        # Encrypt-but-don't-verify, matching the SYNC driver's default exactly.
+        # The Amazon RDS CA is NOT in the system trust store, so a verifying
+        # context would fail the handshake against a real RDS endpoint when no
+        # ``ssl_ca`` was supplied. The sync path reaches the same posture for
+        # free: mysql.connector negotiates TLS by default with
+        # ``ssl_verify_cert=False`` (encrypted, cert not verified) and only
+        # verifies when the user passes ``ssl_ca``. aiomysql does NOT
+        # auto-negotiate TLS, so we must build the context explicitly to get an
+        # encrypted channel for the cleartext token -- but we deliberately do
+        # NOT verify and do NOT warn, so the observable behavior matches the
+        # sync IamAuthPlugin (which is silent here). Verification stays opt-in
+        # via ``ssl_ca`` (handled by the early-return above).
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
-        if WrapperProperties.SSL_SECURE.get_bool(props):
-            logger.warning("IamAuthPlugin.UnverifiedTlsForIamToken")
         props["ssl"] = ctx
 
     def _default_port(self) -> int:
