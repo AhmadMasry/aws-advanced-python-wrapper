@@ -198,13 +198,45 @@ def test_do_failover_reader_mode_sets_reader_connection():
 
 
 def test_do_failover_raises_when_no_writer_in_topology():
+    # No writer ever appears -> _discover_writer loops until the (short) deadline
+    # then raises FailoverFailedError without connecting anywhere.
     reader = HostInfo(host=_R_EAST, port=5432, role=HostRole.READER)
     plugin, svc, *_ = _make_plugin(
-        home_region="us-east-1", all_hosts=(reader,))
+        home_region="us-east-1",
+        overrides={"failover_timeout_sec": "0.3"},
+        all_hosts=(reader,))
 
     with pytest.raises(FailoverFailedError):
         asyncio.run(plugin._do_failover(driver_dialect=svc.driver_dialect))
     svc.set_current_connection.assert_not_called()
+
+
+def test_do_failover_discovers_writer_that_appears_on_a_later_probe():
+    # Right after a failover the new writer often isn't visible on the first
+    # probe; the monitor surfaces it a beat later. _do_failover must keep
+    # force-probing rather than failing immediately.
+    reader = HostInfo(host=_R_EAST, port=5432, role=HostRole.READER)
+    writer = HostInfo(host=_W_EAST, port=5432, role=HostRole.WRITER)
+    plugin, svc, _hlp, conn = _make_plugin(
+        home_region="us-east-1",
+        overrides={"active_home_failover_mode": "strict_writer"},
+        all_hosts=(reader,), role=HostRole.WRITER)
+    plugin._WRITER_DISCOVERY_DELAY_SEC = 0.05  # keep the test fast
+    calls = {"n": 0}
+
+    async def _force_refresh(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            svc.all_hosts = (reader, writer)  # writer appears on a later probe
+
+    svc.force_refresh_host_list = AsyncMock(side_effect=_force_refresh)
+
+    asyncio.run(plugin._do_failover(driver_dialect=svc.driver_dialect))
+
+    svc.set_current_connection.assert_awaited()
+    _c, bound_host = svc.set_current_connection.call_args.args
+    assert bound_host.host == _W_EAST
+    assert calls["n"] >= 2
 
 
 def test_do_failover_unreachable_writer_raises_failover_failed():

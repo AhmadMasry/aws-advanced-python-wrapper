@@ -62,6 +62,11 @@ logger = Logger(__name__)
 class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
     """Async Global-Database (region-aware) failover plugin."""
 
+    # Throttle between topology probes while waiting for the new writer to
+    # surface (each probe is a real monitor query). Capped by the remaining
+    # failover budget at the call site.
+    _WRITER_DISCOVERY_DELAY_SEC = 1.0
+
     def __init__(
             self,
             plugin_service: AsyncPluginService,
@@ -164,22 +169,21 @@ class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
             # so any pool-proxied target is evicted from its owning pool.
             await self._invalidate_current_connection()
 
-            # Force a fresh topology fetch so the just-elected writer is visible
-            # (best-effort: a stale/empty topology surfaces as "no writer" below).
-            try:
-                await self._within_deadline(
-                    self._plugin_service.force_refresh_host_list(), deadline)
-            except Exception:  # noqa: BLE001 - handled via the topology check below
-                pass
-
-            topology = self._plugin_service.all_hosts
-            writer_candidate = next(
-                (host for host in topology if host.role == HostRole.WRITER), None)
+            # Discover the new writer. gdb needs the writer's *region* to pick
+            # the active vs. inactive failover mode, so this must run before the
+            # mode dispatch. A single probe is not enough: right after a failover
+            # the just-elected writer is often not visible yet, and the async
+            # topology monitor needs several panic-mode probes to surface it.
+            # Retry force-refresh until a writer appears or the deadline passes,
+            # mirroring sync's blocking force_monitoring_refresh_host_list and
+            # AsyncFailoverPlugin's retry-until-writer loops.
+            writer_candidate = await self._discover_writer(deadline)
             if writer_candidate is None:
                 self._inc(self._failover_writer_triggered)
                 self._inc(self._failover_writer_failed)
                 message = Messages.get_formatted(
-                    "FailoverPlugin.NoWriterHostInTopology", LogUtils.log_topology(topology))
+                    "FailoverPlugin.NoWriterHostInTopology",
+                    LogUtils.log_topology(self._plugin_service.all_hosts))
                 logger.error(message)
                 raise FailoverFailedError(message)
 
@@ -206,6 +210,32 @@ class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
                 context.close_context()
                 if self._telemetry_failover_additional_top_trace:
                     telemetry_factory.post_copy(context, TelemetryTraceLevel.FORCE_TOP_LEVEL)
+
+    async def _discover_writer(self, deadline: float) -> Optional[HostInfo]:
+        """Force-refresh topology until a writer is visible or the deadline
+        passes; return the writer ``HostInfo`` (or ``None`` on timeout).
+
+        Uses force refresh (monitor panic-mode probing), not the cache-windowed
+        plain refresh, so a writer elected after the failure is actually
+        discovered. Throttled per pass (bounded by the remaining budget) so the
+        probe loop can't hammer topology discovery.
+        """
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await self._within_deadline(
+                    self._plugin_service.force_refresh_host_list(), deadline)
+            except Exception:  # noqa: BLE001 - a failed probe just means retry
+                pass
+            writer = next(
+                (host for host in self._plugin_service.all_hosts
+                 if host.role == HostRole.WRITER), None)
+            if writer is not None:
+                return writer
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(self._WRITER_DISCOVERY_DELAY_SEC, remaining))
+        return None
 
     def _allowed_hosts(self) -> List[HostInfo]:
         """The region/allowlist-filtered topology -- async equivalent of the

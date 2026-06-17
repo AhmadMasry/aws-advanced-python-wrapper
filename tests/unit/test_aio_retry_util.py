@@ -42,7 +42,11 @@ def _svc(*, all_hosts, role=HostRole.WRITER, connect_side_effect=None):
     svc = MagicMock()
     svc.all_hosts = tuple(all_hosts)
     svc.filter_hosts = MagicMock(side_effect=lambda hosts: list(hosts))
+    # The retry loop FORCE-refreshes each pass (so the monitor re-probes and
+    # discovers a newly elected writer); plain refresh would return the cached
+    # pre-failover topology for up to topology_refresh_ms.
     svc.refresh_host_list = AsyncMock()
+    svc.force_refresh_host_list = AsyncMock()
     # Strategy picks the first remaining candidate (tests seed `remaining`
     # via the allowed-hosts closure / all_hosts).
     svc.get_host_info_by_strategy = MagicMock(
@@ -135,6 +139,45 @@ def test_get_writer_connection_times_out_when_no_writer():
         with pytest.raises(TimeoutError):
             await util.get_writer_connection(
                 svc, MagicMock(), object(), True, _deadline(0.25))
+
+    asyncio.run(_body())
+
+
+def test_loop_force_refreshes_and_does_not_use_cache_windowed_refresh():
+    # Regression: a plain refresh_host_list honors topology_refresh_ms (default
+    # 30s) and would return the stale pre-failover topology, so failover could
+    # never see the new writer. The loop must FORCE refresh each pass.
+    async def _body():
+        svc, _ = _svc(all_hosts=[_W], role=HostRole.WRITER)
+        util = AsyncRetryUtil()
+        await util.get_writer_connection(
+            svc, MagicMock(), object(), True, _deadline())
+        svc.force_refresh_host_list.assert_awaited()
+        svc.refresh_host_list.assert_not_awaited()
+
+    asyncio.run(_body())
+
+
+def test_loop_discovers_writer_that_appears_on_a_later_probe():
+    # The new writer isn't elected at the first probe; a later force refresh
+    # surfaces it. The loop must keep force-probing and pick it up rather than
+    # stalling on the stale cached topology.
+    async def _body():
+        svc, conn = _svc(all_hosts=[_R1], role=HostRole.WRITER)
+        calls = {"n": 0}
+
+        async def _force_refresh(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                svc.all_hosts = (_R1, _W)  # writer appears on the 2nd probe
+
+        svc.force_refresh_host_list = AsyncMock(side_effect=_force_refresh)
+        util = AsyncRetryUtil()
+        result = await util.get_writer_connection(
+            svc, MagicMock(), object(), True, _deadline())
+        assert result.connection is conn
+        assert result.host_info.host == _W.host
+        assert calls["n"] >= 2
 
     asyncio.run(_body())
 

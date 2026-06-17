@@ -30,6 +30,12 @@ Async adaptations of the sync logic:
   ``AsyncFailoverPlugin._open_connection`` documents.
 * Sync ``plugin_service.hosts`` (allow/block filtered) ->
   ``plugin_service.filter_hosts(plugin_service.all_hosts)``.
+* Sync ``plugin_service.refresh_host_list`` (cheap cache read, kept fresh by a
+  high-rate background monitor thread) -> ``force_refresh_host_list`` each pass.
+  Async ``refresh`` honors the ``topology_refresh_ms`` cache window (default
+  30s) and would keep returning the stale pre-failover topology; force refresh
+  routes through the cluster topology monitor's panic-mode probing so the new
+  writer is discovered even while the trigger connection is dead.
 * Connection close -> ``await driver_dialect.abort_connection`` (sever the raw
   socket; a pooled proxy's ``close`` would only return it to the pool).
 * Each ``force_connect`` await is bounded by the remaining deadline so a
@@ -89,7 +95,7 @@ class AsyncRetryUtil:
 
             allowed_hosts = plugin_service.filter_hosts(list(updated_hosts))
             if not any(host.host == writer.host and host.port == writer.port for host in allowed_hosts):
-                logger.debug("RetryUtil.NewWriterNotAllowed", writer.host, LogUtils.log_topology(allowed_hosts))
+                logger.debug("RetryUtil.NewWriterNotAllowed", writer.host, LogUtils.log_topology(tuple(allowed_hosts)))
                 return None
             return [writer]
 
@@ -117,9 +123,18 @@ class AsyncRetryUtil:
         candidate_conn: Optional[Any] = None
         try:
             while asyncio.get_event_loop().time() < retry_end_time:
-                # The roles in this list might not be accurate, depending on whether the new
-                # topology has become available yet.
-                await plugin_service.refresh_host_list()
+                # Re-probe live topology each pass via FORCE refresh, not a plain
+                # ``refresh_host_list``. Plain refresh returns the cached
+                # pre-failover topology for up to ``topology_refresh_ms``
+                # (default 30s) and does NOT engage the cluster topology
+                # monitor's independent (panic-mode) host probing -- so it could
+                # never discover the newly elected writer while the trigger
+                # connection is dead. ``force_refresh_host_list`` routes through
+                # the monitor, mirroring ``AsyncFailoverPlugin``'s use of
+                # ``force_refresh`` in its own failover loops. The roles in the
+                # returned list may still be stale, which is why each candidate's
+                # role is re-verified with a data-plane query below.
+                await plugin_service.force_refresh_host_list()
                 updated_allowed_hosts = allowed_hosts()
                 if updated_allowed_hosts is None:
                     await self._short_delay()
@@ -174,6 +189,15 @@ class AsyncRetryUtil:
                     if candidate_conn is not None:
                         await self.close_connection(plugin_service, candidate_conn)
                         candidate_conn = None
+
+                # Throttle the outer pass: when every candidate failed to
+                # connect (e.g. the new writer isn't accepting connections yet),
+                # the inner loop exits with no delay. Without this, the next
+                # ``force_refresh_host_list`` (a real monitor probe) would be
+                # issued back-to-back, hammering topology discovery for the whole
+                # ``failover_timeout_sec``. Mirrors the inter-pass sleep in
+                # ``AsyncFailoverPlugin``'s failover loops.
+                await self._short_delay()
 
             raise TimeoutError(Messages.get("RetryUtil.Timeout"))
         finally:
