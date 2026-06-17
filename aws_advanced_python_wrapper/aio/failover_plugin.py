@@ -229,8 +229,17 @@ class AsyncFailoverPlugin(AsyncPlugin):
         # failover (test_fail_from_writer_to_new_writer_*).
         if self._is_connection_lost_error(exc):
             return True
-        return (self._mode == FailoverMode.STRICT_WRITER
+        return (self._is_strict_writer_failover_mode()
                 and self._plugin_service.is_read_only_connection_exception(error=exc))
+
+    def _is_strict_writer_failover_mode(self) -> bool:
+        """Whether STRICT_WRITER failover applies (gates the read-only-exception
+        escape hatch in :meth:`_should_failover`).
+
+        Extracted as a method so the GDB failover subclass can make it
+        region-aware. Mirrors sync ``FailoverV2Plugin._is_strict_writer_failover_mode``.
+        """
+        return self._mode == FailoverMode.STRICT_WRITER
 
     @staticmethod
     def _is_connection_os_error(exc: BaseException) -> bool:

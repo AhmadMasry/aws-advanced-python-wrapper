@@ -109,6 +109,20 @@ class _GdbReadWriteSplittingFactory:
         )
 
 
+class _GdbFailoverFactory:
+    def get_instance(
+            self, plugin_service, props, host_list_provider=None):
+        if host_list_provider is None:
+            raise AwsWrapperError(
+                "gdb_failover plugin requires a host_list_provider"
+            )
+        from aws_advanced_python_wrapper.aio.gdb_failover_plugin import \
+            AsyncGdbFailoverPlugin
+        return AsyncGdbFailoverPlugin(
+            plugin_service, host_list_provider, props
+        )
+
+
 class _SimpleReadWriteSplittingFactory:
     def get_instance(
             self, plugin_service, props, host_list_provider=None):
@@ -281,6 +295,7 @@ PLUGIN_FACTORIES: Dict[str, AsyncPluginFactory] = {
     "failover_v2": _FailoverFactory(),  # alias -- sync has two failover
                                         # plugins; async ships one with
                                         # failover_v2's semantics.
+    "gdb_failover": _GdbFailoverFactory(),
     "host_monitoring": _HostMonitoringFactory(),
     "host_monitoring_v2": _HostMonitoringFactory(),
     "read_write_splitting": _ReadWriteSplittingFactory(),
@@ -314,6 +329,7 @@ PLUGIN_FACTORY_WEIGHTS: Dict[Type[Any], int] = {
     _GdbReadWriteSplittingFactory: 320,
     _SimpleReadWriteSplittingFactory: 300,
     _FailoverFactory: 400,
+    _GdbFailoverFactory: 420,
     _HostMonitoringFactory: 500,
     _IamAuthFactory: 700,
     _AwsSecretsManagerFactory: 800,
