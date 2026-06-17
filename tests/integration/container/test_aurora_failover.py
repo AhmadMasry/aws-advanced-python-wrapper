@@ -81,6 +81,10 @@ class TestAuroraFailover:
             "cluster_id": "cluster1"
         })
 
+        WrapperProperties.FAILOVER_HOME_REGION.set(p, TestEnvironment.get_current().get_aurora_region())
+        WrapperProperties.ACTIVE_HOME_FAILOVER_MODE.set(p, "strict-writer")
+        WrapperProperties.INACTIVE_HOME_FAILOVER_MODE.set(p, "strict-writer")
+
         features = TestEnvironment.get_current().get_features()
         if TestEnvironmentFeatures.TELEMETRY_TRACES_ENABLED in features \
                 or TestEnvironmentFeatures.TELEMETRY_METRICS_ENABLED in features:
@@ -100,7 +104,7 @@ class TestAuroraFailover:
         WrapperProperties.CLUSTER_INSTANCE_HOST_PATTERN.set(props_copy, f"?.{endpoint_suffix}:{conn_utils.proxy_port}")
         return props_copy
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover", "failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_to_new_writer_fail_on_connection_invocation(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -122,7 +126,7 @@ class TestAuroraFailover:
             assert retry_until(lambda: aurora_utility.is_db_instance_writer(current_connection_id))
             assert current_connection_id != initial_writer_id
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover", "failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_to_new_writer_fail_on_connection_bound_object_invocation(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -156,9 +160,11 @@ class TestAuroraFailover:
     # PluginChainCompatibility.md), so dropping the v1 entries here aligns
     # test coverage with the supported plugin chain and removes the SIGSEGV
     # flake. Other tests still exercise v1 in calmer scenarios that don't
-    # trigger the post-teardown race.
+    # trigger the post-teardown race. The ``gdb_failover`` variant (added in
+    # #1246) is included v2-only for the same reason.
     @pytest.mark.parametrize("plugins", ["failover,host_monitoring_v2",
-                                         "failover_v2,host_monitoring_v2"])
+                                         "failover_v2,host_monitoring_v2",
+                                         "gdb_failover,host_monitoring_v2"])
     @enable_on_features([TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
     def test_fail_from_reader_to_writer(
@@ -186,7 +192,7 @@ class TestAuroraFailover:
             # RDS API lags behind the writer election, so we retry the check.
             assert retry_until(lambda: aurora_utility.is_db_instance_writer(current_connection_id))
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover", "failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_with_session_states_autocommit(self, test_driver: TestDriver, props, conn_utils, aurora_utility,
                                                              plugins):
@@ -228,7 +234,7 @@ class TestAuroraFailover:
                 # Assert autocommit is still False after failover.
                 assert conn.autocommit is False
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover", "failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_with_session_states_readonly(self, test_driver: TestDriver, props, conn_utils, aurora_utility,
                                                            plugins):
@@ -257,7 +263,7 @@ class TestAuroraFailover:
             # Assert readonly is still True after failover.
             assert conn.read_only is True
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover", "failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_writer_fail_within_transaction_set_autocommit_false(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility, plugins):
@@ -301,7 +307,7 @@ class TestAuroraFailover:
                 cursor_3.execute("DROP TABLE IF EXISTS test3_2")
                 conn.commit()
 
-    @pytest.mark.parametrize("plugins", ["failover", "failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover", "failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     @pytest.mark.timeout(FAILOVER_WITHIN_TRANSACTION_PYTEST_TIMEOUT_SEC)
     def test_writer_fail_within_transaction_start_transaction(
@@ -349,7 +355,8 @@ class TestAuroraFailover:
                 cursor_3.execute("DROP TABLE IF EXISTS test3_3")
                 conn.commit()
 
-    @pytest.mark.parametrize("plugins", ["aurora_connection_tracker,failover", "aurora_connection_tracker,failover_v2"])
+    @pytest.mark.parametrize("plugins", ["aurora_connection_tracker,failover", "aurora_connection_tracker,failover_v2",
+                                         "aurora_connection_tracker,gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     @pytest.mark.repeat(5)  # Run this test case a few more times since it is a flakey test
     def test_writer_failover_in_idle_connections(
