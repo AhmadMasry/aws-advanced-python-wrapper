@@ -101,7 +101,7 @@ class TestAuroraFailoverAsync:
         WrapperProperties.CLUSTER_INSTANCE_HOST_PATTERN.set(props_copy, f"?.{endpoint_suffix}:{conn_utils.proxy_port}")
         return props_copy
 
-    @pytest.mark.parametrize("plugins", ["failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_to_new_writer_fail_on_connection_invocation_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -136,7 +136,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_to_new_writer_fail_on_connection_bound_object_invocation_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -178,8 +178,11 @@ class TestAuroraFailoverAsync:
     # triggers tests with the v2 codes only -- the v1 aliases would re-run
     # identical plugins. (Sync keeps distinct v1/v2 implementations and
     # parametrizes both, except where v1 was dropped for a libpq teardown
-    # race -- commit e713459.)
-    @pytest.mark.parametrize("plugins", ["failover_v2,host_monitoring_v2"])
+    # race -- commit e713459.) ``gdb_failover`` is a *distinct* (region-aware)
+    # plugin, not an alias, so it is exercised alongside ``failover_v2`` --
+    # mirroring sync ``test_aurora_failover.py`` (#1246).
+    @pytest.mark.parametrize("plugins", ["failover_v2,host_monitoring_v2",
+                                         "gdb_failover,host_monitoring_v2"])
     @enable_on_features([TestEnvironmentFeatures.NETWORK_OUTAGES_ENABLED,
                          TestEnvironmentFeatures.ABORT_CONNECTION_SUPPORTED])
     def test_fail_from_reader_to_writer_async(
@@ -218,7 +221,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_with_session_states_autocommit_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -275,7 +278,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_fail_from_writer_with_session_states_readonly_async(
             self, test_driver: TestDriver, props, conn_utils, aurora_utility, plugins):
@@ -318,7 +321,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     def test_writer_fail_within_transaction_set_autocommit_false_async(
             self, test_driver: TestDriver, test_environment: TestEnvironment, props, conn_utils, aurora_utility,
@@ -374,7 +377,7 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["failover_v2"])
+    @pytest.mark.parametrize("plugins", ["failover_v2", "gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     @pytest.mark.timeout(FAILOVER_WITHIN_TRANSACTION_PYTEST_TIMEOUT_SEC)
     def test_writer_fail_within_transaction_start_transaction_async(
@@ -431,7 +434,8 @@ class TestAuroraFailoverAsync:
 
         asyncio.run(inner())
 
-    @pytest.mark.parametrize("plugins", ["aurora_connection_tracker,failover_v2"])
+    @pytest.mark.parametrize("plugins", ["aurora_connection_tracker,failover_v2",
+                                         "aurora_connection_tracker,gdb_failover"])
     @enable_on_features([TestEnvironmentFeatures.FAILOVER_SUPPORTED])
     @pytest.mark.repeat(5)  # Run this test case a few more times since it is a flakey test
     def test_writer_failover_in_idle_connections_async(
