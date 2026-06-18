@@ -1,15 +1,18 @@
-[project]
+[tool.poetry]
 name = "aws_advanced_python_wrapper"
 version = "3.1.0"
 description = "Amazon Web Services (AWS) Advanced Python Wrapper"
+authors = ["Amazon Web Services"]
 readme = "README.md"
 license = "Apache-2.0"
-authors = [{ name = "Amazon Web Services" }]
-requires-python = ">=3.10,<4.0"
+include = ["CONTRIBUTING.md"]
+repository = "https://github.com/awslabs/aws-advanced-python-wrapper"
+documentation = "https://github.com/awslabs/aws-advanced-python-wrapper/docs/"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Natural Language :: English",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -19,27 +22,20 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
-dynamic = ["dependencies"]
 
-[project.urls]
-Repository = "https://github.com/awslabs/aws-advanced-python-wrapper"
-Documentation = "https://github.com/awslabs/aws-advanced-python-wrapper/docs/"
-
-[project.entry-points."sqlalchemy.dialects"]
-# Registered as <dialect>.<driver> so the wrapper plugs in as a driver under
-# SQLAlchemy's existing dialects (matches stock mysql+mysqlconnector /
-# postgresql+psycopg), rather than as a parallel top-level dialect name.
-# postgresql+aws_wrapper_psycopg serves BOTH sync and async: the sync class
-# below implements get_async_dialect_cls so create_async_engine swaps in the
-# async dialect from the same URL (exactly how stock postgresql+psycopg works).
+# SQLAlchemy dialect registration. Poetry exposes these as setuptools-style
+# entry points under the ``sqlalchemy.dialects`` group, so the wrapper plugs in
+# as a driver under SQLAlchemy's existing dialects (matching stock
+# mysql+mysqlconnector / postgresql+psycopg) rather than as a parallel
+# top-level dialect name. postgresql+aws_wrapper_psycopg serves BOTH sync and
+# async: the sync dialect implements get_async_dialect_cls, so
+# create_async_engine swaps in the async dialect from the same URL (exactly how
+# stock postgresql+psycopg works). MySQL's sync and async paths are different
+# DBAPIs (mysql-connector-python vs aiomysql), so they use distinct driver names.
+[tool.poetry.plugins."sqlalchemy.dialects"]
 "postgresql.aws_wrapper_psycopg" = "aws_advanced_python_wrapper.sqlalchemy_dialects.pg:AwsWrapperPGPsycopgDialect"
-# MySQL's sync and async paths are different DBAPIs (mysql-connector-python vs
-# aiomysql), so they cannot share one driver name the way psycopg does.
 "mysql.aws_wrapper_mysqlconnector" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql:AwsWrapperMySQLConnectorDialect"
 "mysql.aws_wrapper_aiomysql" = "aws_advanced_python_wrapper.sqlalchemy_dialects.mysql_async:AwsWrapperMySQLAiomysqlAsyncDialect"
-
-[tool.poetry]
-include = ["CONTRIBUTING.md"]
 
 [tool.poetry.dependencies]
 python = "^3.10.0"
