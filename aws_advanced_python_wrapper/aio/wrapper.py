@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 _TOPOLOGY_REQUIRING_PLUGINS = frozenset({
     "failover",
     "failover_v2",
+    "gdb_failover",
     "read_write_splitting",
     "gdb_rw",
     "custom_endpoint",

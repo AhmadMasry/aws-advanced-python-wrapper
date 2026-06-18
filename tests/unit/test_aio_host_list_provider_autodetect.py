@@ -41,6 +41,21 @@ def test_topology_plugins_without_dialect_return_aurora() -> None:
     assert type(provider) is AsyncAuroraHostListProvider
 
 
+def test_gdb_failover_plugin_returns_topology_provider() -> None:
+    # Regression: gdb_failover MUST be treated as a topology-requiring plugin.
+    # It was omitted from _TOPOLOGY_REQUIRING_PLUGINS (gdb_rw was present but
+    # gdb_failover was not), so a gdb_failover connection got the static
+    # provider -- a single seed host, no topology query, no cluster topology
+    # monitor. Writer failover then had only the seed host and looped on the
+    # demoted old writer until timeout (never discovering the new writer), on
+    # both PG and MySQL. A topology provider (with monitor) is required.
+    dd = AsyncPsycopgDriverDialect()
+    provider = _build_host_list_provider(
+        Properties({"plugins": "gdb_failover"}), dd)
+    assert not isinstance(provider, AsyncStaticHostListProvider)
+    assert isinstance(provider, AsyncAuroraHostListProvider)
+
+
 def test_multi_az_dialect_selects_multi_az_provider() -> None:
     dd = AsyncPsycopgDriverDialect()
 

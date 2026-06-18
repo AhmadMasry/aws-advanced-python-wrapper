@@ -82,6 +82,15 @@ class TestAuroraFailoverAsync:
             "cluster_id": "cluster1"
         })
 
+        # Parity with the sync test_aurora_failover.py props fixture: gdb_failover
+        # needs a home region, and these tests assert reconnection to the new
+        # WRITER, so pin gdb to strict-writer. Without this, gdb_failover defaults
+        # to HOME_READER_OR_WRITER on the instance endpoint and routes to a reader,
+        # failing the role==WRITER assertion. (failover_v2 ignores these props.)
+        WrapperProperties.FAILOVER_HOME_REGION.set(p, TestEnvironment.get_current().get_aurora_region())
+        WrapperProperties.ACTIVE_HOME_FAILOVER_MODE.set(p, "strict-writer")
+        WrapperProperties.INACTIVE_HOME_FAILOVER_MODE.set(p, "strict-writer")
+
         features = TestEnvironment.get_current().get_features()
         if TestEnvironmentFeatures.TELEMETRY_TRACES_ENABLED in features \
                 or TestEnvironmentFeatures.TELEMETRY_METRICS_ENABLED in features:

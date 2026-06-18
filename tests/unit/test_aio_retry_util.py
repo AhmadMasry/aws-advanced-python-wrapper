@@ -120,6 +120,36 @@ def test_get_allowed_connection_rejects_role_mismatch_and_times_out():
     asyncio.run(_body())
 
 
+def test_get_allowed_connection_falls_back_to_writer_when_no_reader():
+    # Regression (#1246 GDB live-run bug): the *_OR_WRITER failover modes pass
+    # verify_role=None with an allowed list that includes the writer. Right
+    # after a writer failover the newly elected writer can be the only reachable
+    # host. The host selector requires a concrete role, so the helper must try
+    # READER then fall back to WRITER. The old code asked only for READER, so it
+    # could never select the writer and timed out with UnableToConnectToReader
+    # even though the writer was a valid target.
+    async def _body():
+        svc, conn = _svc(all_hosts=[_W], role=HostRole.WRITER)
+
+        def _role_selector(role_, strat, hosts):
+            matches = [h for h in hosts if h.role == role_]
+            if not matches:
+                raise Exception("strategy can't get a host of the requested role")
+            return matches[0]
+        svc.get_host_info_by_strategy = MagicMock(side_effect=_role_selector)
+
+        util = AsyncRetryUtil()
+        result = await util.get_allowed_connection(
+            svc, MagicMock(), object(),
+            lambda: [_W], "random", None, _deadline())
+        assert result.connection is conn
+        assert result.host_info.host == _W.host
+        roles_asked = [call.args[0] for call in svc.get_host_info_by_strategy.call_args_list]
+        assert HostRole.WRITER in roles_asked  # the fix's writer fallback fired
+
+    asyncio.run(_body())
+
+
 def test_get_writer_connection_selects_writer_from_topology():
     async def _body():
         svc, conn = _svc(all_hosts=[_W, _R1], role=HostRole.WRITER)

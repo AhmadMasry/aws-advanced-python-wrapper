@@ -195,7 +195,7 @@ class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
                 else self._inactive_home_failover_mode
             logger.debug("GdbFailoverPlugin.CurrentFailoverMode", current_failover_mode)
 
-            await self._failover_with_mode(current_failover_mode, writer_candidate, deadline)
+            await self._failover_with_mode(current_failover_mode, writer_candidate, deadline, driver_dialect)
 
             logger.info("FailoverPlugin.EstablishedConnection", self._plugin_service.current_host_info)
             if context:
@@ -246,10 +246,23 @@ class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
             self,
             mode: Optional[GdbFailoverMode],
             writer_candidate: HostInfo,
-            deadline: float) -> None:
+            deadline: float,
+            driver_dialect: AsyncDriverDialect) -> None:
         match mode:
             case GdbFailoverMode.STRICT_WRITER:
-                await self._failover_to_writer(writer_candidate, deadline)
+                # Delegate to the inherited failover_v2 writer-failover, which
+                # CONVERGES on the newly-elected writer: it re-verifies the
+                # candidate's role via the data plane and, when the topology
+                # still labels the just-demoted old writer as WRITER, refreshes
+                # topology THROUGH the live (reader) connection and retries.
+                # gdb's get_writer_connection had neither, so it looped on the
+                # demoted old writer until the deadline (validated on Aurora:
+                # 2592 reconnects to the stale host over 5 min, then timeout).
+                # STRICT_WRITER means "reconnect to the new writer" -- exactly
+                # failover_v2's job. (Requires the real topology provider, i.e.
+                # gdb_failover present in wrapper._TOPOLOGY_REQUIRING_PLUGINS.)
+                await self._failover_writer(
+                    self._plugin_service.all_hosts, driver_dialect, deadline, None)
             case GdbFailoverMode.STRICT_HOME_READER:
                 await self._failover_to_allowed_host(
                     lambda: [host for host in self._allowed_hosts()
@@ -293,25 +306,6 @@ class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
             case _:
                 raise AwsWrapperError(Messages.get_formatted("GdbFailoverPlugin.UnsupportedFailoverMode", mode))
 
-    async def _failover_to_writer(self, writer_candidate: HostInfo, deadline: float) -> None:
-        self._inc(self._failover_writer_triggered)
-
-        result = None
-        try:
-            result = await self._retry_util.get_writer_connection(
-                self._plugin_service, self._props, self, True, deadline)
-            await self._plugin_service.set_current_connection(result.connection, result.host_info)
-            result = None  # Prevents closing the returned connection in the finally block.
-            self._inc(self._failover_writer_completed)
-        except TimeoutError:
-            self._inc(self._failover_writer_failed)
-            logger.error("FailoverPlugin.ExceptionConnectingToWriter", writer_candidate.host)
-            raise FailoverFailedError(
-                Messages.get_formatted("FailoverPlugin.ExceptionConnectingToWriter", writer_candidate.host))
-        finally:
-            if result is not None and result.connection is not self._plugin_service.current_connection:
-                await AsyncRetryUtil.close_connection(self._plugin_service, result.connection)
-
     async def _failover_to_allowed_host(
             self,
             allowed_hosts: Callable[[], Optional[List[HostInfo]]],
@@ -341,12 +335,13 @@ class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
                 await AsyncRetryUtil.close_connection(self._plugin_service, result.connection)
 
     async def _failover_reader(self, *args: Any, **kwargs: Any) -> None:
-        # Not used by the GDB failover plugin -- see _do_failover.
+        # gdb does its OWN reader selection (region/allowlist-filtered, via
+        # _failover_to_allowed_host) rather than the base read-replica failover,
+        # so the inherited _failover_reader is never used here. Writer failover,
+        # by contrast, IS reused: STRICT_WRITER in _failover_with_mode delegates
+        # to the inherited AsyncFailoverPlugin._failover_writer (which converges
+        # on the new writer) -- so _failover_writer is deliberately NOT overridden.
         raise AwsWrapperError(Messages.get_formatted("Plugin.UnsupportedMethod", "_failover_reader"))
-
-    async def _failover_writer(self, *args: Any, **kwargs: Any) -> None:
-        # Not used by the GDB failover plugin -- see _do_failover.
-        raise AwsWrapperError(Messages.get_formatted("Plugin.UnsupportedMethod", "_failover_writer"))
 
 
 __all__ = ["AsyncGdbFailoverPlugin"]
