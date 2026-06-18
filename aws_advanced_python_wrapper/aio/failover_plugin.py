@@ -31,6 +31,7 @@ from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, NoReturn,
                     Optional, Set)
 
 from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
+from aws_advanced_python_wrapper.aio.retry_util import AsyncRetryUtil
 from aws_advanced_python_wrapper.errors import (
     FailoverFailedError, FailoverSuccessError,
     TransactionResolutionUnknownError)
@@ -76,6 +77,9 @@ class AsyncFailoverPlugin(AsyncPlugin):
         self._plugin_service = plugin_service
         self._host_list_provider = host_list_provider
         self._props = props
+        # Shared writer-failover convergence helper (also reused by the GDB
+        # failover subclass). See AsyncRetryUtil.get_writer_connection.
+        self._retry_util = AsyncRetryUtil()
         self._enabled = WrapperProperties.ENABLE_FAILOVER.get_bool(props)
         # API parity with sync ``failover_v2_plugin.py``: accept the v2-style
         # ``enable_connect_failover`` toggle alongside the v1-style
@@ -488,85 +492,27 @@ class AsyncFailoverPlugin(AsyncPlugin):
             driver_dialect: AsyncDriverDialect,
             deadline: float,
             last_error: Optional[BaseException]) -> None:
-        while asyncio.get_event_loop().time() < deadline:
-            writer = next(
-                (h for h in topology if h.role == HostRole.WRITER), None)
-            if writer is not None:
-                try:
-                    new_conn = await self._within_deadline(
-                        self._open_connection(writer, driver_dialect), deadline)
-                except Exception as e:  # noqa: BLE001
-                    self._plugin_service.set_availability(
-                        writer.as_aliases(), HostAvailability.UNAVAILABLE)
-                    last_error = e
-                else:
-                    # Connected -> the host is reachable.
-                    self._plugin_service.set_availability(
-                        writer.as_aliases(), HostAvailability.AVAILABLE)
-                    # Verify the candidate is ACTUALLY the writer via the data
-                    # plane. Right after a failover the topology can still label
-                    # the just-demoted old writer as WRITER; accepting it would
-                    # land us on a reader (its pg_is_in_recovery() is still
-                    # true), which is exactly what the writer-failover tests
-                    # catch. Mirror sync failover_v2 _failover_writer's
-                    # get_host_role re-check -- but here we additionally drop the
-                    # stale connection and loop+refresh until the real writer
-                    # appears, rather than failing outright on the first pass.
-                    role = None
-                    try:
-                        role = await self._plugin_service.get_host_role(new_conn)
-                    except Exception as e:  # noqa: BLE001
-                        last_error = e
-                    if role == HostRole.WRITER:
-                        await self._plugin_service.set_current_connection(new_conn, writer)
-                        if self._failover_writer_completed is not None:
-                            self._failover_writer_completed.inc()
-                        return
-                    # Stale topology: the topology-labeled "writer" is really a
-                    # reader. Refresh the topology THROUGH THIS LIVE connection
-                    # before dropping it -- a reader can still query
-                    # aurora_replica_status() and observe the real current
-                    # writer, whereas the bottom-of-loop refresh goes through
-                    # the dead current_connection and keeps returning stale data
-                    # (which would loop until the failover timeout). Refreshing
-                    # via the live reader lets the next iteration pick the real
-                    # writer and converge in seconds.
-                    try:
-                        refreshed = await self._within_deadline(
-                            self._host_list_provider.force_refresh(new_conn),
-                            deadline)
-                        if refreshed:
-                            topology = refreshed
-                    except Exception as e:  # noqa: BLE001
-                        last_error = e
-                    # Drop the reader connection (sever the raw socket; a pool
-                    # proxy's close would only return it to the pool).
-                    try:
-                        await driver_dialect.abort_connection(
-                            getattr(new_conn, "driver_connection", new_conn))
-                    except Exception:  # noqa: BLE001
-                        pass
-                    # Short pause to let Aurora finish promoting, then retry
-                    # immediately with the freshly-refreshed topology (skip the
-                    # bottom-of-loop refresh, which uses the dead connection).
-                    await asyncio.sleep(0.5)
-                    continue
-
-            await asyncio.sleep(1.0)
-            try:
-                topology = await self._within_deadline(
-                    self._host_list_provider.force_refresh(
-                        self._plugin_service.current_connection),
-                    deadline)
-            except Exception as e:  # noqa: BLE001
-                last_error = e
-
-        if self._failover_writer_failed is not None:
-            self._failover_writer_failed.inc()
-        raise FailoverFailedError(
-            "Failover could not establish a new writer within "
-            f"{self._failover_timeout_sec}s"
-        ) from last_error
+        # The writer-acquisition + convergence loop lives in the shared helper
+        # (also used by AsyncGdbFailoverPlugin's STRICT_WRITER mode). This method
+        # keeps the plugin-owned concerns: binding the connection and the
+        # success/failure telemetry counters.
+        try:
+            result = await self._retry_util.get_writer_connection(
+                self._plugin_service,
+                self._host_list_provider,
+                lambda host: self._open_connection(host, driver_dialect),
+                topology,
+                deadline)
+        except TimeoutError as e:
+            if self._failover_writer_failed is not None:
+                self._failover_writer_failed.inc()
+            raise FailoverFailedError(
+                "Failover could not establish a new writer within "
+                f"{self._failover_timeout_sec}s"
+            ) from (last_error or e)
+        await self._plugin_service.set_current_connection(result.connection, result.host_info)
+        if self._failover_writer_completed is not None:
+            self._failover_writer_completed.inc()
 
     async def _invalidate_current_connection(self) -> None:
         """Invalidate the current connection prior to attempting failover.

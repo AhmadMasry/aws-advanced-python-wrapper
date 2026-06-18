@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from aws_advanced_python_wrapper.aio.retry_util import AsyncRetryUtil
+from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 
 _W = HostInfo(host="writer.example.com", port=5432, role=HostRole.WRITER)
@@ -150,29 +151,6 @@ def test_get_allowed_connection_falls_back_to_writer_when_no_reader():
     asyncio.run(_body())
 
 
-def test_get_writer_connection_selects_writer_from_topology():
-    async def _body():
-        svc, conn = _svc(all_hosts=[_W, _R1], role=HostRole.WRITER)
-        util = AsyncRetryUtil()
-        result = await util.get_writer_connection(
-            svc, MagicMock(), object(), True, _deadline())
-        assert result.connection is conn
-        assert result.host_info.host == _W.host
-
-    asyncio.run(_body())
-
-
-def test_get_writer_connection_times_out_when_no_writer():
-    async def _body():
-        svc, _ = _svc(all_hosts=[_R1, _R2], role=HostRole.READER)
-        util = AsyncRetryUtil()
-        with pytest.raises(TimeoutError):
-            await util.get_writer_connection(
-                svc, MagicMock(), object(), True, _deadline(0.25))
-
-    asyncio.run(_body())
-
-
 def test_loop_force_refreshes_and_does_not_use_cache_windowed_refresh():
     # Regression: a plain refresh_host_list honors topology_refresh_ms (default
     # 30s) and would return the stale pre-failover topology, so failover could
@@ -180,18 +158,19 @@ def test_loop_force_refreshes_and_does_not_use_cache_windowed_refresh():
     async def _body():
         svc, _ = _svc(all_hosts=[_W], role=HostRole.WRITER)
         util = AsyncRetryUtil()
-        await util.get_writer_connection(
-            svc, MagicMock(), object(), True, _deadline())
+        await util.get_allowed_connection(
+            svc, MagicMock(), object(),
+            lambda: [_W], "random", HostRole.WRITER, _deadline())
         svc.force_refresh_host_list.assert_awaited()
         svc.refresh_host_list.assert_not_awaited()
 
     asyncio.run(_body())
 
 
-def test_loop_discovers_writer_that_appears_on_a_later_probe():
-    # The new writer isn't elected at the first probe; a later force refresh
-    # surfaces it. The loop must keep force-probing and pick it up rather than
-    # stalling on the stale cached topology.
+def test_loop_discovers_target_that_appears_on_a_later_probe():
+    # The target isn't present at the first probe; a later force refresh surfaces
+    # it. The loop must keep force-probing and pick it up rather than stalling on
+    # the stale cached topology.
     async def _body():
         svc, conn = _svc(all_hosts=[_R1], role=HostRole.WRITER)
         calls = {"n": 0}
@@ -199,12 +178,14 @@ def test_loop_discovers_writer_that_appears_on_a_later_probe():
         async def _force_refresh(*_a, **_k):
             calls["n"] += 1
             if calls["n"] >= 2:
-                svc.all_hosts = (_R1, _W)  # writer appears on the 2nd probe
+                svc.all_hosts = (_R1, _W)  # target appears on the 2nd probe
 
         svc.force_refresh_host_list = AsyncMock(side_effect=_force_refresh)
         util = AsyncRetryUtil()
-        result = await util.get_writer_connection(
-            svc, MagicMock(), object(), True, _deadline())
+        result = await util.get_allowed_connection(
+            svc, MagicMock(), object(),
+            lambda: [h for h in svc.all_hosts if h.role == HostRole.WRITER] or None,
+            "random", HostRole.WRITER, _deadline())
         assert result.connection is conn
         assert result.host_info.host == _W.host
         assert calls["n"] >= 2
@@ -228,5 +209,106 @@ def test_close_connection_swallows_errors():
             side_effect=RuntimeError("boom"))
         # Must not raise.
         await AsyncRetryUtil.close_connection(svc, conn)
+
+    asyncio.run(_body())
+
+
+# ---- get_writer_connection (shared writer-failover convergence helper) ----
+
+
+def _writer_svc(*, role=HostRole.WRITER, refresh_topology=(_W,)):
+    svc = MagicMock()
+    svc.set_availability = MagicMock()
+    svc.get_host_role = AsyncMock(return_value=role)
+    svc.current_connection = MagicMock(name="old_conn")
+    dd = MagicMock()
+    dd.abort_connection = AsyncMock()
+    svc.driver_dialect = dd
+    hlp = MagicMock()
+    hlp.force_refresh = AsyncMock(return_value=tuple(refresh_topology))
+    return svc, hlp
+
+
+def test_get_writer_connection_returns_writer_when_role_matches():
+    async def _body():
+        svc, hlp = _writer_svc(role=HostRole.WRITER)
+        conn = MagicMock(name="new_conn")
+
+        async def _connect(_host):
+            return conn
+
+        util = AsyncRetryUtil()
+        result = await util.get_writer_connection(
+            svc, hlp, _connect, (_W,), _deadline())
+        assert result.connection is conn
+        assert result.host_info.host == _W.host
+        svc.set_availability.assert_any_call(
+            _W.as_aliases(), HostAvailability.AVAILABLE)
+
+    asyncio.run(_body())
+
+
+def test_get_writer_connection_converges_on_real_writer_through_live_reader():
+    # The topology still labels the just-demoted old writer as WRITER. Connecting
+    # to it and probing its role yields READER (stale); refreshing topology
+    # THROUGH that live reader surfaces the real new writer, which the next pass
+    # connects to. This is the convergence the bare retry loop lacked.
+    async def _body():
+        old = HostInfo(host="old-writer", port=5432, role=HostRole.WRITER)
+        new = HostInfo(host="new-writer", port=5432, role=HostRole.WRITER)
+        conns = {"old-writer": MagicMock(name="old"), "new-writer": MagicMock(name="new")}
+
+        svc, hlp = _writer_svc()
+        svc.get_host_role = AsyncMock(side_effect=[HostRole.READER, HostRole.WRITER])
+        hlp.force_refresh = AsyncMock(return_value=(new,))  # surfaced via the live reader
+
+        async def _connect(host):
+            return conns[host.host]
+
+        util = AsyncRetryUtil()
+        util._WRITER_VERIFY_RETRY_DELAY_SEC = 0.0
+        result = await util.get_writer_connection(
+            svc, hlp, _connect, (old,), _deadline())
+        assert result.host_info.host == "new-writer"
+        assert result.connection is conns["new-writer"]
+        # The stale reader connection must have been dropped.
+        svc.driver_dialect.abort_connection.assert_awaited()
+
+    asyncio.run(_body())
+
+
+def test_get_writer_connection_times_out_when_writer_never_confirmed():
+    async def _body():
+        old = HostInfo(host="old-writer", port=5432, role=HostRole.WRITER)
+        svc, hlp = _writer_svc(role=HostRole.READER, refresh_topology=(old,))
+
+        async def _connect(_host):
+            return MagicMock()
+
+        util = AsyncRetryUtil()
+        util._WRITER_VERIFY_RETRY_DELAY_SEC = 0.0
+        util._WRITER_REFRESH_DELAY_SEC = 0.0
+        with pytest.raises(TimeoutError):
+            await util.get_writer_connection(
+                svc, hlp, _connect, (old,), _deadline(0.25))
+
+    asyncio.run(_body())
+
+
+def test_get_writer_connection_marks_failed_host_unavailable():
+    async def _body():
+        dead = HostInfo(host="dead-writer", port=5432, role=HostRole.WRITER)
+        svc, hlp = _writer_svc(refresh_topology=(dead,))
+
+        async def _connect(_host):
+            raise OSError("refused")
+
+        util = AsyncRetryUtil()
+        util._WRITER_REFRESH_DELAY_SEC = 0.0
+        with pytest.raises(TimeoutError):
+            await util.get_writer_connection(
+                svc, hlp, _connect, (dead,), _deadline(0.25))
+        svc.set_availability.assert_any_call(
+            dead.as_aliases(), HostAvailability.UNAVAILABLE)
 
     asyncio.run(_body())

@@ -46,15 +46,17 @@ Async adaptations of the sync logic:
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, List, Optional,
+                    Tuple)
 
 from aws_advanced_python_wrapper.host_availability import HostAvailability
 from aws_advanced_python_wrapper.hostinfo import HostInfo, HostRole
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
-from aws_advanced_python_wrapper.utils.utils import LogUtils
 
 if TYPE_CHECKING:
+    from aws_advanced_python_wrapper.aio.host_list_provider import \
+        AsyncHostListProvider
     from aws_advanced_python_wrapper.aio.plugin import AsyncPlugin
     from aws_advanced_python_wrapper.aio.plugin_service import \
         AsyncPluginService
@@ -65,6 +67,10 @@ logger = Logger(__name__)
 
 class AsyncRetryUtil:
     _SHORT_DELAY_SEC = 0.1
+    # Inter-attempt pacing for writer convergence (mirrors the sleeps in the
+    # former AsyncFailoverPlugin._failover_writer_impl loop).
+    _WRITER_VERIFY_RETRY_DELAY_SEC = 0.5
+    _WRITER_REFRESH_DELAY_SEC = 1.0
 
     class Results:
         def __init__(self, connection: Any, host_info: HostInfo):
@@ -82,31 +88,89 @@ class AsyncRetryUtil:
     async def get_writer_connection(
             self,
             plugin_service: AsyncPluginService,
-            properties: Properties,
-            plugin: Optional[AsyncPlugin],
-            verify_role: bool,
+            host_list_provider: AsyncHostListProvider,
+            connect_func: Callable[[HostInfo], Awaitable[Any]],
+            topology: Tuple[HostInfo, ...],
             timeout_end_time: float) -> AsyncRetryUtil.Results:
-        def allowed_writer_hosts() -> Optional[List[HostInfo]]:
-            updated_hosts = plugin_service.all_hosts
-            writer = next((host for host in updated_hosts if host.role == HostRole.WRITER), None)
-            if writer is None:
-                logger.debug("RetryUtil.NoWriterHost", LogUtils.log_topology(updated_hosts))
-                return None
+        """Acquire a connection to the cluster's current writer, CONVERGING on
+        the newly-elected writer when the topology still labels the just-demoted
+        old writer as WRITER.
 
-            allowed_hosts = plugin_service.filter_hosts(list(updated_hosts))
-            if not any(host.host == writer.host and host.port == writer.port for host in allowed_hosts):
-                logger.debug("RetryUtil.NewWriterNotAllowed", writer.host, LogUtils.log_topology(tuple(allowed_hosts)))
-                return None
-            return [writer]
+        Shared writer-failover helper used by both ``AsyncFailoverPlugin``
+        (STRICT_WRITER failover) and ``AsyncGdbFailoverPlugin`` (STRICT_WRITER
+        mode). Returns the verified-writer connection + host info; raises
+        ``TimeoutError`` when no writer can be reached and confirmed before
+        ``timeout_end_time``. The caller binds the connection
+        (``set_current_connection``) and owns the telemetry counters.
 
-        return await self.get_allowed_connection(
-            plugin_service,
-            properties,
-            plugin,
-            allowed_writer_hosts,
-            None,
-            HostRole.WRITER if verify_role else None,
-            timeout_end_time)
+        ``connect_func`` opens a connection to a given host -- callers pass their
+        own connect seam (e.g. ``AsyncFailoverPlugin._open_connection``, which
+        routes through ``force_connect`` so auth plugins re-apply and the pooled
+        provider is bypassed while skipping the failover plugin itself).
+
+        Convergence: connect to the topology-labeled writer and re-verify its
+        role via a data-plane ``get_host_role``; if it is actually a reader
+        (stale topology right after failover), refresh the topology THROUGH that
+        live reader connection -- which can observe the real current writer --
+        drop the reader, pause briefly, and retry. A plain bottom-of-loop refresh
+        goes through the dead ``current_connection`` and would loop until the
+        deadline.
+        """
+        last_error: Optional[BaseException] = None
+        while asyncio.get_event_loop().time() < timeout_end_time:
+            writer = next((host for host in topology if host.role == HostRole.WRITER), None)
+            if writer is not None:
+                try:
+                    new_conn = await self._bounded(
+                        connect_func(writer), timeout_end_time)
+                except Exception as e:  # noqa: BLE001
+                    plugin_service.set_availability(writer.as_aliases(), HostAvailability.UNAVAILABLE)
+                    last_error = e
+                else:
+                    # Connected -> the host is reachable.
+                    plugin_service.set_availability(writer.as_aliases(), HostAvailability.AVAILABLE)
+                    # Roles in the topology may be stale right after a failover
+                    # (the demoted old writer can still be labeled WRITER), so
+                    # verify with a data-plane query before accepting.
+                    role = None
+                    try:
+                        role = await plugin_service.get_host_role(new_conn)
+                    except Exception as e:  # noqa: BLE001
+                        last_error = e
+                    if role == HostRole.WRITER:
+                        return AsyncRetryUtil.Results(new_conn, writer)
+                    # Stale topology: refresh THROUGH this live (reader) connection
+                    # -- a reader can observe the real current writer, whereas a
+                    # refresh through the dead current_connection keeps returning
+                    # stale data and would loop until the deadline.
+                    try:
+                        refreshed = await self._bounded(
+                            host_list_provider.force_refresh(new_conn), timeout_end_time)
+                        if refreshed:
+                            topology = refreshed
+                    except Exception as e:  # noqa: BLE001
+                        last_error = e
+                    # Drop the reader connection (sever the raw socket; a pool
+                    # proxy's close would only return it to the pool).
+                    try:
+                        await plugin_service.driver_dialect.abort_connection(
+                            getattr(new_conn, "driver_connection", new_conn))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # Short pause to let the promotion settle, then retry with the
+                    # freshly-refreshed topology (skip the bottom-of-loop refresh).
+                    await asyncio.sleep(self._WRITER_VERIFY_RETRY_DELAY_SEC)
+                    continue
+
+            await asyncio.sleep(self._WRITER_REFRESH_DELAY_SEC)
+            try:
+                topology = await self._bounded(
+                    host_list_provider.force_refresh(plugin_service.current_connection),
+                    timeout_end_time)
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+
+        raise TimeoutError(Messages.get("RetryUtil.Timeout")) from last_error
 
     async def get_allowed_connection(
             self,

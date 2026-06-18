@@ -255,9 +255,10 @@ class AsyncGdbFailoverPlugin(AsyncFailoverPlugin):
                 # candidate's role via the data plane and, when the topology
                 # still labels the just-demoted old writer as WRITER, refreshes
                 # topology THROUGH the live (reader) connection and retries.
-                # gdb's get_writer_connection had neither, so it looped on the
-                # demoted old writer until the deadline (validated on Aurora:
-                # 2592 reconnects to the stale host over 5 min, then timeout).
+                # A plain retry-connect loop (AsyncRetryUtil.get_allowed_connection)
+                # has neither, so it looped on the demoted old writer until the
+                # deadline (validated on Aurora: 2592 reconnects to the stale
+                # host over 5 min, then timeout).
                 # STRICT_WRITER means "reconnect to the new writer" -- exactly
                 # failover_v2's job. (Requires the real topology provider, i.e.
                 # gdb_failover present in wrapper._TOPOLOGY_REQUIRING_PLUGINS.)
