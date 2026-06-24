@@ -411,8 +411,13 @@ class AsyncAwsWrapperCursor:
         """Proxy unknown attributes to the underlying cursor.
 
         Lets driver-specific attrs (e.g., psycopg's ``statusmessage``) work
-        transparently when SA or application code asks for them.
+        transparently when SA or application code asks for them. Underscore
+        names are not delegated: that keeps Python internals (pickle/copy
+        dunders) on the wrapper and prevents infinite recursion if an internal
+        attr (e.g. _target_cursor) is read before it is set.
         """
+        if name.startswith("_"):
+            raise AttributeError(name)
         return getattr(self._target_cursor, name)
 
 
@@ -1094,6 +1099,11 @@ class AsyncAwsWrapperConnection:
         Lets SA's PG dialect and application code reach driver-specific
         state (``info``, ``pgconn``, ``adapters``, etc.) without special
         casing. The connection field is hit only when the attribute is
-        NOT defined on the wrapper itself.
+        NOT defined on the wrapper itself. Underscore names are not delegated:
+        that keeps Python internals (pickle/copy dunders) on the wrapper and
+        prevents infinite recursion if an internal attr (e.g. _target_conn) is
+        read before it is set.
         """
+        if name.startswith("_"):
+            raise AttributeError(name)
         return getattr(self._target_conn, name)

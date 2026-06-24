@@ -909,3 +909,26 @@ def test_connection_isolation_level_roundtrip():
 
     asyncio.run(_set_fallback())
     assert raw_conn2.isolation_level == "REPEATABLE READ"
+
+
+def test_async_connection_getattr_delegates_public_but_not_underscore():
+    # Public driver-specific attrs are delegated to the underlying connection;
+    # underscore names are not (keeps Python internals on the wrapper and
+    # prevents recursion if _target_conn is read before it is set).
+    wrapper = AsyncAwsWrapperConnection.__new__(AsyncAwsWrapperConnection)
+    target = MagicMock()
+    wrapper._target_conn = target
+
+    assert wrapper.pgconn is target.pgconn
+    with pytest.raises(AttributeError):
+        _ = wrapper._not_a_real_internal_attr
+
+
+def test_async_cursor_getattr_delegates_public_but_not_underscore():
+    wrapper = AsyncAwsWrapperCursor.__new__(AsyncAwsWrapperCursor)
+    target = MagicMock()
+    wrapper._target_cursor = target
+
+    assert wrapper.statusmessage is target.statusmessage
+    with pytest.raises(AttributeError):
+        _ = wrapper._not_a_real_internal_attr
