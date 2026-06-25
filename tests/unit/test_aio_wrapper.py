@@ -911,24 +911,38 @@ def test_connection_isolation_level_roundtrip():
     assert raw_conn2.isolation_level == "REPEATABLE READ"
 
 
-def test_async_connection_getattr_delegates_public_but_not_underscore():
-    # Public driver-specific attrs are delegated to the underlying connection;
-    # underscore names are not (keeps Python internals on the wrapper and
-    # prevents recursion if _target_conn is read before it is set).
+def test_async_connection_getattr_delegates_driver_attrs_including_underscore():
+    # Public AND single-underscore driver attrs are delegated to the underlying
+    # connection (SQLAlchemy's psycopg async adapter reaches for underscore
+    # members). Only dunders stay on the wrapper, and the _target_conn name is
+    # guarded so a miss before __init__ sets it raises instead of recursing.
     wrapper = AsyncAwsWrapperConnection.__new__(AsyncAwsWrapperConnection)
     target = MagicMock()
     wrapper._target_conn = target
 
     assert wrapper.pgconn is target.pgconn
+    # single-underscore driver attr delegates (regression: was wrongly blocked)
+    assert wrapper._close is target._close
+    # dunder stays on the wrapper, not delegated
     with pytest.raises(AttributeError):
-        _ = wrapper._not_a_real_internal_attr
+        _ = wrapper.__totally_made_up_dunder__
+    # the internal target name is guarded against recursion when unset
+    fresh = AsyncAwsWrapperConnection.__new__(AsyncAwsWrapperConnection)
+    with pytest.raises(AttributeError):
+        _ = fresh._target_conn
 
 
-def test_async_cursor_getattr_delegates_public_but_not_underscore():
+def test_async_cursor_getattr_delegates_driver_attrs_including_underscore():
     wrapper = AsyncAwsWrapperCursor.__new__(AsyncAwsWrapperCursor)
     target = MagicMock()
     wrapper._target_cursor = target
 
     assert wrapper.statusmessage is target.statusmessage
+    # _close must delegate: SQLAlchemy AsyncAdapt_psycopg_cursor.close() calls
+    # self._cursor._close() on the wrapped DBAPI cursor.
+    assert wrapper._close is target._close
     with pytest.raises(AttributeError):
-        _ = wrapper._not_a_real_internal_attr
+        _ = wrapper.__totally_made_up_dunder__
+    fresh = AsyncAwsWrapperCursor.__new__(AsyncAwsWrapperCursor)
+    with pytest.raises(AttributeError):
+        _ = fresh._target_cursor

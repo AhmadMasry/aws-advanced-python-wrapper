@@ -413,12 +413,15 @@ class AsyncAwsWrapperCursor:
         """Proxy unknown attributes to the underlying cursor.
 
         Lets driver-specific attrs (e.g., psycopg's ``statusmessage``) work
-        transparently when SA or application code asks for them. Underscore
-        names are not delegated: that keeps Python internals (pickle/copy
-        dunders) on the wrapper and prevents infinite recursion if an internal
-        attr (e.g. _target_cursor) is read before it is set.
+        transparently when SA or application code asks for them. This includes
+        single-underscore driver methods: SQLAlchemy's AsyncAdapt_psycopg_cursor
+        .close() calls ``self._cursor._close()`` on the DBAPI cursor, so the
+        wrapper must forward ``_close`` to the psycopg cursor. Only dunders are
+        kept on the wrapper (pickle/copy internals), and ``_target_cursor`` is
+        guarded by name so a miss before __init__ sets it raises cleanly instead
+        of recursing through this method.
         """
-        if name.startswith("_"):
+        if name == "_target_cursor" or name.startswith("__"):
             raise AttributeError(name)
         return getattr(self._target_cursor, name)
 
@@ -1005,11 +1008,12 @@ class AsyncAwsWrapperConnection:
         Lets SA's PG dialect and application code reach driver-specific
         state (``info``, ``pgconn``, ``adapters``, etc.) without special
         casing. The connection field is hit only when the attribute is
-        NOT defined on the wrapper itself. Underscore names are not delegated:
-        that keeps Python internals (pickle/copy dunders) on the wrapper and
-        prevents infinite recursion if an internal attr (e.g. _target_conn) is
-        read before it is set.
+        NOT defined on the wrapper itself. Single-underscore driver attributes
+        are forwarded too (SQLAlchemy's psycopg async adapter reaches for them);
+        only dunders are kept on the wrapper (pickle/copy internals), and
+        ``_target_conn`` is guarded by name so a miss before __init__ sets it
+        raises cleanly instead of recursing through this method.
         """
-        if name.startswith("_"):
+        if name == "_target_conn" or name.startswith("__"):
             raise AttributeError(name)
         return getattr(self._target_conn, name)
