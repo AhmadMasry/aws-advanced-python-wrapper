@@ -1140,6 +1140,8 @@ public class TestEnvironment implements AutoCloseable {
 
   private static String getContainerBaseImageName(TestEnvironmentRequest request) {
     switch (request.getTargetPythonVersion()) {
+      case PYTHON_3_10:
+        return "python:3.10";
       case PYTHON_3_11:
         return "python:3.11.5";
       case PYTHON_3_12:
