@@ -109,13 +109,15 @@ def _build_host_list_provider(
                     writer_host_query=writer_q,
                     topology_query=topology_q,
                     host_id_query=host_id_q,
+                    monitor_connection_factory=monitor_connection_factory,
                 )
         if "GlobalAurora" in dialect_name:
             topology_q = getattr(
                 database_dialect, "topology_query", None)
             if topology_q:
                 return AsyncGlobalAuroraHostListProvider(
-                    props, driver_dialect, topology_query=topology_q)
+                    props, driver_dialect, topology_query=topology_q,
+                    monitor_connection_factory=monitor_connection_factory)
 
     return AsyncAuroraHostListProvider(
         props, driver_dialect,

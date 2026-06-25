@@ -106,6 +106,22 @@ def _make_provider(**overrides: Any) -> AsyncMultiAzHostListProvider:
     return AsyncMultiAzHostListProvider(**kwargs)
 
 
+def _conn_and_provider(conn_kwargs: dict, **prov_overrides: Any):
+    """Return ``(app_conn, provider)`` where the provider's background topology
+    monitor gets its OWN dedicated connection -- a fresh ``_build_conn`` with the
+    same canned rows, mirroring production's dedicated monitoring connection.
+
+    Without it the background monitor queries (and drains) the app connection's
+    stateful mock cursor, racing the foreground probe -- deterministically empty
+    on Python 3.10, where the scheduler runs the background task first.
+    """
+    async def _monitor_factory() -> MagicMock:
+        return _build_conn(**conn_kwargs)
+    prov = _make_provider(monitor_connection_factory=_monitor_factory,
+                          **prov_overrides)
+    return _build_conn(**conn_kwargs), prov
+
+
 # ---- Basic two-step query ------------------------------------------------
 
 
@@ -115,14 +131,13 @@ def test_basic_topology_two_step_query():
     async def _body() -> None:
         writer_id = "db-WRITER"
         reader_id = "db-READER"
-        conn = _build_conn(
+        conn, prov = _conn_and_provider(dict(
             writer_row=(writer_id,),
             topology_rows=[
                 (writer_id, "host1.example.com", 5432),
                 (reader_id, "host2.example.com", 5432),
             ],
-        )
-        prov = _make_provider()
+        ))
         topo = await prov.force_refresh(conn)
         assert len(topo) == 2
 
@@ -150,15 +165,14 @@ def test_empty_writer_host_query_falls_back_to_host_id_query():
     async def _body() -> None:
         writer_id = "0123456789"
         other_id = "9876543210"
-        conn = _build_conn(
+        conn, prov = _conn_and_provider(dict(
             writer_row=None,  # empty
             host_id_row=(writer_id,),
             topology_rows=[
                 (writer_id, "mysql-writer.example.com", 3306),
                 (other_id, "mysql-reader.example.com", 3306),
             ],
-        )
-        prov = _make_provider()
+        ))
         topo = await prov.force_refresh(conn)
         assert len(topo) == 2
         writers = [h for h in topo if h.role == HostRole.WRITER]
@@ -226,16 +240,13 @@ def test_instance_template_substitution_rewrites_hosts():
         reader_host = (
             "postgres-instance-2.XYZ.us-east-1.rds.amazonaws.com"
         )
-        conn = _build_conn(
+        conn, prov = _conn_and_provider(dict(
             writer_row=(writer_id,),
             topology_rows=[
                 (writer_id, writer_host, 5432),
                 (reader_id, reader_host, 5432),
             ],
-        )
-        prov = _make_provider(
-            instance_template_host="?.internal.example.com:6000",
-        )
+        ), instance_template_host="?.internal.example.com:6000")
         topo = await prov.force_refresh(conn)
         assert len(topo) == 2
         writers = [h for h in topo if h.role == HostRole.WRITER]
@@ -256,13 +267,10 @@ def test_instance_template_without_port_keeps_row_port():
         writer_host = (
             "postgres-instance-1.XYZ.us-east-1.rds.amazonaws.com"
         )
-        conn = _build_conn(
+        conn, prov = _conn_and_provider(dict(
             writer_row=(writer_id,),
             topology_rows=[(writer_id, writer_host, 5433)],
-        )
-        prov = _make_provider(
-            instance_template_host="?.internal.example.com",
-        )
+        ), instance_template_host="?.internal.example.com")
         topo = await prov.force_refresh(conn)
         assert len(topo) == 1
         assert topo[0].host == "postgres-instance-1.internal.example.com"
@@ -279,13 +287,10 @@ def test_refresh_uses_cache_within_ttl():
     without re-querying."""
     async def _body() -> None:
         writer_id = "db-WRITER"
-        conn = _build_conn(
+        conn, prov = _conn_and_provider(dict(
             writer_row=(writer_id,),
             topology_rows=[(writer_id, "h1.example.com", 5432)],
-        )
-        prov = _make_provider(
-            props=_props(topology_refresh_ms="60000"),
-        )
+        ), props=_props(topology_refresh_ms="60000"))
         first = await prov.refresh(conn)
         # Replace the cursor with one that would return different rows.
         # If the cache is honored, we should not observe the change.

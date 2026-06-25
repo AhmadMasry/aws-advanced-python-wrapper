@@ -269,14 +269,29 @@ class AsyncAuroraHostListProvider:
 
         high_refresh_ms = WrapperProperties.CLUSTER_TOPOLOGY_HIGH_REFRESH_RATE_MS.get_int(
             self._props)
+        # The background monitor must never query the shared app connection
+        # concurrently with the app -- driver connections can't service
+        # concurrent queries, so a background refresh there corrupts the app's
+        # in-flight query. When a dedicated monitoring connection factory is
+        # wired the monitor opens its own connection; when it isn't, hand it a
+        # getter that yields None so the background loop skips rather than
+        # falling back to the shared app connection. The foreground
+        # force_refresh path still refreshes on demand via the connection
+        # passed to it.
+        if self._monitor_connection_factory is None:
+            logger.warning(
+                "[AsyncAuroraHostListProvider] no dedicated monitoring "
+                "connection factory wired; background topology refresh disabled "
+                "to avoid racing the shared application connection.")
         monitor = AsyncClusterTopologyMonitor(
             provider=self,
-            connection_getter=lambda: self._last_conn,
+            connection_getter=(
+                (lambda: self._last_conn)
+                if self._monitor_connection_factory is not None
+                else (lambda: None)),
             refresh_interval_sec=self._refresh_ns / 1_000_000_000,
             high_refresh_rate_sec=(
                 (high_refresh_ms / 1000.0) if high_refresh_ms else 1.0),
-            # Dedicated monitoring connection so background topology queries
-            # never race the app's queries on the shared driver connection.
             connection_factory=self._monitor_connection_factory,
         )
         monitor.start()
@@ -476,6 +491,8 @@ class AsyncMultiAzHostListProvider(AsyncAuroraHostListProvider):
             cluster_id: Optional[str] = None,
             default_port: int = 5432,
             instance_template_host: Optional[str] = None,
+            monitor_connection_factory: Optional[
+                Callable[[], Awaitable[Any]]] = None,
     ) -> None:
         super().__init__(
             props=props,
@@ -483,6 +500,7 @@ class AsyncMultiAzHostListProvider(AsyncAuroraHostListProvider):
             topology_query=topology_query,
             cluster_id=cluster_id,
             default_port=default_port,
+            monitor_connection_factory=monitor_connection_factory,
         )
         self._writer_host_query = writer_host_query
         self._host_id_query = host_id_query
@@ -616,6 +634,8 @@ class AsyncGlobalAuroraHostListProvider(AsyncAuroraHostListProvider):
             instance_templates_by_region: Optional[Dict[str, str]] = None,
             cluster_id: Optional[str] = None,
             default_port: int = 5432,
+            monitor_connection_factory: Optional[
+                Callable[[], Awaitable[Any]]] = None,
     ) -> None:
         super().__init__(
             props=props,
@@ -623,6 +643,7 @@ class AsyncGlobalAuroraHostListProvider(AsyncAuroraHostListProvider):
             topology_query=topology_query,
             cluster_id=cluster_id,
             default_port=default_port,
+            monitor_connection_factory=monitor_connection_factory,
         )
         if instance_templates_by_region is None:
             raw = WrapperProperties.GLOBAL_CLUSTER_INSTANCE_HOST_PATTERNS.get(
