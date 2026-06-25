@@ -256,24 +256,3 @@ def test_async_wrapper_raises_attribute_error_on_aiomysql_target(method_name):
 
     with pytest.raises(AttributeError):
         getattr(wrapper, method_name)(lambda d: None)
-
-
-# ---- Signature sanity check --------------------------------------------
-
-
-def test_methods_are_sync_on_both_wrappers():
-    """psycopg3 3.3.3 keeps add_notice_handler sync on BOTH Connection
-    and AsyncConnection. The wrapper must match so SQLAlchemy's psycopg
-    dialect (which calls the method synchronously from its on_connect
-    hook) works against the async wrapper too."""
-    import inspect
-    for cls in (AwsWrapperConnection, AsyncAwsWrapperConnection):
-        for name in (
-                "add_notice_handler",
-                "remove_notice_handler",
-                "add_notify_handler",
-                "remove_notify_handler"):
-            method = getattr(cls, name)
-            assert callable(method)
-            assert not inspect.iscoroutinefunction(method), (
-                f"{cls.__name__}.{name} must be sync to match psycopg3")

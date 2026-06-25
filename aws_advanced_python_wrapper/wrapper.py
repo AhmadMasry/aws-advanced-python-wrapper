@@ -84,6 +84,22 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def target_connection(self):
         return self._plugin_service.current_connection
 
+    def __getattr__(self, name: str) -> Any:
+        # Delegate unknown attributes to the live underlying driver connection so
+        # driver-specific extension methods that aren't on the wrapper's PEP-249
+        # surface (e.g. psycopg's add_notice_handler / info / cancel, called by
+        # SQLAlchemy) work transparently. __getattr__ runs only on a normal-lookup
+        # miss, so it never shadows the wrapper's own API -- members that must not
+        # be a plain driver forward (plugin-chain-routed execute/set_read_only/
+        # set_autocommit, the SQLAlchemy-adapter contracts, property setters) stay
+        # defined explicitly below and win via normal lookup. Underscore names are
+        # not delegated: that keeps Python internals (pickle/copy dunders) on the
+        # wrapper and prevents recursion if an internal attr (e.g. _plugin_service)
+        # is read before it is set.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.target_connection, name)
+
     @property
     def is_closed(self):
         return self._plugin_service.driver_dialect.is_closed(self.target_connection)
@@ -242,55 +258,13 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
         return self._plugin_manager.execute(self.target_connection, DbApiMethod.CONNECTION_TPC_RECOVER,
                                             lambda: self.target_connection.tpc_recover())
 
-    # Notice/notify handler passthroughs (psycopg3 parity).
+    # ---- psycopg3-parity passthroughs that need explicit handling ------
     #
-    # SQLAlchemy's psycopg dialect registers a notice handler on every
-    # engine.connect() (sqlalchemy/dialects/postgresql/psycopg.py:575).
-    # Without these passthroughs the wrapper would AttributeError there
-    # and break every connect on the Aurora path.
-    #
-    # These delegate straight to the target connection and BYPASS the
-    # plugin chain: notice/notify handler registration is pure local
-    # client-side state (it just installs a callback slot on the
-    # connection object), it does not hit the database, and plugins
-    # have no reason to intercept it.
-    #
-    # The MySQL drivers (mysql-connector, aiomysql) do not expose these
-    # methods -- callers on MySQL targets will get the underlying
-    # driver's AttributeError, which matches psycopg3 parity (these are
-    # PostgreSQL-only features).
-
-    def add_notice_handler(self, callback: Any) -> Any:
-        return self.target_connection.add_notice_handler(callback)
-
-    def remove_notice_handler(self, callback: Any) -> Any:
-        return self.target_connection.remove_notice_handler(callback)
-
-    def add_notify_handler(self, callback: Any) -> Any:
-        return self.target_connection.add_notify_handler(callback)
-
-    def remove_notify_handler(self, callback: Any) -> Any:
-        return self.target_connection.remove_notify_handler(callback)
-
-    # ---- psycopg3-parity passthroughs (read-only + local-state) --------
-    #
-    # These mirror psycopg3.Connection's public surface. All bypass the
-    # plugin chain: they're client-side state accessors / local ops.
-    # MySQL drivers that don't implement a given attribute raise the
-    # underlying driver's AttributeError -- matches psycopg3 parity
-    # (several of these are PostgreSQL-specific).
-
-    @property
-    def info(self) -> Any:
-        return self.target_connection.info
-
-    @property
-    def broken(self) -> Any:
-        return self.target_connection.broken
-
-    @property
-    def adapters(self) -> Any:
-        return self.target_connection.adapters
+    # Driver-specific attributes (add_notice_handler, info, broken, cancel,
+    # ...) are forwarded automatically by __getattr__. The members below stay
+    # explicit because __getattr__ can't express them: they route through the
+    # plugin chain, have setters, or implement a SQLAlchemy adapter contract
+    # rather than a plain driver forward.
 
     @property
     def closed(self) -> bool:
@@ -322,16 +296,6 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def prepared_max(self, value: Any) -> None:
         self.target_connection.prepared_max = value
 
-    @property
-    def deferrable(self) -> Any:
-        return self.target_connection.deferrable
-
-    def set_deferrable(self, value: Any) -> None:
-        self.target_connection.set_deferrable(value)
-
-    def set_isolation_level(self, value: Any) -> None:
-        self.target_connection.set_isolation_level(value)
-
     def set_read_only(self, value: Any) -> None:
         # Route through the existing plugin-aware setter so read_only
         # changes keep their intended plugin-chain semantics.
@@ -340,15 +304,6 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def set_autocommit(self, value: Any) -> None:
         # Same plugin-chain routing as read_only.
         self.autocommit = value
-
-    def fileno(self) -> int:
-        return self.target_connection.fileno()
-
-    def cancel(self) -> None:
-        self.target_connection.cancel()
-
-    def cancel_safe(self, *, timeout: float = 30.0) -> None:
-        self.target_connection.cancel_safe(timeout=timeout)
 
     def execute(
             self,
@@ -365,32 +320,6 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
         cursor = self.cursor()
         cursor.execute(query, params, prepare=prepare, binary=binary)
         return cursor
-
-    def pipeline(self) -> Any:
-        return self.target_connection.pipeline()
-
-    def notifies(
-            self,
-            *,
-            timeout: Any = None,
-            stop_after: Any = None) -> Any:
-        return self.target_connection.notifies(
-            timeout=timeout, stop_after=stop_after)
-
-    def wait(self, gen: Any, interval: float = 0.1) -> Any:
-        return self.target_connection.wait(gen, interval=interval)
-
-    def xid(self, format_id: int, gtrid: str, bqual: str) -> Any:
-        return self.target_connection.xid(format_id, gtrid, bqual)
-
-    def transaction(
-            self,
-            savepoint_name: Any = None,
-            force_rollback: bool = False) -> Any:
-        return self.target_connection.transaction(
-            savepoint_name=savepoint_name,
-            force_rollback=force_rollback,
-        )
 
     # ---- SQLAlchemy AdaptedConnection / AsyncAdapt_*_connection parity --
     #
@@ -497,6 +426,14 @@ class AwsWrapperCursor(Cursor):
     @property
     def target_cursor(self) -> Cursor:
         return self._target_cursor
+
+    def __getattr__(self, name: str) -> Any:
+        # See AwsWrapperConnection.__getattr__. Delegate unknown attributes to the
+        # underlying driver cursor (e.g. psycopg's statusmessage) so driver-specific
+        # extensions used by SQLAlchemy/application code work transparently.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.target_cursor, name)
 
     @property
     def description(self):

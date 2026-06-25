@@ -305,8 +305,8 @@ def test_async_wrapper_wait_awaits_target() -> None:
     target = MagicMock()
     target.wait = AsyncMock()
     wrapper = _async_wrapper(target)
-    asyncio.run(wrapper.wait("gen"))
-    target.wait.assert_awaited_once_with("gen", interval=0.1)
+    asyncio.run(wrapper.wait("gen", interval=0.5))
+    target.wait.assert_awaited_once_with("gen", interval=0.5)
 
 
 # ---- Setter parity ------------------------------------------------------
@@ -391,32 +391,3 @@ def test_sync_wrapper_passthroughs_bypass_plugin_chain(call) -> None:
     if callable(attr):
         attr(*args)
     wrapper._plugin_manager.execute.assert_not_called()  # type: ignore[attr-defined]
-
-
-# ---- Signature-shape sanity check --------------------------------------
-
-
-def test_async_wrapper_split_methods_are_correct_asyncness() -> None:
-    """Verify that the sync-vs-async shape on the async wrapper matches
-    psycopg3.AsyncConnection's actual method asyncness. Regression
-    guard for future accidental async-def flips."""
-    import inspect
-    async_methods = {
-        "cancel_safe", "execute", "wait",
-        "set_deferrable", "set_read_only", "set_autocommit",
-        "set_isolation_level",
-    }
-    sync_methods = {
-        "fileno", "cancel", "xid", "pipeline", "notifies", "transaction",
-        "add_notice_handler", "remove_notice_handler",
-        "add_notify_handler", "remove_notify_handler",
-    }
-    for name in async_methods:
-        method = getattr(AsyncAwsWrapperConnection, name)
-        assert inspect.iscoroutinefunction(method), (
-            f"AsyncAwsWrapperConnection.{name} should be async")
-    for name in sync_methods:
-        method = getattr(AsyncAwsWrapperConnection, name)
-        assert not inspect.iscoroutinefunction(method), (
-            f"AsyncAwsWrapperConnection.{name} should be sync "
-            f"(matches psycopg3.AsyncConnection)")

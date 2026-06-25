@@ -524,67 +524,13 @@ class AsyncAwsWrapperConnection:
         # Fallback: attribute assignment.
         target.isolation_level = level
 
-    # Notice/notify handler passthroughs (psycopg3 parity).
+    # ---- psycopg3-parity passthroughs that need explicit handling ------
     #
-    # SQLAlchemy's psycopg dialect registers a notice handler on every
-    # engine.connect() (sqlalchemy/dialects/postgresql/psycopg.py:575).
-    # Without these passthroughs the wrapper would AttributeError there
-    # and break every connect on the Aurora path.
-    #
-    # These delegate straight to the target connection and BYPASS the
-    # plugin chain: notice/notify handler registration is pure local
-    # client-side state (it just installs a callback slot on the
-    # connection object), it does not hit the database, and plugins
-    # have no reason to intercept it.
-    #
-    # Signatures are plain ``def`` (not ``async def``) because
-    # ``psycopg.AsyncConnection.add_notice_handler`` is itself a sync
-    # method -- it does not await anything. Verified against
-    # ``psycopg 3.3.3`` in this repo's venv (iscoroutinefunction=False
-    # for both sync and async variants).
-    #
-    # The aiomysql driver does not expose these methods -- callers on
-    # MySQL targets will get the underlying driver's AttributeError,
-    # which matches psycopg3 parity (these are PostgreSQL-only
-    # features).
-
-    def add_notice_handler(self, callback: Any) -> Any:
-        return self._target_conn.add_notice_handler(callback)
-
-    def remove_notice_handler(self, callback: Any) -> Any:
-        return self._target_conn.remove_notice_handler(callback)
-
-    def add_notify_handler(self, callback: Any) -> Any:
-        return self._target_conn.add_notify_handler(callback)
-
-    def remove_notify_handler(self, callback: Any) -> Any:
-        return self._target_conn.remove_notify_handler(callback)
-
-    # ---- psycopg3-parity passthroughs (read-only + local-state) --------
-    #
-    # Mirror psycopg3.AsyncConnection's public surface. All bypass the
-    # plugin chain: they're client-side state accessors / local ops.
-    # aiomysql lacks most of these -- callers on MySQL targets will
-    # get the underlying driver's AttributeError, matching parity
-    # with psycopg3 (these are PostgreSQL-specific).
-    #
-    # Async-vs-sync shape matches psycopg3.AsyncConnection exactly
-    # (verified against psycopg 3.3.3 via inspect.iscoroutinefunction):
-    #   sync:  fileno, cancel, xid, pipeline, notifies, transaction
-    #   async: cancel_safe, execute, wait, set_deferrable,
-    #          set_read_only, set_autocommit
-
-    @property
-    def info(self) -> Any:
-        return self._target_conn.info
-
-    @property
-    def broken(self) -> Any:
-        return self._target_conn.broken
-
-    @property
-    def adapters(self) -> Any:
-        return self._target_conn.adapters
+    # Driver-specific attributes (add_notice_handler, info, cancel, ...) are
+    # forwarded automatically by __getattr__. The members below stay explicit
+    # because __getattr__ can't express them: they route through the plugin
+    # chain (execute/set_read_only/set_autocommit), have cross-driver fallback
+    # (set_isolation_level), or implement a SQLAlchemy adapter contract.
 
     @property
     def closed(self) -> bool:
@@ -636,10 +582,6 @@ class AsyncAwsWrapperConnection:
         self._target_conn.prepared_max = value
 
     @property
-    def deferrable(self) -> Any:
-        return self._target_conn.deferrable
-
-    @property
     def read_only(self) -> bool:
         """Current read-only intent, normalized to a plain ``bool``.
 
@@ -654,9 +596,6 @@ class AsyncAwsWrapperConnection:
         if val is None:
             val = getattr(self._target_conn, "_aws_read_only", False)
         return bool(val)
-
-    async def set_deferrable(self, value: Any) -> None:
-        await self._target_conn.set_deferrable(value)
 
     async def set_read_only(self, value: Any) -> None:
         """Set read-only, routing through the plugin pipeline.
@@ -716,15 +655,6 @@ class AsyncAwsWrapperConnection:
         await self._plugin_manager.execute(
             self, DbApiMethod.CONNECTION_SET_READ_ONLY, _call, value)
 
-    def fileno(self) -> int:
-        return self._target_conn.fileno()
-
-    def cancel(self) -> None:
-        self._target_conn.cancel()
-
-    async def cancel_safe(self, *, timeout: float = 30.0) -> None:
-        await self._target_conn.cancel_safe(timeout=timeout)
-
     async def execute(
             self,
             query: Any,
@@ -741,32 +671,6 @@ class AsyncAwsWrapperConnection:
         cursor = self.cursor()
         await cursor.execute(query, params, prepare=prepare, binary=binary)
         return cursor
-
-    def pipeline(self) -> Any:
-        return self._target_conn.pipeline()
-
-    def notifies(
-            self,
-            *,
-            timeout: Any = None,
-            stop_after: Any = None) -> Any:
-        return self._target_conn.notifies(
-            timeout=timeout, stop_after=stop_after)
-
-    async def wait(self, gen: Any, interval: float = 0.1) -> Any:
-        return await self._target_conn.wait(gen, interval=interval)
-
-    def xid(self, format_id: int, gtrid: str, bqual: str) -> Any:
-        return self._target_conn.xid(format_id, gtrid, bqual)
-
-    def transaction(
-            self,
-            savepoint_name: Any = None,
-            force_rollback: bool = False) -> Any:
-        return self._target_conn.transaction(
-            savepoint_name=savepoint_name,
-            force_rollback=force_rollback,
-        )
 
     # ---- SQLAlchemy AdaptedConnection / AsyncAdapt_*_connection parity --
     #
