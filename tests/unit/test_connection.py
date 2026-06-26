@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import psycopg
+import pytest
 
 if TYPE_CHECKING:
     from aws_advanced_python_wrapper.pep249 import Connection
@@ -25,7 +26,8 @@ if TYPE_CHECKING:
 from aws_advanced_python_wrapper.hostinfo import HostInfo
 from aws_advanced_python_wrapper.plugin_service import (
     PluginServiceImpl, PluginServiceManagerContainer)
-from aws_advanced_python_wrapper.wrapper import AwsWrapperConnection
+from aws_advanced_python_wrapper.wrapper import (AwsWrapperConnection,
+                                                 AwsWrapperCursor)
 
 
 def test_connection_basic():
@@ -42,3 +44,41 @@ def test_connection_basic():
 
         connection_mock.connect.assert_called_with(host="localhost", dbname="postgres", user="postgres",
                                                    password="qwerty")
+
+
+def test_connection_getattr_delegates_driver_attrs_including_underscore():
+    # Public AND single-underscore driver attrs delegate to the live underlying
+    # connection (SQLAlchemy's psycopg adapter reaches for underscore members like
+    # _close). Only dunders stay on the wrapper, and the recursion-critical
+    # _plugin_service name is guarded so a miss before it is set raises cleanly.
+    wrapper = AwsWrapperConnection.__new__(AwsWrapperConnection)
+    underlying = MagicMock()
+    plugin_service = MagicMock()
+    plugin_service.current_connection = underlying
+    wrapper._plugin_service = plugin_service
+
+    assert wrapper.add_notice_handler is underlying.add_notice_handler
+    # single-underscore driver attr delegates (regression: was wrongly blocked)
+    assert wrapper._close is underlying._close
+    # dunder stays on the wrapper, not delegated
+    with pytest.raises(AttributeError):
+        _ = wrapper.__totally_made_up_dunder__
+    # the recursion-critical internal name is guarded when unset
+    fresh = AwsWrapperConnection.__new__(AwsWrapperConnection)
+    with pytest.raises(AttributeError):
+        _ = fresh._plugin_service
+
+
+def test_cursor_getattr_delegates_driver_attrs_including_underscore():
+    wrapper = AwsWrapperCursor.__new__(AwsWrapperCursor)
+    target_cursor = MagicMock()
+    wrapper._target_cursor = target_cursor
+
+    assert wrapper.statusmessage is target_cursor.statusmessage
+    # _close must delegate: SQLAlchemy's psycopg cursor adapter calls it.
+    assert wrapper._close is target_cursor._close
+    with pytest.raises(AttributeError):
+        _ = wrapper.__totally_made_up_dunder__
+    fresh = AwsWrapperCursor.__new__(AwsWrapperCursor)
+    with pytest.raises(AttributeError):
+        _ = fresh._target_cursor
