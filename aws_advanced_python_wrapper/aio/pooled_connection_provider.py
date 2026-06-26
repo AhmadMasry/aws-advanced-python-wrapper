@@ -37,7 +37,6 @@ from aws_advanced_python_wrapper.host_selector import (
     HighestWeightHostSelector, HostSelector, RandomHostSelector,
     RoundRobinHostSelector, WeightedRandomHostSelector)
 from aws_advanced_python_wrapper.sql_alchemy_connection_provider import PoolKey
-from aws_advanced_python_wrapper.utils import transient_connect
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
 from aws_advanced_python_wrapper.utils.properties import (Properties,
@@ -221,13 +220,6 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
     _POOL_EXPIRATION_CHECK_NS: ClassVar[int] = 30 * 60_000_000_000  # 30 minutes
     _LEAST_CONNECTIONS: ClassVar[str] = "least_connections"
 
-    # The async pool's creator (``_creator`` below) bypasses the wrapper's
-    # plugin chain when it refills, so this layer needs its own
-    # transient-retry. Classification and backoff are centralised in
-    # ``utils.transient_connect`` so all retry sites (sync pool, async
-    # pool, Django backend) stay in sync.
-    _TRANSIENT_CONNECT_MAX_ATTEMPTS: ClassVar[int] = transient_connect.DEFAULT_MAX_ATTEMPTS
-
     _accepted_strategies: ClassVar[Dict[str, HostSelector]] = {
         "random": RandomHostSelector(),
         "round_robin": RoundRobinHostSelector(),
@@ -378,26 +370,8 @@ class AsyncPooledConnectionProvider(AsyncCanReleaseResources):
             target_connect_func: Callable[..., Awaitable[Any]],
             props: Properties,
     ) -> Callable[[], Awaitable[Any]]:
-        max_attempts = WrapperProperties.CONNECTION_RETRY_MAX_ATTEMPTS.get_int(props)
-        max_backoff = WrapperProperties.CONNECTION_RETRY_MAX_BACKOFF_S.get_float(props)
-
         async def _creator() -> Any:
-            last_exc: Optional[BaseException] = None
-            for attempt in range(max_attempts):
-                try:
-                    return await target_connect_func(**props)
-                except Exception as exc:  # noqa: BLE001
-                    last_exc = exc
-                    if transient_connect.is_transient_connect_error(exc) \
-                            and attempt < max_attempts - 1:
-                        await asyncio.sleep(transient_connect.compute_backoff(
-                            attempt, max_backoff=max_backoff))
-                        continue
-                    raise
-            # Defensive: loop exits via return or raise above; keeps mypy
-            # from inferring an implicit ``None`` return.
-            assert last_exc is not None
-            raise last_exc
+            return await target_connect_func(**props)
         return _creator
 
     async def release_resources(self) -> None:
