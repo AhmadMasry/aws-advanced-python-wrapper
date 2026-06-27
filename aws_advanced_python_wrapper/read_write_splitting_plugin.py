@@ -326,7 +326,7 @@ class AbstractReadWriteSplittingPlugin(Plugin):
 
         try:
             if self._is_connection_usable(internal_conn, driver_dialect):
-                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: internal_conn.close())
+                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: internal_conn.close(), conn=internal_conn)
         except Exception:
             # Ignore exceptions during cleanup - connection might already be dead
             pass
@@ -363,7 +363,7 @@ class AbstractReadWriteSplittingPlugin(Plugin):
     def close_connection(conn: Optional[Connection], driver_dialect: DriverDialect):
         if conn is not None:
             try:
-                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close())
+                driver_dialect.execute(DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close(), conn=conn)
             except Exception:
                 # Swallow exception
                 return
@@ -470,16 +470,28 @@ class ReadWriteSplittingPlugin(AbstractReadWriteSplittingPlugin):
             )
 
         current_host = self._plugin_service.initial_connection_host_info
-        if current_host is not None:
-            if current_role == current_host.role:
-                return current_conn
-
+        effective_host = current_host
+        if current_host is not None and current_role != current_host.role:
             updated_host = deepcopy(current_host)
             updated_host.role = current_role
+            effective_host = updated_host
             if self._host_list_provider_service is not None:
                 self._host_list_provider_service.initial_connection_host_info = (
                     updated_host
                 )
+
+        # Seed the connection cache under the verified role so a later
+        # set_read_only reuses THIS connection instead of switching to a
+        # different instance. Without this, connecting to the reader-cluster
+        # endpoint and then set_read_only(True) finds an empty reader cache and
+        # switches off the current reader to a strategy-picked one (and a
+        # transient role-probe/topology glitch under load makes it land on the
+        # wrong reader). Parity with the async plugin's connect().
+        if effective_host is not None:
+            if current_role == HostRole.WRITER and self._writer_connection is None:
+                self._set_writer_connection(current_conn, effective_host)
+            elif current_role == HostRole.READER and self._reader_connection is None:
+                self._set_reader_connection(current_conn, effective_host)
 
         return current_conn
 
@@ -610,6 +622,17 @@ class ReadWriteSplittingPlugin(AbstractReadWriteSplittingPlugin):
         conn: Optional[Connection] = None
         reader_host: Optional[HostInfo] = None
 
+        # Aurora's topology can briefly disagree with the data plane after
+        # a failover (the picked instance was a reader at topology-query
+        # time but has since been promoted). When ``rws_recheck_reader_role``
+        # is set, verify the live role on the freshly-opened connection
+        # and refresh the topology on mismatch so we don't hand back a
+        # writer as a reader. Originally added in commit 94b39f0 against
+        # the pre-refactor ReadWriteSplittingPlugin; ported here onto the
+        # post-1da2f0b abstract-base structure.
+        recheck_role = WrapperProperties.RWS_RECHECK_READER_ROLE.get_bool(
+            self._properties)
+
         host_candidates = self._get_reader_host_candidates()
         conn_attempts = len(host_candidates) * 2
         for _ in range(conn_attempts):
@@ -618,13 +641,38 @@ class ReadWriteSplittingPlugin(AbstractReadWriteSplittingPlugin):
             )
             if host is not None:
                 try:
-                    conn = self._plugin_service.connect(host, self._properties, self)
-                    reader_host = host
-                    break
+                    candidate_conn = self._plugin_service.connect(
+                        host, self._properties, self)
                 except Exception:
                     logger.warning(
                         "ReadWriteSplittingPlugin.FailedToConnectToReader", host.url
                     )
+                    continue
+
+                if recheck_role:
+                    try:
+                        actual_role = self._plugin_service.get_host_role(
+                            candidate_conn)
+                    except Exception:
+                        actual_role = None
+                    if actual_role is not None and actual_role != HostRole.READER:
+                        logger.debug(
+                            "ReadWriteSplittingPlugin.ReaderRoleMismatch",
+                            host.url, str(actual_role))
+                        AbstractReadWriteSplittingPlugin.close_connection(
+                            candidate_conn, self._plugin_service.driver_dialect)
+                        try:
+                            self._plugin_service.force_refresh_host_list()
+                        except Exception:
+                            # Topology refresh is best-effort; the next
+                            # iteration's get_host_info_by_strategy will
+                            # work with whatever state we have.
+                            pass
+                        continue
+
+                conn = candidate_conn
+                reader_host = host
+                break
 
         return conn, reader_host
 

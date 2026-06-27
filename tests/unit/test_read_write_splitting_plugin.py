@@ -111,7 +111,8 @@ def driver_dialect_mock(mocker, writer_conn_mock, closed_writer_conn_mock):
     driver_dialect_mock.get_connection_from_obj.return_value = writer_conn_mock
     driver_dialect_mock.unwrap_connection.return_value = writer_conn_mock
     driver_dialect_mock.can_execute_query.return_value = True
-    driver_dialect_mock.execute.side_effect = lambda method, func: func()
+    # Mirror DriverDialect.execute(method_name, exec_func, *args, exec_timeout=None, conn=None, **kwargs)
+    driver_dialect_mock.execute.side_effect = lambda method, func, *args, **kwargs: func()
     return driver_dialect_mock
 
 
@@ -336,13 +337,15 @@ def test_close_pooled_reader_connection_after_set_read_only(
         conn_provider_manager_mock
     )
 
+    # RWS_RECHECK_READER_ROLE (default True) verifies the picked reader's
+    # live role; report READER for reader_conn_mock so the recheck passes.
+    plugin_service_mock.get_host_role.side_effect = lambda conn: (
+        HostRole.READER if conn == reader_conn_mock else HostRole.WRITER
+    )
     if plugin_type == "read_write_splitting_plugin":
         plugin_service_mock.get_host_info_by_strategy.return_value = reader_host1
         plugin = ReadWriteSplittingPlugin(plugin_service_mock, props)
     else:
-        plugin_service_mock.get_host_role.side_effect = lambda conn: (
-            HostRole.READER if conn == reader_conn_mock else HostRole.WRITER
-        )
         plugin = SimpleReadWriteSplittingPlugin(plugin_service_mock, srw_props)
 
     spy = mocker.spy(plugin, "_close_connection")
@@ -382,13 +385,15 @@ def test_close_pooled_writer_connection_after_set_read_only(
         conn_provider_manager_mock
     )
 
+    # RWS_RECHECK_READER_ROLE (default True) verifies the picked reader's
+    # live role; report READER for reader_conn_mock so the recheck passes.
+    plugin_service_mock.get_host_role.side_effect = lambda conn: (
+        HostRole.READER if conn == reader_conn_mock else HostRole.WRITER
+    )
     if plugin_type == "read_write_splitting_plugin":
         plugin_service_mock.get_host_info_by_strategy.return_value = reader_host1
         plugin = ReadWriteSplittingPlugin(plugin_service_mock, props)
     else:
-        plugin_service_mock.get_host_role.side_effect = lambda conn: (
-            HostRole.READER if conn == reader_conn_mock else HostRole.WRITER
-        )
         plugin = SimpleReadWriteSplittingPlugin(plugin_service_mock, srw_props)
 
     spy = mocker.spy(plugin, "_close_connection")
@@ -410,6 +415,10 @@ def test_set_read_only_true_read_write_splitting(read_write_splitting_plugin, pl
     plugin_service_mock.get_host_info_by_strategy.return_value = reader_host1
     plugin_service_mock.hosts = single_reader_topology
     read_write_splitting_plugin._reader_connection = None
+    # RWS_RECHECK_READER_ROLE (default True) verifies the picked reader's
+    # live role; return READER so the recheck passes and the picked
+    # connection is kept.
+    plugin_service_mock.get_host_role.return_value = HostRole.READER
 
     read_write_splitting_plugin._switch_connection_if_required(True)
     plugin_service_mock.set_current_connection.assert_called_once_with(
@@ -795,3 +804,70 @@ def test_get_verified_connection_sql_exception_retry_srw(srw_plugin, plugin_serv
 
     assert plugin_service_mock.connect.call_count == 2
     assert srw_plugin._reader_connection == reader_conn_mock
+
+
+# ---------------------------------------------------------------------------
+# RWS_RECHECK_READER_ROLE: reader-pick role mismatch -> refresh + retry
+# ---------------------------------------------------------------------------
+
+def test_open_new_reader_connection_role_mismatch_refreshes_and_retries(
+        plugin_service_mock, props, reader_conn_mock, writer_conn_mock):
+    """RWS picks a reader from topology, but the live connection reports
+    HostRole.WRITER (Aurora topology lagged a recent failover). The plugin
+    should close the bad connection, force a topology refresh, and try
+    another candidate. Locks the contract added for the cluster-ro DNS
+    routing race.
+    """
+    plugin = ReadWriteSplittingPlugin(plugin_service_mock, props)
+
+    # Two consecutive reader-pick attempts: first returns an instance that
+    # turns out to be a writer (stale topology), second returns a real reader.
+    plugin_service_mock.get_host_info_by_strategy.side_effect = [
+        reader_host1, reader_host2,
+    ]
+
+    # plugin_service.connect(host, props, plugin) hands back the writer-acting
+    # conn first, then the real reader conn on the second attempt.
+    connect_calls: List = []
+
+    def fake_connect(host, _props, _plugin):
+        connect_calls.append(host)
+        return writer_conn_mock if len(connect_calls) == 1 else reader_conn_mock
+
+    plugin_service_mock.connect.side_effect = fake_connect
+
+    # get_host_role: the first conn reports WRITER (stale-topology case),
+    # the second reports READER (recovered).
+    plugin_service_mock.get_host_role.side_effect = lambda conn: (
+        HostRole.WRITER if conn == writer_conn_mock else HostRole.READER
+    )
+
+    conn, host = plugin._open_new_reader_connection()
+
+    assert conn == reader_conn_mock
+    assert host == reader_host2
+    assert len(connect_calls) == 2
+    plugin_service_mock.force_refresh_host_list.assert_called_once()
+
+
+def test_open_new_reader_connection_recheck_disabled_keeps_mismatched_conn(
+        plugin_service_mock, reader_conn_mock):
+    """With RWS_RECHECK_READER_ROLE=False the plugin trusts topology and
+    returns the picked connection even if its live role disagrees.
+    Confirms the property gates the new behavior.
+    """
+    props_no_recheck = Properties()
+    props_no_recheck[WrapperProperties.RWS_RECHECK_READER_ROLE.name] = "False"
+    plugin = ReadWriteSplittingPlugin(plugin_service_mock, props_no_recheck)
+
+    plugin_service_mock.get_host_info_by_strategy.return_value = reader_host1
+    plugin_service_mock.connect.return_value = reader_conn_mock
+    # Even though the live role disagrees, recheck is disabled so the
+    # mismatch isn't observed.
+    plugin_service_mock.get_host_role.return_value = HostRole.WRITER
+
+    conn, host = plugin._open_new_reader_connection()
+
+    assert conn == reader_conn_mock
+    assert host == reader_host1
+    plugin_service_mock.force_refresh_host_list.assert_not_called()

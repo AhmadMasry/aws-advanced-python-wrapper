@@ -46,19 +46,6 @@ def test_connection_basic():
                                                    password="qwerty")
 
 
-def test_connection_getattr_delegates_to_underlying_connection():
-    # Driver-specific extension methods absent from the wrapper's PEP-249 surface
-    # (e.g. psycopg's add_notice_handler, called by SQLAlchemy) must reach the
-    # live underlying connection via __getattr__.
-    wrapper = AwsWrapperConnection.__new__(AwsWrapperConnection)
-    underlying = MagicMock()
-    plugin_service = MagicMock()
-    plugin_service.current_connection = underlying
-    wrapper._plugin_service = plugin_service
-
-    assert wrapper.add_notice_handler is underlying.add_notice_handler
-
-
 def test_connection_getattr_delegates_driver_attrs_including_underscore():
     # Public AND single-underscore driver attrs delegate to the live underlying
     # connection (SQLAlchemy's psycopg adapter reaches for underscore members like
@@ -70,6 +57,7 @@ def test_connection_getattr_delegates_driver_attrs_including_underscore():
     plugin_service.current_connection = underlying
     wrapper._plugin_service = plugin_service
 
+    assert wrapper.add_notice_handler is underlying.add_notice_handler
     # single-underscore driver attr delegates (regression: was wrongly blocked)
     assert wrapper._close is underlying._close
     # dunder stays on the wrapper, not delegated
@@ -81,19 +69,12 @@ def test_connection_getattr_delegates_driver_attrs_including_underscore():
         _ = fresh._plugin_service
 
 
-def test_cursor_getattr_delegates_to_target_cursor():
-    wrapper = AwsWrapperCursor.__new__(AwsWrapperCursor)
-    target_cursor = MagicMock()
-    wrapper._target_cursor = target_cursor
-
-    assert wrapper.statusmessage is target_cursor.statusmessage
-
-
 def test_cursor_getattr_delegates_driver_attrs_including_underscore():
     wrapper = AwsWrapperCursor.__new__(AwsWrapperCursor)
     target_cursor = MagicMock()
     wrapper._target_cursor = target_cursor
 
+    assert wrapper.statusmessage is target_cursor.statusmessage
     # _close must delegate: SQLAlchemy's psycopg cursor adapter calls it.
     assert wrapper._close is target_cursor._close
     with pytest.raises(AttributeError):

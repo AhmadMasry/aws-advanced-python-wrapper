@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-from typing import (TYPE_CHECKING, Any, Callable, Iterator, List, Optional,
-                    Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Awaitable, Callable, Iterator, List,
+                    Optional, Type, TypeVar, Union)
 
 from aws_advanced_python_wrapper.plugin_service import (
     PluginManager, PluginServiceImpl, PluginServiceManagerContainer)
@@ -87,14 +87,16 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def __getattr__(self, name: str) -> Any:
         # Delegate unknown attributes to the live underlying driver connection so
         # driver-specific extension methods that aren't on the wrapper's PEP-249
-        # surface (e.g. psycopg's add_notice_handler, called by SQLAlchemy) work
-        # transparently -- including single-underscore driver attributes, since
-        # SQLAlchemy's psycopg adapter reaches for names like _close. __getattr__
-        # runs only on a normal-lookup miss, so it never shadows the wrapper's own
-        # API. Only dunders are kept on the wrapper (pickle/copy internals), and
-        # _plugin_service is guarded by name -- it is the recursion-critical field
-        # this method dereferences (via target_connection), so a miss before it is
-        # set raises cleanly instead of recursing through this method.
+        # surface (e.g. psycopg's add_notice_handler / info / cancel, called by
+        # SQLAlchemy) work transparently. __getattr__ runs only on a normal-lookup
+        # miss, so it never shadows the wrapper's own API -- members that must not
+        # be a plain driver forward (plugin-chain-routed execute/set_read_only/
+        # set_autocommit, the SQLAlchemy-adapter contracts, property setters) stay
+        # defined explicitly below and win via normal lookup. Single-underscore
+        # driver attributes are delegated too (SQLAlchemy's psycopg adapter reaches
+        # for names like _close); only dunders are kept on the wrapper (pickle/copy
+        # internals), and _plugin_service is guarded by name -- the recursion-
+        # critical field this method dereferences via target_connection.
         if name == "_plugin_service" or name.startswith("__"):
             raise AttributeError(name)
         return getattr(self.target_connection, name)
@@ -199,6 +201,30 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
                                      lambda: self.target_connection.close())
         self.release_resources()
 
+    def invalidate(self) -> None:
+        """Mark this connection as invalid and evict it from any owning pool.
+
+        For pool-proxied targets (e.g. SQLAlchemy's ``_ConnectionFairy``),
+        calls the underlying ``.invalidate()`` which closes the driver
+        connection AND removes it from the pool's tracking, so the next
+        pool checkout creates a fresh connection. For raw driver
+        connections (no ``invalidate`` method), falls back to ``close()``.
+
+        Use ``invalidate()`` when the connection is known to be in a
+        broken state (e.g. after a failover-eligible exception); use
+        ``close()`` when the connection was used normally and you intend
+        the pool to keep the underlying socket for reuse.
+        """
+        inv = getattr(self.target_connection, "invalidate", None)
+        if callable(inv):
+            try:
+                inv()
+                self.release_resources()
+                return
+            except Exception:  # noqa: BLE001 - fall through to close
+                pass
+        self.close()
+
     def cursor(self, *args: Any, **kwargs: Any) -> AwsWrapperCursor:
         _cursor = self._plugin_manager.execute(self.target_connection, DbApiMethod.CONNECTION_CURSOR,
                                                lambda: self.target_connection.cursor(*args, **kwargs),
@@ -232,6 +258,134 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def tpc_recover(self) -> Any:
         return self._plugin_manager.execute(self.target_connection, DbApiMethod.CONNECTION_TPC_RECOVER,
                                             lambda: self.target_connection.tpc_recover())
+
+    # ---- psycopg3-parity passthroughs that need explicit handling ------
+    #
+    # Driver-specific attributes (add_notice_handler, info, broken, cancel,
+    # ...) are forwarded automatically by __getattr__. The members below stay
+    # explicit because __getattr__ can't express them: they route through the
+    # plugin chain, have setters, or implement a SQLAlchemy adapter contract
+    # rather than a plain driver forward.
+
+    @property
+    def closed(self) -> bool:
+        """Whether the underlying driver connection is closed.
+
+        psycopg3 exposes ``closed`` as a sync bool property; SA's psycopg
+        dialect reads it during pool-invalidation paths
+        (``sqlalchemy/dialects/postgresql/psycopg.py:595``) after a DBAPI
+        exception is classified. The wrapper has the plugin-aware sync
+        ``is_closed`` property, but SA's dialect probes the unprefixed
+        ``closed`` attribute directly. Without this passthrough, SA's
+        post-exception cleanup raises AttributeError on our proxy.
+        """
+        return bool(getattr(self.target_connection, "closed", False))
+
+    @property
+    def prepare_threshold(self) -> Any:
+        return self.target_connection.prepare_threshold
+
+    @prepare_threshold.setter
+    def prepare_threshold(self, value: Any) -> None:
+        self.target_connection.prepare_threshold = value
+
+    @property
+    def prepared_max(self) -> Any:
+        return self.target_connection.prepared_max
+
+    @prepared_max.setter
+    def prepared_max(self, value: Any) -> None:
+        self.target_connection.prepared_max = value
+
+    def set_read_only(self, value: Any) -> None:
+        # Route through the existing plugin-aware setter so read_only
+        # changes keep their intended plugin-chain semantics.
+        self.read_only = value
+
+    def set_autocommit(self, value: Any) -> None:
+        # Same plugin-chain routing as read_only.
+        self.autocommit = value
+
+    def execute(
+            self,
+            query: Any,
+            params: Any = None,
+            *,
+            prepare: Any = None,
+            binary: bool = False) -> Any:
+        # psycopg3's Connection.execute() is a shortcut that opens a cursor
+        # and runs the query in one call. Route via our cursor so the query
+        # goes through the plugin chain (failover, RWS, etc.) instead of
+        # bypassing it -- otherwise SQLAlchemy and other psycopg-aware
+        # callers can issue SQL that's invisible to plugins.
+        cursor = self.cursor()
+        cursor.execute(query, params, prepare=prepare, binary=binary)
+        return cursor
+
+    # ---- SQLAlchemy AdaptedConnection / AsyncAdapt_*_connection parity --
+    #
+    # SQLAlchemy's async dialects (including the psycopg async dialect)
+    # treat the DBAPI-level connection as an "adapted connection" and
+    # call ``adapted.await_`` / ``adapted.driver_connection`` /
+    # ``adapted.run_async`` against it -- see
+    # ``sqlalchemy/engine/interfaces.py:AdaptedConnection`` and
+    # ``sqlalchemy/connectors/asyncio.py:AsyncAdapt_dbapi_connection``.
+    # The psycopg async dialect's ``_type_info_fetch`` hits
+    # ``adapted.await_`` during engine initialize; without these methods
+    # SQLAlchemy crashes with AttributeError.
+    #
+    # We don't inherit from ``AdaptedConnection`` (we pre-date it and
+    # have our own plugin-mediated hierarchy) -- we duck-type its
+    # contract instead so SA's async dialects see what they expect.
+    #
+    # All four bypass the plugin chain: they expose client-side state
+    # (driver connection handle) or greenlet machinery (``await_``,
+    # ``run_async``). The plugin pipeline has no say in these.
+
+    @property
+    def driver_connection(self) -> Any:
+        """The native driver connection -- matches ``AdaptedConnection.driver_connection``."""
+        return self.target_connection
+
+    @property
+    def _connection(self) -> Any:
+        """Alias for SA's ``AdaptedConnection._connection`` slot.
+
+        SA's ``AsyncAdapt_*_connection`` subclasses read ``self._connection``
+        directly in some paths (e.g., ``AsyncAdapt_dbapi_connection.rollback``).
+        We expose the same attribute name so duck-typed access works.
+        """
+        return self.target_connection
+
+    @staticmethod
+    def await_(coro: Any) -> Any:
+        """SA async-adapter bridge: run a coroutine from sync context.
+
+        SA's ``AsyncAdapt_dbapi_connection`` exposes this as
+        ``staticmethod(sqlalchemy.util.concurrency.await_only)``. We
+        delegate to the same utility lazily so SQLAlchemy stays a
+        soft runtime dependency -- callers who don't use SA never
+        hit the import.
+        """
+        from sqlalchemy.util.concurrency import await_only
+        return await_only(coro)
+
+    def run_async(self, fn: Callable[[Any], Awaitable[Any]]) -> Any:
+        """Match ``sqlalchemy.engine.interfaces.AdaptedConnection.run_async``.
+
+        SA's contract is "pass the raw asyncio driver connection to fn,
+        then await its result". On this sync wrapper ``target_connection``
+        is a *sync* DBAPI connection -- there is no asyncio driver conn
+        to hand to ``fn``. Honoring the call here would either error
+        inside ``fn`` or silently misbehave. Surface the misuse instead:
+        sync engines should not be invoking ``run_async`` on their pool
+        connections in the first place.
+        """
+        raise NotImplementedError(
+            "run_async is not supported on the sync AwsWrapperConnection; "
+            "the target connection is sync, not asyncio. Use the async "
+            "wrapper if you need run_async semantics."
+        )
 
     def release_resources(self):
         self._plugin_manager.release_resources()
