@@ -39,8 +39,6 @@ from aws_advanced_python_wrapper.errors import UnsupportedOperationError
 from aws_advanced_python_wrapper.hostinfo import HostRole
 from aws_advanced_python_wrapper.utils.log import Logger
 from aws_advanced_python_wrapper.utils.messages import Messages
-from aws_advanced_python_wrapper.utils.transient_connect import \
-    is_transient_connect_error
 from tests.integration.container.utils.test_timings import (
     WRITER_CHANGED_PROBE_CONNECT_TIMEOUT_SEC,
     WRITER_CHANGED_PROBE_POLL_INTERVAL_SEC)
@@ -251,18 +249,6 @@ class RdsTestUtility:
             TestDriver.PG if engine == DatabaseEngine.PG else TestDriver.MYSQL)
         instance_id_query = self.get_instance_id_query(engine)
 
-        # Distinguish "Aurora briefly rejected the connect" (transient -- keep
-        # polling) from persistent non-network failures like credential
-        # misconfiguration (re-raise so the test surfaces the actual root
-        # cause instead of burning the full timeout before failing with a
-        # generic "writer didn't change" assertion). Aurora's PAM-recovery
-        # window during writer promotion is ~1-5 s, so a small budget of
-        # consecutive non-transient failures still tolerates that race
-        # without masking real misconfiguration for the full timeout.
-        max_consecutive_non_transient = 3
-        consecutive_non_transient = 0
-        last_non_transient_ex: Optional[BaseException] = None
-
         # The data plane converges within seconds, but downstream test
         # assertions can call ``get_cluster_writer_instance_id`` (RDS
         # DescribeDBClusters) and ``is_db_instance_writer``, which read the
@@ -282,21 +268,9 @@ class RdsTestUtility:
                         row = cursor.fetchone()
                         if row is not None and row[0] != initial_writer_id:
                             data_plane_changed = True
-                    consecutive_non_transient = 0
                 finally:
                     conn.close()
             except Exception as ex:
-                if is_transient_connect_error(ex):
-                    consecutive_non_transient = 0
-                else:
-                    consecutive_non_transient += 1
-                    last_non_transient_ex = ex
-                    if consecutive_non_transient >= max_consecutive_non_transient:
-                        self.logger.debug(
-                            "writer_changed SQL probe failed with "
-                            f"{consecutive_non_transient} consecutive "
-                            "non-transient errors; re-raising last")
-                        raise last_non_transient_ex
                 # Aurora may briefly reject connections mid-failover; keep polling.
                 self.logger.debug("writer_changed SQL probe failed: " + str(ex))
             if data_plane_changed:
