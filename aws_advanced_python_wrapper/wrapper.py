@@ -87,16 +87,14 @@ class AwsWrapperConnection(Connection, CanReleaseResources):
     def __getattr__(self, name: str) -> Any:
         # Delegate unknown attributes to the live underlying driver connection so
         # driver-specific extension methods that aren't on the wrapper's PEP-249
-        # surface (e.g. psycopg's add_notice_handler / info / cancel, called by
-        # SQLAlchemy) work transparently. __getattr__ runs only on a normal-lookup
-        # miss, so it never shadows the wrapper's own API -- members that must not
-        # be a plain driver forward (plugin-chain-routed execute/set_read_only/
-        # set_autocommit, the SQLAlchemy-adapter contracts, property setters) stay
-        # defined explicitly below and win via normal lookup. Single-underscore
-        # driver attributes are delegated too (SQLAlchemy's psycopg adapter reaches
-        # for names like _close); only dunders are kept on the wrapper (pickle/copy
-        # internals), and _plugin_service is guarded by name -- the recursion-
-        # critical field this method dereferences via target_connection.
+        # surface (e.g. psycopg's add_notice_handler, called by SQLAlchemy) work
+        # transparently -- including single-underscore driver attributes, since
+        # SQLAlchemy's psycopg adapter reaches for names like _close. __getattr__
+        # runs only on a normal-lookup miss, so it never shadows the wrapper's own
+        # API. Only dunders are kept on the wrapper (pickle/copy internals), and
+        # _plugin_service is guarded by name -- it is the recursion-critical field
+        # this method dereferences (via target_connection), so a miss before it is
+        # set raises cleanly instead of recursing through this method.
         if name == "_plugin_service" or name.startswith("__"):
             raise AttributeError(name)
         return getattr(self.target_connection, name)
