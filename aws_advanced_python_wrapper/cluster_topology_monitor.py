@@ -19,7 +19,7 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter_ns
-from typing import TYPE_CHECKING, ClassVar, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from aws_advanced_python_wrapper.errors import AwsWrapperError
 from aws_advanced_python_wrapper.host_availability import HostAvailability
@@ -496,14 +496,6 @@ class ClusterTopologyMonitorImpl(ClusterTopologyMonitor):
 
 
 class HostMonitor:
-    # Aurora PG briefly rejects IAM/PAM auth on instances that are
-    # mid-promotion (the PAM service restarts during writer-role swap).
-    # Treat the first N login failures as transient and retry, so a single
-    # unlucky probe during failover doesn't permanently kill this monitor
-    # thread and leave _failover_writer reading an empty topology.
-    _MAX_TRANSIENT_LOGIN_ATTEMPTS: ClassVar[int] = 10
-    _LOGIN_RETRY_BACKOFF_SEC: ClassVar[float] = 0.5
-
     def __init__(self, monitor: ClusterTopologyMonitorImpl, host_info: HostInfo,
                  writer_host_info: Optional[HostInfo]):
         self._monitor: ClusterTopologyMonitorImpl = monitor
@@ -511,7 +503,6 @@ class HostMonitor:
         self._writer_host_info = writer_host_info
         self._writer_changed = False
         self._connection_attempts = 0
-        self._login_attempts = 0
 
     def __call__(self) -> None:
         connection = None
@@ -528,7 +519,6 @@ class HostMonitor:
                         connection = self._monitor._plugin_service.force_connect(
                             self._host_info, self._monitor._monitoring_properties)
                         self._connection_attempts = 0
-                        self._login_attempts = 0
                     except Exception as ex:
                         if self._monitor._host_threads_stop.is_set():
                             return
@@ -537,17 +527,6 @@ class HostMonitor:
                             time.sleep(0.1)
                             continue
                         elif self._monitor._plugin_service.is_login_exception(ex):
-                            # Aurora PG fails IAM/PAM during the promotion window. Retry a
-                            # bounded number of times before declaring the credentials
-                            # invalid -- a real misconfiguration will keep failing past
-                            # the budget and still raise. Use ``Event.wait`` instead of
-                            # ``time.sleep`` so a concurrent shutdown wins the race
-                            # deterministically (would otherwise sit out the full backoff).
-                            self._login_attempts += 1
-                            if self._login_attempts <= HostMonitor._MAX_TRANSIENT_LOGIN_ATTEMPTS:
-                                if self._monitor._host_threads_stop.wait(HostMonitor._LOGIN_RETRY_BACKOFF_SEC):
-                                    return
-                                continue
                             raise RuntimeError(ex)
                         else:
                             backoff = self._calculate_backoff_with_jitter(self._connection_attempts)

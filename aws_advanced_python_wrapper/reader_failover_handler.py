@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 from aws_advanced_python_wrapper.utils.properties import PropertiesUtils
 
@@ -72,21 +72,6 @@ class ReaderFailoverHandler:
 
 class ReaderFailoverHandlerImpl(ReaderFailoverHandler):
     failed_reader_failover_result = ReaderFailoverResult(None, False, None, None)
-
-    # Aurora's freshly-rotated instances can briefly reject connections
-    # during their post-failover boot window (~15-45s typical). Without
-    # retry, a single mid-boot probe causes the whole reader failover
-    # to give up even though the target would have come online seconds
-    # later. ``attempt_connection`` retries up to ``_CONNECT_MAX_ATTEMPTS``
-    # times on network-classifiable errors, spaced by
-    # ``_CONNECT_BACKOFF_S``. Total budget here is bounded by the outer
-    # ``_get_result_from_next_task_batch``'s ``as_completed`` timeout
-    # (``self.timeout_sec``), so retries cannot overrun the failover
-    # ceiling. If ``self.timeout_sec`` < ``_CONNECT_MAX_ATTEMPTS *
-    # _CONNECT_BACKOFF_S``, the outer timeout pre-empts the retry
-    # mid-sleep and the future is GC'd — intended behavior, not a leak.
-    _CONNECT_MAX_ATTEMPTS: ClassVar[int] = 4
-    _CONNECT_BACKOFF_S: ClassVar[float] = 1.0
 
     def __init__(
             self,
@@ -211,34 +196,20 @@ class ReaderFailoverHandlerImpl(ReaderFailoverHandler):
         return ReaderFailoverHandlerImpl.failed_reader_failover_result
 
     def attempt_connection(self, host: HostInfo) -> ReaderFailoverResult:
-        # See class-level ``_CONNECT_MAX_ATTEMPTS`` / ``_CONNECT_BACKOFF_S``
-        # for the rationale on retrying network-classifiable failures
-        # (Aurora post-failover boot window).
         props: Properties = deepcopy(self._properties)
         logger.debug("ReaderFailoverHandler.AttemptingReaderConnection", host.url, PropertiesUtils.mask_properties(props))
 
-        for attempt in range(self._CONNECT_MAX_ATTEMPTS):
-            try:
-                conn: Connection = self._plugin_service.force_connect(host, props)
-                self._plugin_service.set_availability(host.all_aliases, HostAvailability.AVAILABLE)
-                logger.debug("ReaderFailoverHandler.SuccessfulReaderConnection", host.url)
-                return ReaderFailoverResult(conn, True, host, None)
-            except Exception as ex:
-                is_transient = self._plugin_service.is_network_exception(ex)
-                if is_transient and attempt < self._CONNECT_MAX_ATTEMPTS - 1:
-                    logger.debug(
-                        f"[ReaderFailoverHandler] Transient error connecting to "
-                        f"{host.url} (attempt {attempt + 1}/"
-                        f"{self._CONNECT_MAX_ATTEMPTS}); retrying in "
-                        f"{self._CONNECT_BACKOFF_S}s: {ex}"
-                    )
-                    sleep(self._CONNECT_BACKOFF_S)
-                    continue
-                logger.debug("ReaderFailoverHandler.FailedReaderConnection", host.url)
-                self._plugin_service.set_availability(host.all_aliases, HostAvailability.UNAVAILABLE)
-                if not is_transient:
-                    return ReaderFailoverResult(None, False, None, ex)
-                return ReaderFailoverHandlerImpl.failed_reader_failover_result
+        try:
+            conn: Connection = self._plugin_service.force_connect(host, props)
+            self._plugin_service.set_availability(host.all_aliases, HostAvailability.AVAILABLE)
+
+            logger.debug("ReaderFailoverHandler.SuccessfulReaderConnection", host.url)
+            return ReaderFailoverResult(conn, True, host, None)
+        except Exception as ex:
+            logger.debug("ReaderFailoverHandler.FailedReaderConnection", host.url)
+            self._plugin_service.set_availability(host.all_aliases, HostAvailability.UNAVAILABLE)
+            if not self._plugin_service.is_network_exception(ex):
+                return ReaderFailoverResult(None, False, None, ex)
 
         return ReaderFailoverHandlerImpl.failed_reader_failover_result
 
