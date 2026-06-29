@@ -281,7 +281,7 @@ class FailoverV2Plugin(Plugin):
 
                     remaining_readers.remove(reader_candidate)
                     self._plugin_service.driver_dialect.execute(
-                        DbApiMethod.CONNECTION_CLOSE.method_name, lambda: candidate_conn.close(), conn=candidate_conn)
+                        DbApiMethod.CONNECTION_CLOSE.method_name, lambda: candidate_conn.close())
 
                     if role == HostRole.WRITER:
                         reader_candidates.remove(reader_candidate)
@@ -301,7 +301,7 @@ class FailoverV2Plugin(Plugin):
                     return ReaderFailoverResult(candidate_conn, updated_host_info)
 
                 self._plugin_service.driver_dialect.execute(
-                        DbApiMethod.CONNECTION_CLOSE.method_name, lambda: candidate_conn.close(), conn=candidate_conn)
+                        DbApiMethod.CONNECTION_CLOSE.method_name, lambda: candidate_conn.close())
                 if role == HostRole.WRITER:
                     is_original_writer_still_writer = True
             except Exception:
@@ -379,37 +379,9 @@ class FailoverV2Plugin(Plugin):
             except Exception:
                 pass
 
-        # See failover_plugin.py:_invalidate_current_connection for the full
-        # rationale. Short version: clearing the pool record's
-        # ``dbapi_connection`` reference before ``inv(soft=True)`` keeps
-        # SA's next checkout on the "create new" branch instead of
-        # rolling back the dead libpq socket, and ``soft=True`` keeps
-        # libpq teardown off the failover-trigger thread to avoid
-        # contention with the parallel reader-probe connects.
-        # See ``failover_plugin.py:_invalidate_current_connection`` for the
-        # full rationale and the SA-version caveat on
-        # ``_connection_record.dbapi_connection``. ``hasattr`` + nested
-        # ``try/except AttributeError`` make this a no-op on SA layout
-        # changes.
-        inv = getattr(conn, "invalidate", None)
-        if callable(inv):
-            try:
-                record = getattr(conn, "_connection_record", None)
-                if record is not None and hasattr(record, "dbapi_connection"):
-                    try:
-                        if record.dbapi_connection is not None:
-                            record.dbapi_connection = None
-                    except AttributeError:
-                        pass
-                inv(soft=True)
-            except TypeError:
-                pass
-            except Exception:
-                pass
-
         try:
             self._plugin_service.driver_dialect.execute(
-                        DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close(), conn=conn)
+                        DbApiMethod.CONNECTION_CLOSE.method_name, lambda: conn.close())
         except Exception:
             pass
 

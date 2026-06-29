@@ -208,25 +208,15 @@ class OpenedConnectionTracker:
             if conn_reference is None:
                 continue
 
-            # For pool-proxied connections (e.g. SQLAlchemy's
-            # _ConnectionFairy), prefer .invalidate() over .close() so the
-            # underlying driver connection is closed AND removed from the
-            # pool. Calling .close() on a pool fairy just returns it to the
-            # pool, which would later hand the broken connection back to a
-            # caller after writer failover.
             try:
-                inv = getattr(conn_reference, "invalidate", None)
-                if callable(inv):
-                    inv()
-                else:
-                    conn_reference.close()
+                conn_reference.close()
             except Exception:
                 # Swallow this exception, current connection should be useless anyway
                 pass
 
     def _invalidate_connections(self, connections_list: list):
         invalidate_connection_thread: Thread = Thread(daemon=True, target=self._task,
-                                                      args=[connections_list])  # type: ignore[arg-type]
+                                                      args=[connections_list])  # type: ignore
         invalidate_connection_thread.start()
 
     def log_opened_connections(self):
